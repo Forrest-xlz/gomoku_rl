@@ -2,7 +2,9 @@ from typing import Callable, Dict, List, Any, Union, Iterable
 from tensordict import TensorDict
 import torch
 from torchrl.data import TensorSpec, DiscreteTensorSpec
-from torch.cuda import _device_t
+import torch
+from typing import Union
+DeviceLike = Union[torch.device, str, int, None]
 from omegaconf import DictConfig, OmegaConf
 import logging
 from torchrl.objectives import ClipPPOLoss
@@ -26,11 +28,11 @@ class PPO(Policy):
         cfg: DictConfig,
         action_spec: DiscreteTensorSpec,
         observation_spec: TensorSpec,
-        device: _device_t = "cuda",
+        device: DeviceLike = "cuda",
     ) -> None:
         super().__init__(cfg, action_spec, observation_spec, device)
         self.cfg: DictConfig = cfg
-        self.device: _device_t = device
+        self.device: DeviceLike = device
 
         self.clip_param: float = cfg.clip_param
         self.ppo_epoch: int = int(cfg.ppo_epochs)
