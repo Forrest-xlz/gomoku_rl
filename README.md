@@ -19,10 +19,11 @@ git clone git@github.com:hesic73/gomoku_rl.git
 cd gomoku_rl
 conda create -n gomoku python=3.11.5
 conda activate gomoku
+from torch web chose pip command with CUDA 12.8 and execute this pip command 
 pip install -e .
 ```
 
-I use python 3.11.5, torch 2.1.0 and **torchrl 0.2.1**. Lower versions of python and torch 1.x should be compatible as well. 
+above steps is compatible with the RTX 5070 Ti.
 
 ## Getting Started
 
