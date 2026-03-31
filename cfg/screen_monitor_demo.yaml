@@ -1,6 +1,5 @@
 board_size: 15
 device: cpu
-
 checkpoint: pretrained_models/15_15/ppo/0.pt
 black_checkpoint: pretrained_models/15_15/ppo/1.pt
 white_checkpoint: pretrained_models/15_15/ppo/0.pt
@@ -12,13 +11,16 @@ white_diff_thresh: 30
 
 runtime_config_path: gomoku_monitor_config.json
 output_dir: gomoku_monitor_output
-
 require_last_move: false
+
 my_color: black
 auto_suggest_enabled: false
-heartbeat_interval_ms: 500
-reaction_delay_min_ms: 1000
-reaction_delay_max_ms: 2000
+poll_interval_ms: 500
+
+mcts_infer_enabled: true
+mcts_num_simulations: 64
+mcts_c_puct: 1.5
+mcts_reuse_subtree: true
 
 defaults:
   - algo: ppo

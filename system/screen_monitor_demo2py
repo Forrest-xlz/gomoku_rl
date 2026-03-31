@@ -11,7 +11,7 @@ import cv2
 import hydra
 import numpy as np
 import torch
-import pyautogui  # === 新增：鼠标控制库 ===
+import pyautogui
 from omegaconf import DictConfig, OmegaConf
 from PIL import ImageGrab
 from PyQt5.QtCore import Qt, QRect, QTimer
@@ -43,10 +43,10 @@ from torchrl.data.tensor_specs import (
 
 from gomoku_rl import CONFIG_PATH
 from gomoku_rl.policy import Policy, get_policy
+from gomoku_rl.search import MCTSInferenceEngine
 
-# === 新增：pyautogui安全配置 ===
-pyautogui.FAILSAFE = True  # 鼠标移到左上角强制停止
-pyautogui.PAUSE = 0.1     # 操作间隔
+pyautogui.FAILSAFE = True
+pyautogui.PAUSE = 0.1
 
 
 class Piece(enum.Enum):
@@ -119,7 +119,6 @@ class MonitorOverlay(QWidget):
 
 
 def grab_screen_bgr() -> np.ndarray:
-
     """Grab the full desktop as a BGR image."""
     try:
         img = ImageGrab.grab(all_screens=True)
@@ -456,6 +455,7 @@ class ModelManager:
         self.single_checkpoint: Optional[str] = None
         self.black_checkpoint: Optional[str] = None
         self.white_checkpoint: Optional[str] = None
+        self.mcts_engine: Optional[MCTSInferenceEngine] = None
 
     def load_from_cfg(self) -> None:
         if self.cfg.get("checkpoint"):
@@ -471,22 +471,84 @@ class ModelManager:
     def load_single(self, checkpoint_path: str) -> None:
         self.single_model = load_policy(self.cfg, checkpoint_path)
         self.single_checkpoint = checkpoint_path
+        self._reset_mcts_engine()
         logging.info("Loaded single checkpoint: %s", checkpoint_path)
 
     def load_black(self, checkpoint_path: str) -> None:
         self.black_model = load_policy(self.cfg, checkpoint_path)
         self.black_checkpoint = checkpoint_path
+        self._reset_mcts_engine()
         logging.info("Loaded black checkpoint: %s", checkpoint_path)
 
     def load_white(self, checkpoint_path: str) -> None:
         self.white_model = load_policy(self.cfg, checkpoint_path)
         self.white_checkpoint = checkpoint_path
+        self._reset_mcts_engine()
         logging.info("Loaded white checkpoint: %s", checkpoint_path)
 
     def _select_model(self, current_player: Piece) -> Optional[Policy]:
         if self.black_model is not None and self.white_model is not None:
             return self.black_model if current_player == Piece.BLACK else self.white_model
         return self.single_model
+
+    def _select_model_by_piece_value(self, piece_value: int) -> Optional[Policy]:
+        if piece_value == BLACK:
+            return self._select_model(Piece.BLACK)
+        if piece_value == WHITE:
+            return self._select_model(Piece.WHITE)
+        return None
+
+    def _build_mcts_input(
+        self,
+        board: np.ndarray,
+        current_player: int,
+        latest_move: Optional[tuple[int, int]],
+        device: str,
+    ) -> TensorDict:
+        piece = Piece.BLACK if current_player == BLACK else Piece.WHITE
+        return build_model_input(
+            board=board,
+            current_player=piece,
+            latest_move=latest_move,
+            device=device,
+        )
+
+    def _reset_mcts_engine(self) -> None:
+        self.mcts_engine = None
+
+    def _get_mcts_engine(self) -> Optional[MCTSInferenceEngine]:
+        if not bool(self.cfg.get("mcts_infer_enabled", False)):
+            return None
+        if not self.has_model():
+            return None
+        if self.mcts_engine is None:
+            self.mcts_engine = MCTSInferenceEngine(
+                board_size=int(self.cfg.board_size),
+                build_input_fn=self._build_mcts_input,
+                select_model_fn=self._select_model_by_piece_value,
+                device=str(self.cfg.device),
+                num_simulations=int(self.cfg.get("mcts_num_simulations", 64)),
+                c_puct=float(self.cfg.get("mcts_c_puct", 1.5)),
+                reuse_subtree=bool(self.cfg.get("mcts_reuse_subtree", True)),
+            )
+        return self.mcts_engine
+
+    def observe_board(
+        self,
+        board: np.ndarray,
+        latest_move: Optional[tuple[int, int]],
+    ) -> None:
+        current_player = infer_current_player(board)
+        if current_player is None:
+            return
+        engine = self._get_mcts_engine()
+        if engine is None:
+            return
+        engine.observe(
+            board=board,
+            current_player=current_player.value,
+            latest_move=latest_move,
+        )
 
     def predict(
         self,
@@ -540,26 +602,17 @@ class ScreenMonitorWidget(QWidget):
         self.last_turn: Optional[Piece] = None
         self.last_board_hash: Optional[str] = None
         self.last_suggested_hash: Optional[str] = None
-        self.pending_board_hash: Optional[str] = None
-        self.pending_board_snapshot: Optional[np.ndarray] = None
-        self.pending_latest_move: Optional[tuple[int, int]] = None
-        self.pending_warped: Optional[np.ndarray] = None
         self.mouse_managed: bool = False
-        
-        # === 新增：保存透视变换矩阵（用于坐标逆转换） ===
+
         self.perspective_matrix: Optional[np.ndarray] = None
-        # === 新增：自动点击开关 ===
         self.auto_click: bool = cfg.get("auto_click", True)
 
         self.auto_enabled: bool = bool(cfg.get("auto_suggest_enabled", False))
         self.my_color: Piece = Piece.BLACK if str(cfg.get("my_color", "black")).lower() == "black" else Piece.WHITE
 
         self.overlay = MonitorOverlay()
-        self.heartbeat_timer = QTimer(self)
-        self.heartbeat_timer.timeout.connect(self.on_heartbeat)
-        self.reaction_timer = QTimer(self)
-        self.reaction_timer.setSingleShot(True)
-        self.reaction_timer.timeout.connect(self.finish_pending_suggestion)
+        self.poll_timer = QTimer(self)
+        self.poll_timer.timeout.connect(self.on_poll_tick)
 
         self._build_ui()
         self.load_runtime_config()
@@ -598,7 +651,6 @@ class ScreenMonitorWidget(QWidget):
         self.auto_checkbox.toggled.connect(self.set_auto_enabled)
         left.addWidget(self.auto_checkbox)
 
-        # === 新增：自动点击勾选框 ===
         self.click_checkbox = QCheckBox("启用自动鼠标点击")
         self.click_checkbox.setChecked(self.auto_click)
         self.click_checkbox.toggled.connect(self.set_auto_click)
@@ -647,7 +699,6 @@ class ScreenMonitorWidget(QWidget):
         self.preview_label.setStyleSheet("background: #202020;")
         right.addWidget(self.preview_label, stretch=1)
 
-    # === 新增：自动点击开关函数 ===
     def set_auto_click(self, enabled: bool):
         self.auto_click = enabled
         self.click_checkbox.blockSignals(True)
@@ -676,7 +727,7 @@ class ScreenMonitorWidget(QWidget):
             "latest_move": list(self.latest_move) if self.latest_move is not None else None,
             "my_color": "black" if self.my_color == Piece.BLACK else "white",
             "auto_enabled": self.auto_enabled,
-            "auto_click": self.auto_click,  # === 新增 ===
+            "auto_click": self.auto_click,
         }
 
     def save_runtime_config(self) -> None:
@@ -736,16 +787,13 @@ class ScreenMonitorWidget(QWidget):
         self.auto_checkbox.setChecked(self.auto_enabled)
         self.auto_checkbox.blockSignals(False)
         self.refresh_auto_info_label()
-        interval_ms = int(self.cfg.get("heartbeat_interval_ms", 500))
+
+        interval_ms = int(self.cfg.get("poll_interval_ms", 500))
         if self.auto_enabled:
-            self.heartbeat_timer.start(interval_ms)
+            self.poll_timer.start(interval_ms)
         else:
-            self.heartbeat_timer.stop()
-            self.reaction_timer.stop()
-            self.pending_board_hash = None
-            self.pending_board_snapshot = None
-            self.pending_latest_move = None
-            self.pending_warped = None
+            self.poll_timer.stop()
+
         self.save_runtime_config()
         self.update_overlay()
 
@@ -889,6 +937,7 @@ class ScreenMonitorWidget(QWidget):
                     latest_move=selection["move"],
                     suggested_move=self.suggested_move,
                 )
+                cv2.imshow("Pick Last Move", show)
             key = cv2.waitKey(20) & 0xFF
             if key == 13 and selection["move"] is not None:
                 break
@@ -902,27 +951,22 @@ class ScreenMonitorWidget(QWidget):
         self.save_runtime_config()
         self.update_overlay()
 
-    # === 新增：棋盘坐标 → 屏幕全局坐标 转换函数 ===
     def board_to_screen(self, row: int, col: int) -> Optional[tuple[int, int]]:
         if self.perspective_matrix is None or self.roi is None:
             return None
-        
-        # 计算棋盘在归一化图像中的坐标
+
         x = self.cfg.margin + col * self.cfg.cell
         y = self.cfg.margin + row * self.cfg.cell
-        
-        # 逆透视变换 → ROI内坐标
+
         inv_matrix = np.linalg.inv(self.perspective_matrix)
         point = np.array([[[x, y]]], dtype=np.float32)
         roi_point = cv2.perspectiveTransform(point, inv_matrix)[0][0]
         rx, ry = int(roi_point[0]), int(roi_point[1])
-        
-        # 转换为全局屏幕坐标
+
         screen_x = self.roi[0] + rx
         screen_y = self.roi[1] + ry
         return screen_x, screen_y
 
-    # === 新增：自动鼠标点击函数 ===
     def auto_click_position(self, row: int, col: int) -> bool:
         if not self.auto_click:
             return False
@@ -966,7 +1010,6 @@ class ScreenMonitorWidget(QWidget):
                 QMessageBox.critical(self, "错误", "当前 ROI 超出屏幕范围，请重新设置。")
             return None
 
-        # === 新增：保存透视变换矩阵 ===
         warped, matrix = warp_board(
             img=roi_img,
             corners=self.corners_in_roi,
@@ -1031,6 +1074,7 @@ class ScreenMonitorWidget(QWidget):
             )
         )
 
+        self.model_manager.observe_board(board, self.latest_move)
         move, msg, _current_player = self.model_manager.predict(board, self.latest_move)
         self.model_label.setText(f"模型建议：{msg}")
         self.suggested_move = move
@@ -1094,10 +1138,11 @@ class ScreenMonitorWidget(QWidget):
         self.preview_pixmap = pixmap
         self.preview_label.setPixmap(self.preview_pixmap)
 
-    def on_heartbeat(self) -> None:
+    def on_poll_tick(self) -> None:
         result = self._infer_position(update_preview=True, silent=True)
         if result is None:
             return
+
         warped, board, _debug = result
         self.latest_warped = warped
         self.latest_board = board
@@ -1108,17 +1153,14 @@ class ScreenMonitorWidget(QWidget):
             )
         )
 
+        self.model_manager.observe_board(board, self.latest_move)
         current_hash = board_hash(board)
         board_changed = current_hash != self.last_board_hash
+
         if board_changed:
-            if self.reaction_timer.isActive():
-                self.reaction_timer.stop()
-            self.pending_board_hash = None
-            self.pending_board_snapshot = None
-            self.pending_latest_move = None
-            self.pending_warped = None
             self.suggested_move = None
-            self.model_label.setText("模型建议：检测到新盘面，等待判断是否轮到我方。")
+            self.last_suggested_hash = None
+            self.model_label.setText("模型建议：检测到新盘面。")
 
         current_turn = infer_current_player(board)
         self.last_turn = current_turn
@@ -1136,7 +1178,7 @@ class ScreenMonitorWidget(QWidget):
         if not self.auto_enabled:
             return
         if current_turn is None:
-            self.set_status("自动模式：当前盘面不合法，等待下一次心跳。")
+            self.set_status("自动模式：当前盘面不合法，等待下一次轮询。")
             return
         if current_turn != self.my_color:
             self.set_status(
@@ -1148,44 +1190,13 @@ class ScreenMonitorWidget(QWidget):
             return
         if self.last_suggested_hash == current_hash:
             return
-        if self.pending_board_hash == current_hash and self.reaction_timer.isActive():
-            return
 
-        self.pending_board_hash = current_hash
-        self.pending_board_snapshot = board.copy()
-        self.pending_latest_move = self.latest_move
-        self.pending_warped = warped.copy()
-        delay_ms = random.randint(
-            int(self.cfg.get("reaction_delay_min_ms", 1000)),
-            int(self.cfg.get("reaction_delay_max_ms", 2000)),
-        )
-        self.reaction_timer.start(delay_ms)
-        self.set_status(
-            f"自动模式：已检测到轮到我方，{delay_ms / 1000:.2f} 秒后给出建议。"
-        )
-        self.model_label.setText("模型建议：等待随机反应延迟后计算。")
-
-    def finish_pending_suggestion(self) -> None:
-        if self.pending_board_hash is None or self.pending_board_snapshot is None:
-            return
-        if self.latest_board is None or board_hash(self.latest_board) != self.pending_board_hash:
-            self.set_status("自动模式：盘面已变化，取消本次建议。")
-            self.pending_board_hash = None
-            self.pending_board_snapshot = None
-            self.pending_latest_move = None
-            self.pending_warped = None
-            return
-
-        move, msg, current_player = self.model_manager.predict(
-            self.pending_board_snapshot,
-            self.pending_latest_move,
-        )
+        move, msg, _player = self.model_manager.predict(board, self.latest_move)
         self.model_label.setText(f"模型建议：{msg}")
         self.suggested_move = move
-        self.last_suggested_hash = self.pending_board_hash
+        self.last_suggested_hash = current_hash
         self.render_preview()
 
-        # === 核心：AI给出建议后 → 自动点击 ===
         if move is not None:
             row, col = move
             clicked = self.auto_click_position(row, col)
@@ -1201,10 +1212,6 @@ class ScreenMonitorWidget(QWidget):
             self.set_status("自动模式：已完成判断，但未得到可用建议。")
 
         self.update_overlay()
-        self.pending_board_hash = None
-        self.pending_board_snapshot = None
-        self.pending_latest_move = None
-        self.pending_warped = None
 
 
 @hydra.main(version_base=None, config_path=CONFIG_PATH, config_name="screen_monitor_demo")
