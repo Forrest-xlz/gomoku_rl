@@ -4,6 +4,7 @@ board_size: 15
 device: cuda
 out_device: cpu
 run_dir:
+version_name: original
 
 augment: false
 
@@ -16,6 +17,7 @@ black_checkpoint: pretrained_models/${board_size}_${board_size}/${algo.name}/0.p
 white_checkpoint: pretrained_models/${board_size}_${board_size}/${algo.name}/1.pt
 
 wandb:
+  name: ${version_name}
   group: ${board_size}_${board_size}_${algo.name}_InRL
   project: gomoku_rl
   mode: online # set to 'disabled' when debugging locally
