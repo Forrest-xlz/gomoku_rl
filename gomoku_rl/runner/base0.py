@@ -1,23 +1,21 @@
 import abc
-import logging
-import os
-from typing import Any
-
-import torch
-import wandb
 from omegaconf import DictConfig
-from tqdm import tqdm
-
 from gomoku_rl.env import GomokuEnv
-from gomoku_rl.mcts import PlayoutLadder, PureMCTSPlayer
-from gomoku_rl.policy import get_policy
 from gomoku_rl.utils.misc import set_seed
 from gomoku_rl.utils.policy import _policy_t, uniform_policy
+from gomoku_rl.policy import get_policy
+from tqdm import tqdm
+import torch
+import logging
+import os
+import wandb
+from typing import Any
 
 
 class Runner(abc.ABC):
     def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
+
         self.env = GomokuEnv(
             num_envs=cfg.num_envs,
             board_size=cfg.board_size,
@@ -28,7 +26,6 @@ class Runner(abc.ABC):
             board_size=cfg.board_size,
             device=cfg.device,
         )
-
         seed = cfg.get("seed", None)
         set_seed(seed)
 
@@ -56,7 +53,6 @@ class Runner(abc.ABC):
                 torch.load(black_checkpoint, map_location=self.cfg.device)
             )
             logging.info(f"black_checkpoint:{black_checkpoint}")
-
         if white_checkpoint := cfg.get("white_checkpoint", None):
             self.policy_white.load_state_dict(
                 torch.load(white_checkpoint, map_location=self.cfg.device)
@@ -64,34 +60,6 @@ class Runner(abc.ABC):
             logging.info(f"white_checkpoint:{white_checkpoint}")
 
         self.baseline = self._get_baseline()
-
-        eval_cfg = cfg.get("eval", {})
-        pure_mcts_cfg = eval_cfg.get("pure_mcts", {}) if eval_cfg is not None else {}
-
-        self.eval_interval = int(eval_cfg.get("interval", 5))
-        self.eval_repeat = int(eval_cfg.get("repeat", 1))
-        self.pure_mcts_repeat = int(pure_mcts_cfg.get("repeat", 16))
-        self.pure_mcts_c_puct = float(pure_mcts_cfg.get("c_puct", 5.0))
-        self.pure_mcts_rollout_limit = pure_mcts_cfg.get("rollout_limit", None)
-        self.pure_mcts_seed = pure_mcts_cfg.get("seed", seed)
-
-        pure_mcts_num_envs = int(pure_mcts_cfg.get("num_envs", 1))
-        self.mcts_eval_env = GomokuEnv(
-            num_envs=pure_mcts_num_envs,
-            board_size=cfg.board_size,
-            device=cfg.device,
-        )
-
-        ladder_playouts = list(pure_mcts_cfg.get("playouts", [1000, 2000, 4000]))
-        ladder_threshold = float(pure_mcts_cfg.get("win_rate_threshold", 0.70))
-        self.black_pure_mcts_ladder = PlayoutLadder(
-            playouts=ladder_playouts,
-            win_rate_threshold=ladder_threshold,
-        )
-        self.white_pure_mcts_ladder = PlayoutLadder(
-            playouts=ladder_playouts,
-            win_rate_threshold=ladder_threshold,
-        )
 
         run_dir = cfg.get("run_dir", None)
         if run_dir is None:
@@ -106,11 +74,13 @@ class Runner(abc.ABC):
             f"{self.cfg.board_size}_{self.cfg.board_size}",
             f"{self.cfg.baseline.name}",
         )
+
         if os.path.isdir(pretrained_dir) and (
             ckpts := [
                 p
                 for f in os.listdir(pretrained_dir)
-                if os.path.isfile(p := os.path.join(pretrained_dir, f)) and p.endswith(".pt")
+                if os.path.isfile(p := os.path.join(pretrained_dir, f))
+                and p.endswith(".pt")
             ]
         ):
             baseline = get_policy(
@@ -122,25 +92,18 @@ class Runner(abc.ABC):
             )
             ckpts.sort()
             logging.info(f"Baseline:{ckpts[0]}")
-            baseline.load_state_dict(torch.load(ckpts[0], map_location=self.cfg.device))
+            baseline.load_state_dict(torch.load(
+                ckpts[0], map_location=self.cfg.device))
             baseline.eval()
             return baseline
-        return uniform_policy
-
-    def _make_pure_mcts_player(self, num_simulations: int) -> PureMCTSPlayer:
-        return PureMCTSPlayer(
-            board_size=self.cfg.board_size,
-            num_simulations=num_simulations,
-            c_puct=self.pure_mcts_c_puct,
-            rollout_limit=self.pure_mcts_rollout_limit,
-            seed=self.pure_mcts_seed,
-            action_selector=None,
-        )
+        else:
+            return uniform_policy
 
     @abc.abstractmethod
     def _epoch(self, epoch: int) -> dict[str, Any]:
         ...
 
+    # @abc.abstractmethod
     def _post_run(self):
         pass
 
@@ -154,6 +117,7 @@ class Runner(abc.ABC):
             info = {}
             info.update(self._epoch(epoch=i))
             self._log(info=info, epoch=i)
+
             if i % self.save_interval == 0 and self.save_interval > 0:
                 torch.save(
                     self.policy_black.state_dict(),
@@ -163,22 +127,29 @@ class Runner(abc.ABC):
                     self.policy_white.state_dict(),
                     os.path.join(self.run_dir, f"white_{i:04d}.pt"),
                 )
-            pbar.set_postfix({"fps": info["fps"]})
+
+            pbar.set_postfix(
+                {
+                    "fps": info['fps'],
+                }
+            )
 
         torch.save(
             self.policy_black.state_dict(),
-            os.path.join(self.run_dir, "black_final.pt"),
+            os.path.join(self.run_dir, f"black_final.pt"),
         )
         torch.save(
             self.policy_white.state_dict(),
-            os.path.join(self.run_dir, "white_final.pt"),
+            os.path.join(self.run_dir, f"white_final.pt"),
         )
+
         self._post_run()
 
 
 class SPRunner(abc.ABC):
     def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
+
         self.env = GomokuEnv(
             num_envs=cfg.num_envs,
             board_size=cfg.board_size,
@@ -189,13 +160,13 @@ class SPRunner(abc.ABC):
             board_size=cfg.board_size,
             device=cfg.device,
         )
-
         seed = cfg.get("seed", None)
         set_seed(seed)
 
         self.epochs: int = cfg.get("epochs")
         self.steps: int = cfg.steps
         self.save_interval: int = cfg.get("save_interval", -1)
+
         self.policy = get_policy(
             name=cfg.algo.name,
             cfg=cfg.algo,
@@ -203,10 +174,15 @@ class SPRunner(abc.ABC):
             observation_spec=self.env.observation_spec,
             device=self.env.device,
         )
+
         if checkpoint := cfg.get("checkpoint", None):
-            self.policy.load_state_dict(torch.load(checkpoint, map_location=self.cfg.device))
+            self.policy.load_state_dict(
+                torch.load(checkpoint, map_location=self.cfg.device)
+            )
             logging.info(f"load from {checkpoint}")
+
         self.baseline = self._get_baseline()
+
         run_dir = cfg.get("run_dir", None)
         if run_dir is None:
             run_dir = wandb.run.dir
@@ -220,11 +196,13 @@ class SPRunner(abc.ABC):
             f"{self.cfg.board_size}_{self.cfg.board_size}",
             f"{self.cfg.baseline.name}",
         )
+
         if os.path.isdir(pretrained_dir) and (
             ckpts := [
                 p
                 for f in os.listdir(pretrained_dir)
-                if os.path.isfile(p := os.path.join(pretrained_dir, f)) and p.endswith(".pt")
+                if os.path.isfile(p := os.path.join(pretrained_dir, f))
+                and p.endswith(".pt")
             ]
         ):
             baseline = get_policy(
@@ -236,15 +214,18 @@ class SPRunner(abc.ABC):
             )
             ckpts.sort()
             logging.info(f"Baseline:{ckpts[0]}")
-            baseline.load_state_dict(torch.load(ckpts[0], map_location=self.cfg.device))
+            baseline.load_state_dict(torch.load(
+                ckpts[0], map_location=self.cfg.device))
             baseline.eval()
             return baseline
-        return uniform_policy
+        else:
+            return uniform_policy
 
     @abc.abstractmethod
     def _epoch(self, epoch: int) -> dict[str, Any]:
         ...
 
+    # @abc.abstractmethod
     def _post_run(self):
         pass
 
@@ -258,15 +239,22 @@ class SPRunner(abc.ABC):
             info = {}
             info.update(self._epoch(epoch=i))
             self._log(info=info, epoch=i)
+
             if i % self.save_interval == 0 and self.save_interval > 0:
                 torch.save(
                     self.policy.state_dict(),
                     os.path.join(self.run_dir, f"{i:04d}.pt"),
                 )
-            pbar.set_postfix({"fps": info["fps"]})
+
+            pbar.set_postfix(
+                {
+                    "fps": info['fps'],
+                }
+            )
 
         torch.save(
             self.policy.state_dict(),
-            os.path.join(self.run_dir, "final.pt"),
+            os.path.join(self.run_dir, f"final.pt"),
         )
+
         self._post_run()

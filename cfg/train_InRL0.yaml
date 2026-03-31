@@ -4,28 +4,17 @@ board_size: 15
 device: cuda
 out_device: cpu
 run_dir:
-
 version_name: original
+
 augment: false
 
 epochs: 1000
 steps: 128
 save_interval: 300
 
+
 black_checkpoint: pretrained_models/${board_size}_${board_size}/${algo.name}/0.pt
 white_checkpoint: pretrained_models/${board_size}_${board_size}/${algo.name}/1.pt
-
-eval:
-  interval: 5
-  repeat: 1
-  pure_mcts:
-    num_envs: 1
-    repeat: 16
-    playouts: [1000, 2000, 4000]
-    win_rate_threshold: 0.70
-    c_puct: 5.0
-    rollout_limit:
-    seed: ${seed}
 
 wandb:
   name: ${version_name}
