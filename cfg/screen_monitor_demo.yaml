@@ -18,9 +18,13 @@ auto_suggest_enabled: false
 poll_interval_ms: 500
 
 mcts_infer_enabled: true
-mcts_num_simulations: 64
+mcts_num_simulations: 2000
 mcts_c_puct: 1.5
+mcts_dirichlet_alpha: 0.0
+mcts_dirichlet_epsilon: 0.0
+mcts_temperature: 0.0
 mcts_reuse_subtree: true
+mcts_reuse_tree: true
 
 defaults:
   - algo: ppo

@@ -18,7 +18,7 @@ from .core import Gomoku
 from gomoku_rl.utils.log import get_log_func
 from collections import defaultdict
 
-
+# 定义环境，并声明了环境的 observation_spec、action_spec 和 reward_spec，以及 reset 和 step 方法。
 class GomokuEnv:
     def __init__(
         self,
@@ -36,13 +36,13 @@ class GomokuEnv:
         self.gomoku = Gomoku(
             num_envs=num_envs, board_size=board_size, device=device)
 
-        self.observation_spec = CompositeSpec(
+        self.observation_spec = CompositeSpec(  # 把多个子 spec 组合成一个整体 spec。
             {
-                "observation": UnboundedContinuousTensorSpec(
+                "observation": UnboundedContinuousTensorSpec(   # 一个无界连续张量，表示棋盘状态的编码
                     device=self.device,
                     shape=[num_envs, 3, board_size, board_size],
                 ),
-                "action_mask": BinaryDiscreteTensorSpec(
+                "action_mask": BinaryDiscreteTensorSpec(    # 一个二值离散张量，表示每个位置是否可落子
                     n=board_size * board_size,
                     device=self.device,
                     shape=[num_envs, board_size * board_size],
@@ -54,7 +54,7 @@ class GomokuEnv:
             ],
             device=self.device,
         )
-        self.action_spec = DiscreteTensorSpec(
+        self.action_spec = DiscreteTensorSpec(  # 一个离散张量，表示动作空间的大小，即棋盘上所有位置的编号
             board_size * board_size,
             shape=[
                 num_envs,

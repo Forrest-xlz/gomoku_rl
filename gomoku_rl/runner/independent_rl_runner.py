@@ -7,6 +7,7 @@ from gomoku_rl.collector import SelfPlayCollector, VersusPlayCollector
 import torch
 
 
+
 class IndependentRLRunner(Runner):
     def __init__(self, cfg: DictConfig) -> None:
         super().__init__(cfg)
