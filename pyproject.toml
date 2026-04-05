@@ -13,8 +13,8 @@ description = "train AI agents to play Free-style Gomoku."
 readme = "README.md"
 keywords = ["RL", "pytorch"]
 dependencies = [
-    "torch",
     "torchrl==0.2.1",
+    "tensordict==0.2.1",
     "scipy",
     "omegaconf",
     "hydra-core",

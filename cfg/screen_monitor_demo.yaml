@@ -1,0 +1,31 @@
+board_size: 15
+device: cpu
+checkpoint: pretrained_models/15_15/ppo/0.pt
+black_checkpoint: pretrained_models/15_15/ppo/1.pt
+white_checkpoint: pretrained_models/15_15/ppo/0.pt
+
+cell: 60
+margin: 60
+black_diff_thresh: -70
+white_diff_thresh: 30
+
+runtime_config_path: gomoku_monitor_config.json
+output_dir: gomoku_monitor_output
+require_last_move: false
+
+my_color: black
+auto_suggest_enabled: false
+poll_interval_ms: 500
+
+mcts_infer_enabled: true
+mcts_num_simulations: 2000
+mcts_c_puct: 1.5
+mcts_dirichlet_alpha: 0.0
+mcts_dirichlet_epsilon: 0.0
+mcts_temperature: 0.0
+mcts_reuse_subtree: true
+mcts_reuse_tree: true
+
+defaults:
+  - algo: ppo
+  - _self_

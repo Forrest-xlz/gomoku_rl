@@ -4,7 +4,7 @@ board_size: 15
 device: cuda
 out_device: cpu
 run_dir:
-
+version_name: sp - original
 augment: false
 
 epochs: 100
@@ -13,9 +13,10 @@ save_interval: -1
 
 
 
-# checkpoint: pretrained_models/${board_size}_${board_size}/${algo.name}/0.pt
+checkpoint: pretrained_models/${board_size}_${board_size}/${algo.name}/0.pt
 
 wandb:
+  name: ${version_name}
   group: ${board_size}_${board_size}_${algo.name}_InRL_sp
   project: gomoku_rl
   mode: online # set to 'disabled' when debugging locally

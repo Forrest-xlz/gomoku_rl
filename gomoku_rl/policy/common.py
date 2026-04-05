@@ -5,7 +5,9 @@ from torch.optim import Optimizer, Adam, AdamW
 import torch
 import torch.nn as nn
 from torch.nn import Parameter
-from torch.cuda import _device_t
+import torch
+from typing import Union
+DeviceLike = Union[torch.device, str, int, None]
 from torchrl.modules import ProbabilisticActor
 from torch.distributions.categorical import Categorical
 from torchrl.modules.models import ConvNet, MLP
@@ -40,7 +42,7 @@ from gomoku_rl.utils.misc import get_kwargs
 def make_dqn_actor(
     cfg: DictConfig,
     action_spec: TensorSpec,
-    device: _device_t,
+    device: DeviceLike,
 ):
     net_kwargs = get_kwargs(cfg, "num_residual_blocks", "num_channels")
     net = MyDuelingCnnDQNet(
@@ -77,7 +79,7 @@ def make_egreedy_actor(
 def make_ppo_actor(
     cfg: DictConfig,
     action_spec: TensorSpec,
-    device: _device_t,
+    device: DeviceLike,
 ):
     actor_net = ActorNet(
         residual_tower=ResidualTower(
@@ -106,7 +108,7 @@ def make_ppo_actor(
 
 def make_critic(
     cfg: DictConfig,
-    device: _device_t,
+    device: DeviceLike,
 ):
     value_net = ValueNet(
         residual_tower=ResidualTower(
@@ -128,7 +130,7 @@ def make_critic(
 def make_ppo_ac(
     cfg: DictConfig,
     action_spec: TensorSpec,
-    device: _device_t,
+    device: DeviceLike,
 ):
     residual_tower = ResidualTower(
         in_channels=3,
