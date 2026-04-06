@@ -79,6 +79,7 @@ class PSRORunner(Runner):
                 initial_policy=_policy,
                 dir=os.path.join(self.run_dir, "population_0"),
                 device=cfg.device,
+                interaction_type=cfg.get("population_interaction_type", "random"),
             ),
         )
 
@@ -92,6 +93,7 @@ class PSRORunner(Runner):
                 initial_policy=_policy,
                 dir=os.path.join(self.run_dir, "population_1"),
                 device=cfg.device,
+                interaction_type=cfg.get("population_interaction_type", "random"),
             ),
         )
 

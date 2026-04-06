@@ -20,6 +20,24 @@ from .policy import _policy_t, uniform_policy
 DeviceLike = Union[torch.device, str, int, None]
 
 
+def parse_interaction_type(value: str | InteractionType) -> InteractionType:
+    if isinstance(value, InteractionType):
+        return value
+    if isinstance(value, str):
+        key = value.strip().lower()
+        mapping = {
+            "random": InteractionType.RANDOM,
+            "mode": InteractionType.MODE,
+            "median": InteractionType.MEDIAN,
+            "mean": InteractionType.MEAN,
+        }
+        if key in mapping:
+            return mapping[key]
+    raise ValueError(
+        f"Unsupported interaction_type={value!r}. Expected one of: random, mode, median, mean, or an InteractionType value."
+    )
+
+
 class PayoffType(enum.Enum):
     black_vs_white = enum.auto()
     both = enum.auto()
@@ -110,6 +128,7 @@ class Population:
         dir: str,
         initial_policy: _policy_t | list[_policy_t] = uniform_policy,
         device: DeviceLike = "cuda",
+        interaction_type: str | InteractionType = InteractionType.MODE,
     ):
         self.dir = dir
         os.makedirs(self.dir, exist_ok=True)
@@ -120,8 +139,8 @@ class Population:
         self._idx = -1
         self.device = device
 
-        # this should be deterministic, as PSRO requires pure strategies.
-        self._interaction_type = InteractionType.MODE
+        # Controls how archive/population opponents act when sampled for training/eval.
+        self._interaction_type = parse_interaction_type(interaction_type)
 
         self.policy_sets: list[_policy_t | int] = []
         self.active_mask: list[bool] = []

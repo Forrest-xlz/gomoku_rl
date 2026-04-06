@@ -12,6 +12,7 @@ version_name: psro - active-archive - base
 
 # psro
 meta_solver: uniform
+population_interaction_type: random
 mean_threshold: 0.99
 std_threshold: 0.005
 min_iter_steps: 1
