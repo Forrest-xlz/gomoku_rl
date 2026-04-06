@@ -36,8 +36,6 @@ from gomoku_rl.utils.visual import payoff_headmap
 
 
 class PSRORunner(Runner):
-    
-
     def __init__(self, cfg: DictConfig) -> None:
         super().__init__(cfg)
         ci_kwargs = get_kwargs(
@@ -56,12 +54,14 @@ class PSRORunner(Runner):
         self.mid_low = float(cfg.get("mid_low", 0.3))
         self.mid_high = float(cfg.get("mid_high", 0.7))
         self.active_min = int(cfg.get("active_min", 8))
-        self.protect_latest = int(cfg.get("protect_latest", 5))
         self.archive_max = int(cfg.get("archive_max", 32))
+        self.protect_latest = int(cfg.get("protect_latest", 5))
         if not (0.0 <= self.mid_low <= self.mid_high <= 1.0):
             raise ValueError("mid_low and mid_high must satisfy 0 <= mid_low <= mid_high <= 1")
         if self.active_min <= 0:
             raise ValueError("active_min must be positive")
+        if self.archive_max <= 0:
+            raise ValueError("archive_max must be positive")
         if not (0 <= self.protect_latest < self.archive_max):
             raise ValueError(
                 f"protect_latest must satisfy 0 <= protect_latest < {self.archive_max}"
