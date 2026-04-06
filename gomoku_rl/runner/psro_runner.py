@@ -26,6 +26,7 @@ from gomoku_rl.utils.psro import (
     get_meta_solver,
     get_new_payoffs_sp,
     init_payoffs,
+    make_frozen_actor_policy,
     init_payoffs_sp,
     mid_ratio,
     select_active_indices,
@@ -69,8 +70,7 @@ class PSRORunner(Runner):
         self.rng = np.random.default_rng(int(cfg.get("seed", 0)))
 
         if self.cfg.get("black_checkpoint", None):
-            _policy = copy.deepcopy(self.policy_black)
-            _policy.eval()
+            _policy = make_frozen_actor_policy(self.policy_black, device=cfg.device)
         else:
             _policy = uniform_policy
         self.player_0 = PSROPolicyWrapper(
@@ -83,8 +83,7 @@ class PSRORunner(Runner):
         )
 
         if self.cfg.get("white_checkpoint", None):
-            _policy = copy.deepcopy(self.policy_white)
-            _policy.eval()
+            _policy = make_frozen_actor_policy(self.policy_white, device=cfg.device)
         else:
             _policy = uniform_policy
         self.player_1 = PSROPolicyWrapper(
@@ -356,10 +355,9 @@ class PSROSPRunner(SPRunner):
                 tmp = copy.deepcopy(self.policy)
                 tmp.load_state_dict(torch.load(os.path.join(population_dir, p), map_location=self.cfg.device))
                 tmp.eval()
-                _policy.append(tmp)
+                _policy.append(make_frozen_actor_policy(tmp, device=cfg.device))
         elif self.cfg.get("checkpoint", None):
-            _policy = copy.deepcopy(self.policy)
-            _policy.eval()
+            _policy = make_frozen_actor_policy(self.policy, device=cfg.device)
         else:
             _policy = uniform_policy
 

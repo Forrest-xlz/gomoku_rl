@@ -8,6 +8,7 @@ from typing import Callable, Union
 
 import numpy as np
 import torch
+import torch.nn as nn
 from gomoku_rl.policy import Policy
 from scipy.optimize import linprog
 from tensordict import TensorDict
@@ -66,6 +67,43 @@ class ConvergedIndicator:
         return mean >= self.mean_threshold and std <= self.std_threshold
 
 
+class FrozenActorPolicy(nn.Module):
+    def __init__(self, actor: nn.Module, device: DeviceLike = "cuda"):
+        super().__init__()
+        self.actor = actor
+        self.device = device
+        self.to(device)
+        self.eval()
+
+    def forward(self, tensordict: TensorDict) -> TensorDict:
+        tensordict = tensordict.to(self.device)
+        actor_input = tensordict.select("observation", "action_mask", strict=False)
+        actor_output: TensorDict = self.actor(actor_input)
+        actor_output = actor_output.exclude("probs")
+        tensordict.update(actor_output)
+        return tensordict
+
+
+def make_frozen_actor_policy(policy_or_actor: Policy | nn.Module, device: DeviceLike = "cuda") -> FrozenActorPolicy:
+    if isinstance(policy_or_actor, FrozenActorPolicy):
+        frozen = copy.deepcopy(policy_or_actor)
+        frozen.to(device)
+        frozen.eval()
+        return frozen
+    if isinstance(policy_or_actor, Policy):
+        actor = copy.deepcopy(policy_or_actor.actor)
+    elif isinstance(policy_or_actor, nn.Module):
+        actor = copy.deepcopy(policy_or_actor)
+    else:
+        raise TypeError(f"Unsupported policy type for archive population: {type(policy_or_actor)!r}")
+    actor.eval()
+    return FrozenActorPolicy(actor=actor, device=device)
+
+
+def _is_population_module_candidate(obj) -> bool:
+    return isinstance(obj, (Policy, nn.Module))
+
+
 class Population:
     def __init__(
         self,
@@ -88,11 +126,11 @@ class Population:
         self.policy_sets: list[_policy_t | int] = []
         self.active_mask: list[bool] = []
 
-        if isinstance(initial_policy, (TensorDictModule, Policy)):
+        if _is_population_module_candidate(initial_policy):
             self.add(initial_policy)
         elif isinstance(initial_policy, list):
             for _ip in initial_policy:
-                assert isinstance(_ip, (TensorDictModule, Policy))
+                assert _is_population_module_candidate(_ip)
                 self.add(_ip)
         else:
             self.policy_sets.append(initial_policy)
@@ -129,12 +167,13 @@ class Population:
             raise RuntimeError("Population active set cannot be empty.")
         self.active_mask = mask.tolist()
 
-    def add(self, policy: Policy):
+    def add(self, policy: Policy | nn.Module):
+        frozen_policy = make_frozen_actor_policy(policy, device=self.device)
         if self._module is None:
-            self._module = copy.deepcopy(policy)
+            self._module = frozen_policy
             self._module.eval()
         torch.save(
-            policy.state_dict(),
+            frozen_policy.state_dict(),
             os.path.join(self.dir, f"{self._module_cnt}.pt"),
         )
         self.policy_sets.append(self._module_cnt)
@@ -261,9 +300,7 @@ class PSROPolicyWrapper:
         self.population.sample(meta_policy=self.meta_policy)
 
     def add_current_policy(self):
-        actor = copy.deepcopy(self.policy)
-        actor.eval()
-        self.population.add(actor)
+        self.population.add(self.policy)
 
     def __call__(self, tensordict: TensorDict) -> TensorDict:
         if self._oracle_mode:
