@@ -25,54 +25,42 @@ class GomokuEnv:
         num_envs: int,
         board_size: int,
         device=None,
+        action_pruning=None,
     ):
-        """Initializes a parallel Gomoku environment.
-
-        Args:
-            num_envs (int): The number of independent game environments to run in parallel. Each environment represents a separate instance of a Gomoku game.
-            board_size (int): The size of the square Gomoku game board.
-            device: The computational device (e.g., CPU, GPU) on which the game simulations will run. If `None`, the default device is used.
-        """
         self.gomoku = Gomoku(
-            num_envs=num_envs, board_size=board_size, device=device)
+            num_envs=num_envs,
+            board_size=board_size,
+            device=device,
+            action_pruning=action_pruning,
+        )
 
-        self.observation_spec = CompositeSpec(  # 把多个子 spec 组合成一个整体 spec。
+        self.observation_spec = CompositeSpec(
             {
-                "observation": UnboundedContinuousTensorSpec(   # 一个无界连续张量，表示棋盘状态的编码
-                    device=self.device,
-                    shape=[num_envs, 3, board_size, board_size],
+                "observation": UnboundedContinuousTensorSpec(
+                    device=self.device, shape=[num_envs, 3, board_size, board_size],
                 ),
-                "action_mask": BinaryDiscreteTensorSpec(    # 一个二值离散张量，表示每个位置是否可落子
+                "action_mask": BinaryDiscreteTensorSpec(
                     n=board_size * board_size,
                     device=self.device,
                     shape=[num_envs, board_size * board_size],
                     dtype=torch.bool,
                 ),
             },
-            shape=[
-                num_envs,
-            ],
+            shape=[num_envs],
             device=self.device,
         )
-        self.action_spec = DiscreteTensorSpec(  # 一个离散张量，表示动作空间的大小，即棋盘上所有位置的编号
+
+        self.action_spec = DiscreteTensorSpec(
             board_size * board_size,
-            shape=[
-                num_envs,
-            ],
+            shape=[num_envs],
             device=self.device,
         )
         self.reward_spec = UnboundedContinuousTensorSpec(
-            shape=[num_envs, 1],
-            device=self.device,
+            shape=[num_envs, 1], device=self.device,
         )
+        self._post_step = None
 
-        self._post_step: Callable[
-            [
-                TensorDict,
-            ],
-            None,
-        ] | None = None
-
+        
     @property
     def batch_size(self):
         return torch.Size((self.num_envs,))

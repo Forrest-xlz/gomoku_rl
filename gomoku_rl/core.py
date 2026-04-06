@@ -13,7 +13,7 @@ def compute_done(
     Checks for a winning sequence of stones horizontally, vertically, and diagonally.
 
     Args:
-        board (torch.Tensor): The game boards, shaped (E, B, B), with E being the number of environments, 
+        board (torch.Tensor): The game boards, shaped (E, B, B), with E being the number of environments,
                               and B being the board size. Values are 0 (empty), 1 (black stone), or -1 (white stone).
         kernel_horizontal (torch.Tensor): Horizontal detection kernel, shaped (1, 1, 5, 1).
         kernel_vertical (torch.Tensor): Vertical detection kernel, shaped (1, 1, 1, 5).
@@ -48,9 +48,73 @@ def compute_done(
     return done
 
 
+def _compute_immediate_five_mask(
+    atk: torch.Tensor,
+    deff: torch.Tensor,
+    empty: torch.Tensor,
+    kernel_horizontal: torch.Tensor,
+    kernel_vertical: torch.Tensor,
+    kernel_diagonal: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Returns a boolean mask of shape (E, B, B) where True means:
+    placing one stone for `atk` there creates an immediate five-in-a-row.
+    """
+    if atk.numel() == 0:
+        return torch.zeros_like(empty, dtype=torch.bool)
+
+    atk4 = atk.float().unsqueeze(1)   # (E,1,B,B)
+    def4 = deff.float().unsqueeze(1)  # (E,1,B,B)
+    out = torch.zeros_like(empty, dtype=torch.bool)
+
+    # kernel_horizontal: (5,1) window -> output (E, B-4, B)
+    atk_cnt = F.conv2d(atk4, kernel_horizontal).squeeze(1)
+    def_cnt = F.conv2d(def4, kernel_horizontal).squeeze(1)
+    win_seg = (atk_cnt == 4) & (def_cnt == 0)
+    if win_seg.any():
+        h, w = win_seg.shape[-2:]
+        for t in range(5):
+            out[:, t:t + h, :] |= win_seg & empty[:, t:t + h, :]
+
+    # kernel_vertical: (1,5) window -> output (E, B, B-4)
+    atk_cnt = F.conv2d(atk4, kernel_vertical).squeeze(1)
+    def_cnt = F.conv2d(def4, kernel_vertical).squeeze(1)
+    win_seg = (atk_cnt == 4) & (def_cnt == 0)
+    if win_seg.any():
+        h, w = win_seg.shape[-2:]
+        for t in range(5):
+            out[:, :, t:t + w] |= win_seg & empty[:, :, t:t + w]
+
+    # Main diagonal
+    atk_cnt = F.conv2d(atk4, kernel_diagonal[:1]).squeeze(1)
+    def_cnt = F.conv2d(def4, kernel_diagonal[:1]).squeeze(1)
+    win_seg = (atk_cnt == 4) & (def_cnt == 0)
+    if win_seg.any():
+        h, w = win_seg.shape[-2:]
+        for t in range(5):
+            out[:, t:t + h, t:t + w] |= win_seg & empty[:, t:t + h, t:t + w]
+
+    # Anti diagonal
+    atk_cnt = F.conv2d(atk4, kernel_diagonal[1:2]).squeeze(1)
+    def_cnt = F.conv2d(def4, kernel_diagonal[1:2]).squeeze(1)
+    win_seg = (atk_cnt == 4) & (def_cnt == 0)
+    if win_seg.any():
+        h, w = win_seg.shape[-2:]
+        for t in range(5):
+            out[:, t:t + h, 4 - t:4 - t + w] |= (
+                win_seg & empty[:, t:t + h, 4 - t:4 - t + w]
+            )
+
+    return out
+
+
 class Gomoku:
     def __init__(
-        self, num_envs: int, board_size: int = 15, device=None
+        self,
+        num_envs: int,
+        board_size: int = 15,
+        device=None,
+        action_pruning=None,
     ):
         """Initializes a batch of parallel Gomoku game environments.
 
@@ -58,6 +122,8 @@ class Gomoku:
             num_envs (int): Number of parallel game environments.
             board_size (int, optional): Side length of the square game board. Defaults to 15.
             device: Torch device on which the tensors are allocated. Defaults to None (CPU).
+            action_pruning: Optional config/dict with keys:
+                enabled, self_win4, block_opp_win4
         """
         assert num_envs > 0
         assert board_size >= 5
@@ -65,6 +131,16 @@ class Gomoku:
         self.num_envs: int = num_envs
         self.board_size: int = board_size
         self.device = device
+
+        if action_pruning is None:
+            action_pruning = {}
+
+        self.action_pruning_enabled = bool(action_pruning.get("enabled", False))
+        self.action_pruning_self_win4 = bool(action_pruning.get("self_win4", True))
+        self.action_pruning_block_opp_win4 = bool(
+            action_pruning.get("block_opp_win4", True)
+        )
+
         # board 0 empty 1 black -1 white
         self.board: torch.Tensor = torch.zeros(
             num_envs,
@@ -89,16 +165,14 @@ class Gomoku:
         )
 
         self.kernel_horizontal = (
-            torch.tensor([1, 1, 1, 1, 1], device=self.device,
-                         dtype=torch.float)
+            torch.tensor([1, 1, 1, 1, 1], device=self.device, dtype=torch.float)
             .unsqueeze(-1)
             .unsqueeze(0)
             .unsqueeze(0)
         )  # (1,1,5,1)
 
         self.kernel_vertical = (
-            torch.tensor([1, 1, 1, 1, 1], device=self.device,
-                         dtype=torch.float)
+            torch.tensor([1, 1, 1, 1, 1], device=self.device, dtype=torch.float)
             .unsqueeze(0)
             .unsqueeze(0)
             .unsqueeze(0)
@@ -123,19 +197,10 @@ class Gomoku:
             ],
             device=self.device,
             dtype=torch.float,
-        ).unsqueeze(
-            1
-        )  # (2,1,5,5)
+        ).unsqueeze(1)  # (2,1,5,5)
 
     def to(self, device):
-        """Transfers all internal tensors to the specified device.
-
-        Args:
-            device: The target device.
-
-        Returns:
-            self: The instance with its tensors moved to the new device.
-        """
+        """Transfers all internal tensors to the specified device."""
         self.board.to(device=device)
         self.done.to(device=device)
         self.turn.to(device=device)
@@ -144,11 +209,7 @@ class Gomoku:
         return self
 
     def reset(self, env_indices: torch.Tensor | None = None):
-        """Resets specified game environments to their initial state.
-
-        Args:
-            env_indices (torch.Tensor | None, optional): Indices of environments to reset. Resets all if None. Defaults to None.
-        """
+        """Resets specified game environments to their initial state."""
         if env_indices is None:
             self.board.zero_()
             self.done.zero_()
@@ -165,18 +226,7 @@ class Gomoku:
     def step(
         self, action: torch.Tensor, env_mask: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Performs actions in specified environments and updates their states based on the provided action tensor. If an environment mask is provided, only the environments corresponding to `True` values in the mask are updated; otherwise, all environments are updated.
-
-        Args:
-            action (torch.Tensor): 1D positions to place a stone, one per environment. Shape: (E,)
-            env_indices (torch.Tensor | None, optional): Boolean mask to select environments for updating. If `None`, updates all. Shape should match environments.
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]: A tuple containing two tensors:
-                - done_statuses: Boolean tensor with `True` where games ended.
-                - invalid_actions: Boolean tensor with `True` for invalid actions in environments.
-        """
-
+        """Performs actions in specified environments and updates their states."""
         if env_mask is None:
             env_mask = torch.ones_like(action, dtype=torch.bool)
 
@@ -197,7 +247,8 @@ class Gomoku:
 
         # F.conv2d doesn't support LongTensor on CUDA. So we use float.
         board_one_side = (
-            self.board == piece.unsqueeze(-1).unsqueeze(-1)).float()
+            self.board == piece.unsqueeze(-1).unsqueeze(-1)
+        ).float()
         self.done = compute_done(
             board_one_side,
             self.kernel_horizontal,
@@ -211,22 +262,15 @@ class Gomoku:
         return self.done & env_mask, nop & env_mask
 
     def get_encoded_board(self) -> torch.Tensor:
-        """Encodes the current board state into a tensor format suitable for neural network input.
-
-        Returns:
-            torch.Tensor: Encoded board state, shaped (E, 3, B, B), with separate channels for the current player's stones, the opponent's stones, and the last move.
-        """
-        piece = torch.where(self.turn == 0, 1, -
-                            1).unsqueeze(-1).unsqueeze(-1)  # (E,1,1)
+        """Encodes the current board state into a tensor format suitable for neural network input."""
+        piece = torch.where(self.turn == 0, 1, -1).unsqueeze(-1).unsqueeze(-1)
 
         layer1 = (self.board == piece).float()
         layer2 = (self.board == -piece).float()
 
-        last_x = self.last_move // self.board_size  # (E,)
-        last_y = self.last_move % self.board_size  # (E,)
+        last_x = self.last_move // self.board_size
+        last_y = self.last_move % self.board_size
 
-        # (1,B)==(E,1)-> (E,B)-> (E,B,1)
-        # (1,B)==(E,1)-> (E,B)-> (E,1,B)
         layer3 = (
             (
                 torch.arange(self.board_size, device=self.device).unsqueeze(0)
@@ -238,50 +282,88 @@ class Gomoku:
                 == last_y.unsqueeze(-1)
             ).unsqueeze(1)
         )  # (E,B,B)
-        layer3 = layer3.float()
 
-        # layer4 = (self.turn == 0).float().unsqueeze(-1).unsqueeze(-1)  # (E,1,1)
-        # layer4 = layer4.expand(-1, self.board_size, self.board_size)
+        layer3 = layer3.float()
 
         output = torch.stack(
             [
                 layer1,
                 layer2,
                 layer3,
-                # layer4,
             ],
             dim=1,
-        )  # (E,*,B,B)
+        )  # (E,3,B,B)
         return output
 
     def get_action_mask(self) -> torch.Tensor:
-        """Generates a mask indicating valid actions for each environment.
-
-        Returns:
-            torch.Tensor: Action mask tensor, shaped (E, B*B), with 1s for valid actions and 0s otherwise.
         """
-        return (self.board == 0).flatten(start_dim=1)
+        Priority:
+        1) if current side has any move that immediately makes five, keep only those moves
+        2) else if opponent has any move that would immediately make five next turn, keep only those blocking moves
+        3) else keep normal legal moves
+        """
+        legal = (self.board == 0)
+
+        if not self.action_pruning_enabled:
+            return legal.flatten(start_dim=1)
+
+        # Before 7 total moves placed, neither side can possibly have a "one move to five" threat.
+        active = self.move_count >= 7
+        if not active.any():
+            return legal.flatten(start_dim=1)
+
+        piece = torch.where(self.turn == 0, 1, -1).view(-1, 1, 1)
+        mine = (self.board == piece)
+        opp = (self.board == -piece)
+
+        final_mask = legal.clone()
+        remaining = active.clone()
+
+        # Priority 1: current player can win immediately
+        if self.action_pruning_self_win4 and remaining.any():
+            my_mask = _compute_immediate_five_mask(
+                atk=mine[remaining],
+                deff=opp[remaining],
+                empty=legal[remaining],
+                kernel_horizontal=self.kernel_horizontal,
+                kernel_vertical=self.kernel_vertical,
+                kernel_diagonal=self.kernel_diagonal,
+            )
+            has_my = my_mask.flatten(start_dim=1).any(dim=1)
+            if has_my.any():
+                remaining_ids = remaining.nonzero(as_tuple=False).squeeze(-1)
+                hit_ids = remaining_ids[has_my]
+                final_mask[hit_ids] = my_mask[has_my]
+                remaining[hit_ids] = False
+
+        # Priority 2: block opponent's immediate win
+        if self.action_pruning_block_opp_win4 and remaining.any():
+            opp_mask = _compute_immediate_five_mask(
+                atk=opp[remaining],
+                deff=mine[remaining],
+                empty=legal[remaining],
+                kernel_horizontal=self.kernel_horizontal,
+                kernel_vertical=self.kernel_vertical,
+                kernel_diagonal=self.kernel_diagonal,
+            )
+            has_opp = opp_mask.flatten(start_dim=1).any(dim=1)
+            if has_opp.any():
+                remaining_ids = remaining.nonzero(as_tuple=False).squeeze(-1)
+                hit_ids = remaining_ids[has_opp]
+                final_mask[hit_ids] = opp_mask[has_opp]
+
+        return final_mask.flatten(start_dim=1)
 
     def is_valid(self, action: torch.Tensor) -> torch.Tensor:
-        """Checks the validity of the specified actions in each environment.
-
-        Args:
-            action (torch.Tensor): Actions to be checked, linearly indexed.
-
-        Returns:
-            torch.Tensor: Boolean tensor, shaped (E,), indicating the validity of each action.
-        """
-        out_of_range = action < 0 | (
-            action >= self.board_size * self.board_size)
+        """Checks the validity of the specified actions in each environment."""
+        out_of_range = (action < 0) | (
+            action >= self.board_size * self.board_size
+        )
         x = action // self.board_size
         y = action % self.board_size
-
         values_on_board = self.board[
             torch.arange(self.num_envs, device=self.device), x, y
         ]  # (E,)
-
         not_empty = values_on_board != 0  # (E,)
-
         invalid = out_of_range | not_empty
-
         return ~invalid

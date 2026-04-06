@@ -16,15 +16,19 @@ class Runner(abc.ABC):
     def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
 
+        action_pruning_cfg = cfg.get("action_pruning", None)
+
         self.env = GomokuEnv(
             num_envs=cfg.num_envs,
             board_size=cfg.board_size,
             device=cfg.device,
+            action_pruning=action_pruning_cfg,
         )
         self.eval_env = GomokuEnv(
             num_envs=512,
             board_size=cfg.board_size,
             device=cfg.device,
+            action_pruning=action_pruning_cfg,
         )
         seed = cfg.get("seed", None)
         set_seed(seed)
@@ -150,15 +154,19 @@ class SPRunner(abc.ABC):
     def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
 
+        action_pruning_cfg = cfg.get("action_pruning", None)
+
         self.env = GomokuEnv(
             num_envs=cfg.num_envs,
             board_size=cfg.board_size,
             device=cfg.device,
+            action_pruning=action_pruning_cfg,
         )
         self.eval_env = GomokuEnv(
             num_envs=512,
             board_size=cfg.board_size,
             device=cfg.device,
+            action_pruning=action_pruning_cfg,
         )
         seed = cfg.get("seed", None)
         set_seed(seed)
