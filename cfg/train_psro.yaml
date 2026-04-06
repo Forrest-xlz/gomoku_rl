@@ -8,32 +8,31 @@ augment: false
 epochs: 2000
 steps: 128
 save_interval: 250
-version_name: psro - uniform - threshold - v0
+version_name: psro - active-archive - base
 
 # psro
-meta_solver: uniform_threshold
+meta_solver: uniform
 mean_threshold: 0.99
 std_threshold: 0.005
 min_iter_steps: 1
 max_iter_steps: 5
 max_size: 1
 
-# uniform-threshold pruning
-uniform_lower_threshold: 0.2
-uniform_upper_threshold: 1.0
-min_pool_size_black: 10
-max_pool_size_black: 20
-min_pool_size_white: 10
-max_pool_size_white: 20
+# active / archive management
+mid_low: 0.3
+mid_high: 0.7
+active_min: 5
+protect_latest: 2
+archive_max: 10
 
-#black_checkpoint: pretrained_models/${board_size}_${board_size}/${algo.name}/0.pt
-#white_checkpoint: pretrained_models/${board_size}_${board_size}/${algo.name}/1.pt
+# black_checkpoint: pretrained_models/${board_size}_${board_size}/${algo.name}/0.pt
+# white_checkpoint: pretrained_models/${board_size}_${board_size}/${algo.name}/1.pt
 
 wandb:
-  name: ${version_name} 
+  name: ${version_name}
   group: ${board_size}_${board_size}
   project: gomoku_rl
-  mode: online # set to 'disabled' when debugging locally
+  mode: online
 
 defaults:
   - _self_

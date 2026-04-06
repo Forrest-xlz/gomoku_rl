@@ -18,18 +18,26 @@ from gomoku_rl.utils.psro import (
     PSROPolicyWrapper,
     PayoffType,
     Population,
+    black_archive_similarity,
+    black_mean_win_rates,
     calculate_jpc,
+    eval_black_win_rates_against_population,
+    eval_white_win_rates_against_population,
     get_meta_solver,
-    get_new_payoffs,
     get_new_payoffs_sp,
     init_payoffs,
     init_payoffs_sp,
-    prune_populations_once_by_threshold_and_capacity,
+    mid_ratio,
+    select_active_indices,
+    white_archive_similarity,
+    white_mean_win_rates,
 )
 from gomoku_rl.utils.visual import payoff_headmap
 
 
 class PSRORunner(Runner):
+    
+
     def __init__(self, cfg: DictConfig) -> None:
         super().__init__(cfg)
         ci_kwargs = get_kwargs(
@@ -43,6 +51,22 @@ class PSRORunner(Runner):
         self.converged_indicator = ConvergedIndicator(**ci_kwargs)
         self.learning_player_id = cfg.get("first_id", 0)
         self.meta_solver_name = cfg.get("meta_solver", "uniform").lower()
+        self.meta_solver = get_meta_solver(self.meta_solver_name)
+
+        self.mid_low = float(cfg.get("mid_low", 0.3))
+        self.mid_high = float(cfg.get("mid_high", 0.7))
+        self.active_min = int(cfg.get("active_min", 8))
+        self.protect_latest = int(cfg.get("protect_latest", 5))
+        self.archive_max = int(cfg.get("archive_max", 32))
+        if not (0.0 <= self.mid_low <= self.mid_high <= 1.0):
+            raise ValueError("mid_low and mid_high must satisfy 0 <= mid_low <= mid_high <= 1")
+        if self.active_min <= 0:
+            raise ValueError("active_min must be positive")
+        if not (0 <= self.protect_latest < self.archive_max):
+            raise ValueError(
+                f"protect_latest must satisfy 0 <= protect_latest < {self.archive_max}"
+            )
+        self.rng = np.random.default_rng(int(cfg.get("seed", 0)))
 
         if self.cfg.get("black_checkpoint", None):
             _policy = copy.deepcopy(self.policy_black)
@@ -55,7 +79,6 @@ class PSRORunner(Runner):
                 initial_policy=_policy,
                 dir=os.path.join(self.run_dir, "population_0"),
                 device=cfg.device,
-                module_prototype=copy.deepcopy(self.policy_black),
             ),
         )
 
@@ -70,24 +93,17 @@ class PSRORunner(Runner):
                 initial_policy=_policy,
                 dir=os.path.join(self.run_dir, "population_1"),
                 device=cfg.device,
-                module_prototype=copy.deepcopy(self.policy_white),
             ),
         )
 
         self.player_0.set_oracle_mode(self.learning_player_id == 0)
         self.player_1.set_oracle_mode(self.learning_player_id != 0)
-        if self.player_0.population.restored_from_meta or self.player_1.population.restored_from_meta:
-            logging.info(
-                "Restored PSRO populations from metadata: "
-                f"black_active={self.player_0.population.active_count()}/{len(self.player_0.population)}, "
-                f"white_active={self.player_1.population.active_count()}/{len(self.player_1.population)}"
-            )
         self.payoffs = init_payoffs(
             env=self.eval_env,
             population_0=self.player_0.population,
             population_1=self.player_1.population,
         )
-        self.meta_solver = get_meta_solver(self.meta_solver_name)
+        self.archive_metrics = {}
         self.collector = VersusPlayCollector(
             self.env,
             self.player_0,
@@ -95,6 +111,142 @@ class PSRORunner(Runner):
             out_device=self.cfg.get("out_device", None),
             augment=self.cfg.get("augment", False),
         )
+        self._rebuild_active_pools(log_prefix="init")
+
+    def _build_active_masks(self):
+        black_wr_vs_white = eval_black_win_rates_against_population(
+            env=self.eval_env,
+            current_black=self.policy_black,
+            white_population=self.player_1.population,
+        )
+        white_wr_vs_black = eval_white_win_rates_against_population(
+            env=self.eval_env,
+            black_population=self.player_0.population,
+            current_white=self.policy_white,
+        )
+
+        white_active_info = select_active_indices(
+            win_rates=black_wr_vs_white,
+            mid_low=self.mid_low,
+            mid_high=self.mid_high,
+            active_min=self.active_min,
+            rng=self.rng,
+        )
+        black_active_info = select_active_indices(
+            win_rates=white_wr_vs_black,
+            mid_low=self.mid_low,
+            mid_high=self.mid_high,
+            active_min=self.active_min,
+            rng=self.rng,
+        )
+        return black_wr_vs_white, white_wr_vs_black, black_active_info, white_active_info
+
+    def _rebuild_active_pools(self, log_prefix: str):
+        black_wr_vs_white, white_wr_vs_black, black_active_info, white_active_info = self._build_active_masks()
+
+        self.player_0.population.set_active_indices(black_active_info["active_indices"])
+        self.player_1.population.set_active_indices(white_active_info["active_indices"])
+
+        active_black_mask = self.player_0.population.get_active_mask()
+        active_white_mask = self.player_1.population.get_active_mask()
+        meta_policy_0, meta_policy_1 = self.meta_solver(
+            payoffs=self.payoffs,
+            active_row_mask=active_black_mask,
+            active_col_mask=active_white_mask,
+        )
+        self.player_0.set_meta_policy(meta_policy=meta_policy_0)
+        self.player_1.set_meta_policy(meta_policy=meta_policy_1)
+
+        self.archive_metrics = {
+            "archive/black_mid_ratio": mid_ratio(white_wr_vs_black, self.mid_low, self.mid_high),
+            "archive/white_mid_ratio": mid_ratio(black_wr_vs_white, self.mid_low, self.mid_high),
+            "archive/black_similarity": black_archive_similarity(self.payoffs),
+            "archive/white_similarity": white_archive_similarity(self.payoffs),
+        }
+
+        logging.info(
+            f"{log_prefix} active pool | "
+            f"black_vs_white_wr={np.array2string(black_wr_vs_white, precision=3)} | "
+            f"white_active={white_active_info['active_indices'].tolist()} | "
+            f"white_mid={white_active_info['mid_indices'].tolist()} | "
+            f"white_easy={white_active_info['easy_indices'].tolist()} | "
+            f"white_hard={white_active_info['hard_indices'].tolist()}"
+        )
+        logging.info(
+            f"{log_prefix} active pool | "
+            f"white_vs_black_wr={np.array2string(white_wr_vs_black, precision=3)} | "
+            f"black_active={black_active_info['active_indices'].tolist()} | "
+            f"black_mid={black_active_info['mid_indices'].tolist()} | "
+            f"black_easy={black_active_info['easy_indices'].tolist()} | "
+            f"black_hard={black_active_info['hard_indices'].tolist()}"
+        )
+        logging.info(
+            f"{log_prefix} archive metrics | "
+            f"black_mid_ratio={self.archive_metrics['archive/black_mid_ratio']:.3f} | "
+            f"white_mid_ratio={self.archive_metrics['archive/white_mid_ratio']:.3f} | "
+            f"black_similarity={self.archive_metrics['archive/black_similarity']:.3f} | "
+            f"white_similarity={self.archive_metrics['archive/white_similarity']:.3f}"
+        )
+        logging.info(f"Meta Policy: Black {meta_policy_0}, White {meta_policy_1}")
+
+        if self.payoffs.shape[0] == self.payoffs.shape[1] and active_black_mask.sum() > 1 and active_white_mask.sum() > 1 and active_black_mask.sum() == active_white_mask.sum():
+            logging.info(
+                f"Active JPC:{calculate_jpc((self.payoffs + 1) / 2, active_black_mask, active_white_mask)}"
+            )
+
+    def _archive_insert_and_evict(self, wrapper: PSROPolicyWrapper, mean_win_rates: np.ndarray, side: str) -> dict[str, Any]:
+        population = wrapper.population
+        info = {
+            "side": side,
+            "removed_archive_index": None,
+            "removed_checkpoint_id": None,
+            "archive_mean_win_rates": mean_win_rates.copy(),
+        }
+        if len(population) >= self.archive_max:
+            protected_start = max(0, len(population) - self.protect_latest)
+            candidate_indices = np.arange(protected_start, dtype=int)
+            if len(candidate_indices) == 0:
+                raise RuntimeError("No removable archive candidate found. Decrease protect_latest.")
+            local_remove = int(np.argmin(mean_win_rates[candidate_indices]))
+            remove_index = int(candidate_indices[local_remove])
+            removed_entry = population.policy_sets[remove_index]
+            population.remove(remove_index)
+            info["removed_archive_index"] = remove_index
+            info["removed_checkpoint_id"] = int(removed_entry) if isinstance(removed_entry, int) else str(removed_entry)
+        wrapper.add_current_policy()
+        info["archive_size"] = len(population)
+        return info
+
+    def _refresh_archives_and_payoffs(self):
+        black_info = self._archive_insert_and_evict(
+            wrapper=self.player_0,
+            mean_win_rates=black_mean_win_rates(self.payoffs),
+            side="black",
+        )
+        white_info = self._archive_insert_and_evict(
+            wrapper=self.player_1,
+            mean_win_rates=white_mean_win_rates(self.payoffs),
+            side="white",
+        )
+        logging.info(
+            "archive update | "
+            f"black_removed_index={black_info['removed_archive_index']} | "
+            f"black_removed_checkpoint={black_info['removed_checkpoint_id']} | "
+            f"white_removed_index={white_info['removed_archive_index']} | "
+            f"white_removed_checkpoint={white_info['removed_checkpoint_id']}"
+        )
+
+        self.payoffs = init_payoffs(
+            env=self.eval_env,
+            population_0=self.player_0.population,
+            population_1=self.player_1.population,
+        )
+        logging.info(
+            "archive mean win rate after refresh | "
+            f"black={np.array2string(black_mean_win_rates(self.payoffs), precision=3)} | "
+            f"white={np.array2string(white_mean_win_rates(self.payoffs), precision=3)}"
+        )
+        self._rebuild_active_pools(log_prefix="refresh")
 
     def _epoch(self, epoch: int) -> dict[str, Any]:
         if self.learning_player_id == 0:
@@ -159,56 +311,9 @@ class PSRORunner(Runner):
             logging.info(f"learning_player_id:{self.learning_player_id}")
 
             if self.learning_player_id == self.cfg.get("first_id", 0):
-                self.player_0.add_current_policy()
-                self.player_1.add_current_policy()
-                self.payoffs = get_new_payoffs(
-                    env=self.eval_env,
-                    population_0=self.player_0.population,
-                    population_1=self.player_1.population,
-                    old_payoffs=self.payoffs,
-                )
-                print(repr(self.payoffs))
+                self._refresh_archives_and_payoffs()
 
-                if self.meta_solver_name == "uniform_threshold":
-                    prune_info = prune_populations_once_by_threshold_and_capacity(
-                        payoffs=self.payoffs,
-                        population_black=self.player_0.population,
-                        population_white=self.player_1.population,
-                        lower_threshold=self.cfg.get("uniform_lower_threshold", 0.35),
-                        upper_threshold=self.cfg.get("uniform_upper_threshold", 0.65),
-                        min_pool_size_black=self.cfg.get("min_pool_size_black", 4),
-                        max_pool_size_black=self.cfg.get("max_pool_size_black", 12),
-                        min_pool_size_white=self.cfg.get("min_pool_size_white", 4),
-                        max_pool_size_white=self.cfg.get("max_pool_size_white", 12),
-                    )
-                    logging.info(
-                        "uniform_threshold prune | "
-                        f"black_mean={np.array2string(prune_info['black_mean_win_rates'], precision=3)} | "
-                        f"white_mean={np.array2string(prune_info['white_mean_win_rates'], precision=3)} | "
-                        f"black_threshold_pruned={prune_info['black_threshold_pruned']} | "
-                        f"white_threshold_pruned={prune_info['white_threshold_pruned']} | "
-                        f"black_capacity_pruned={prune_info['black_capacity_pruned']} | "
-                        f"white_capacity_pruned={prune_info['white_capacity_pruned']} | "
-                        f"black_active={prune_info['black_active_mask'].astype(int).tolist()} | "
-                        f"white_active={prune_info['white_active_mask'].astype(int).tolist()}"
-                    )
-
-                active_black_mask = self.player_0.population.get_active_mask()
-                active_white_mask = self.player_1.population.get_active_mask()
-                meta_policy_0, meta_policy_1 = self.meta_solver(
-                    payoffs=self.payoffs,
-                    active_row_mask=active_black_mask,
-                    active_col_mask=active_white_mask,
-                )
-                logging.info(f"Meta Policy: Black {meta_policy_0}, White {meta_policy_1}")
-                self.player_0.set_meta_policy(meta_policy=meta_policy_0)
-                self.player_1.set_meta_policy(meta_policy=meta_policy_1)
-
-                if np.sum(active_black_mask) > 1 and np.sum(active_white_mask) > 1:
-                    logging.info(
-                        f"Active JPC:{calculate_jpc((self.payoffs + 1) / 2, active_black_mask, active_white_mask)}"
-                    )
-
+        info.update(self.archive_metrics)
         return info
 
     def _post_run(self):
@@ -223,13 +328,14 @@ class PSRORunner(Runner):
     def _log(self, info: dict[str, Any], epoch: int):
         if epoch % 5 == 0:
             print(
-                "Black vs White:{:.2f}%\tBlack vs baseline:{:.2f}%\tWhite vs baseline:{:.2f}%".format(
+                "Black vs White:{:.2f}%	Black vs baseline:{:.2f}%	White vs baseline:{:.2f}%".format(
                     info["eval/black_vs_white"] * 100,
                     info["eval/black_vs_baseline"] * 100,
                     info["eval/white_vs_baseline"] * 100,
                 )
             )
         return super()._log(info, epoch)
+
 
 
 class PSROSPRunner(SPRunner):
