@@ -1,37 +1,35 @@
-import numpy as np
-import copy
 import logging
-import os
 from typing import Any
-
-import torch
-import wandb
 from omegaconf import DictConfig
 
+from gomoku_rl.utils.policy import _policy_t, uniform_policy
 from .base import Runner, SPRunner
-from gomoku_rl.collector import BlackPlayCollector, VersusPlayCollector, WhitePlayCollector
-from gomoku_rl.utils.eval import eval_win_rate
-from gomoku_rl.utils.misc import add_prefix, get_kwargs
-from gomoku_rl.utils.policy import uniform_policy
+from gomoku_rl.utils.misc import get_kwargs, add_prefix
+from gomoku_rl.utils.visual import payoff_headmap
+import os
+import copy
 from gomoku_rl.utils.psro import (
     ConvergedIndicator,
-    PSROPolicyWrapper,
-    PayoffType,
     Population,
-    calculate_jpc,
-    get_meta_solver,
+    PSROPolicyWrapper,
     get_new_payoffs,
     get_new_payoffs_sp,
-    init_payoffs,
     init_payoffs_sp,
-    prune_populations_once_by_threshold_and_capacity,
+    get_meta_solver,
+    calculate_jpc,
+    PayoffType,
 )
-from gomoku_rl.utils.visual import payoff_headmap
+from gomoku_rl.utils.eval import eval_win_rate
+import wandb
+import torch
+
+from gomoku_rl.collector import VersusPlayCollector, BlackPlayCollector, WhitePlayCollector
 
 
 class PSRORunner(Runner):
     def __init__(self, cfg: DictConfig) -> None:
         super().__init__(cfg)
+
         ci_kwargs = get_kwargs(
             cfg,
             "max_size",
@@ -41,8 +39,8 @@ class PSRORunner(Runner):
             "max_iter_steps",
         )
         self.converged_indicator = ConvergedIndicator(**ci_kwargs)
+
         self.learning_player_id = cfg.get("first_id", 0)
-        self.meta_solver_name = cfg.get("meta_solver", "uniform").lower()
 
         if self.cfg.get("black_checkpoint", None):
             _policy = copy.deepcopy(self.policy_black)
@@ -55,10 +53,8 @@ class PSRORunner(Runner):
                 initial_policy=_policy,
                 dir=os.path.join(self.run_dir, "population_0"),
                 device=cfg.device,
-                module_prototype=copy.deepcopy(self.policy_black),
             ),
         )
-
         if self.cfg.get("white_checkpoint", None):
             _policy = copy.deepcopy(self.policy_white)
             _policy.eval()
@@ -70,46 +66,43 @@ class PSRORunner(Runner):
                 initial_policy=_policy,
                 dir=os.path.join(self.run_dir, "population_1"),
                 device=cfg.device,
-                module_prototype=copy.deepcopy(self.policy_white),
             ),
         )
-
         self.player_0.set_oracle_mode(self.learning_player_id == 0)
         self.player_1.set_oracle_mode(self.learning_player_id != 0)
-        if self.player_0.population.restored_from_meta or self.player_1.population.restored_from_meta:
-            logging.info(
-                "Restored PSRO populations from metadata: "
-                f"black_active={self.player_0.population.active_count()}/{len(self.player_0.population)}, "
-                f"white_active={self.player_1.population.active_count()}/{len(self.player_1.population)}"
-            )
-        self.payoffs = init_payoffs(
+
+        self.payoffs = get_new_payoffs(
             env=self.eval_env,
             population_0=self.player_0.population,
             population_1=self.player_1.population,
+            old_payoffs=None,
         )
-        self.meta_solver = get_meta_solver(self.meta_solver_name)
-        self.collector = VersusPlayCollector(
-            self.env,
-            self.player_0,
-            self.player_1,
-            out_device=self.cfg.get("out_device", None),
-            augment=self.cfg.get("augment", False),
-        )
+        self.meta_solver = get_meta_solver(cfg.get("meta_solver", "uniform"))
+
+        self.collector = VersusPlayCollector(self.env, self.player_0, self.player_1, out_device=self.cfg.get(
+            "out_device", None), augment=self.cfg.get("augment", False),)
 
     def _epoch(self, epoch: int) -> dict[str, Any]:
         if self.learning_player_id == 0:
             self.player_1.sample()
         else:
             self.player_0.sample()
+        data_0, data_1, info = self.collector.rollout(
+            steps=self.steps
+        )
 
-        data_0, data_1, info = self.collector.rollout(steps=self.steps)
         info = add_prefix(info, "versus_play/")
-        info["fps"] = info["versus_play/fps"]
-        del info["versus_play/fps"]
+        info['fps'] = info['versus_play/fps']
+        del info['versus_play/fps']
+
         info.update(
             {
-                "pure_strategy_black": self.player_0.population._idx if self.learning_player_id == 1 else -1,
-                "pure_strategy_white": self.player_1.population._idx if self.learning_player_id == 0 else -1,
+                "pure_strategy_black": self.player_0.population._idx
+                if self.learning_player_id == 1
+                else -1,
+                "pure_strategy_white": self.player_1.population._idx
+                if self.learning_player_id == 0
+                else -1,
             }
         )
 
@@ -140,12 +133,12 @@ class PSRORunner(Runner):
                 ),
             }
         )
+
         self.converged_indicator.update(
             info["eval/black_vs_white"]
             if self.learning_player_id == 0
             else (1 - info["eval/black_vs_white"])
         )
-
         if self.converged_indicator.converged():
             self.collector.reset()
             self.converged_indicator.reset()
@@ -155,9 +148,9 @@ class PSRORunner(Runner):
             else:
                 self.player_1.set_oracle_mode(False)
                 self.player_0.set_oracle_mode(True)
+
             self.learning_player_id = (self.learning_player_id + 1) % 2
             logging.info(f"learning_player_id:{self.learning_player_id}")
-
             if self.learning_player_id == self.cfg.get("first_id", 0):
                 self.player_0.add_current_policy()
                 self.player_1.add_current_policy()
@@ -168,46 +161,15 @@ class PSRORunner(Runner):
                     old_payoffs=self.payoffs,
                 )
                 print(repr(self.payoffs))
-
-                if self.meta_solver_name == "uniform_threshold":
-                    prune_info = prune_populations_once_by_threshold_and_capacity(
-                        payoffs=self.payoffs,
-                        population_black=self.player_0.population,
-                        population_white=self.player_1.population,
-                        lower_threshold=self.cfg.get("uniform_lower_threshold", 0.35),
-                        upper_threshold=self.cfg.get("uniform_upper_threshold", 0.65),
-                        min_pool_size_black=self.cfg.get("min_pool_size_black", 4),
-                        max_pool_size_black=self.cfg.get("max_pool_size_black", 12),
-                        min_pool_size_white=self.cfg.get("min_pool_size_white", 4),
-                        max_pool_size_white=self.cfg.get("max_pool_size_white", 12),
-                    )
-                    logging.info(
-                        "uniform_threshold prune | "
-                        f"black_mean={np.array2string(prune_info['black_mean_win_rates'], precision=3)} | "
-                        f"white_mean={np.array2string(prune_info['white_mean_win_rates'], precision=3)} | "
-                        f"black_threshold_pruned={prune_info['black_threshold_pruned']} | "
-                        f"white_threshold_pruned={prune_info['white_threshold_pruned']} | "
-                        f"black_capacity_pruned={prune_info['black_capacity_pruned']} | "
-                        f"white_capacity_pruned={prune_info['white_capacity_pruned']} | "
-                        f"black_active={prune_info['black_active_mask'].astype(int).tolist()} | "
-                        f"white_active={prune_info['white_active_mask'].astype(int).tolist()}"
-                    )
-
-                active_black_mask = self.player_0.population.get_active_mask()
-                active_white_mask = self.player_1.population.get_active_mask()
                 meta_policy_0, meta_policy_1 = self.meta_solver(
-                    payoffs=self.payoffs,
-                    active_row_mask=active_black_mask,
-                    active_col_mask=active_white_mask,
+                    payoffs=self.payoffs)
+                logging.info(
+                    f"Meta Policy: Black {meta_policy_0}, White {meta_policy_1}"
                 )
-                logging.info(f"Meta Policy: Black {meta_policy_0}, White {meta_policy_1}")
                 self.player_0.set_meta_policy(meta_policy=meta_policy_0)
                 self.player_1.set_meta_policy(meta_policy=meta_policy_1)
 
-                if np.sum(active_black_mask) > 1 and np.sum(active_white_mask) > 1:
-                    logging.info(
-                        f"Active JPC:{calculate_jpc((self.payoffs + 1) / 2, active_black_mask, active_white_mask)}"
-                    )
+                logging.info(f"JPC:{calculate_jpc(self.payoffs+1)/2}")
 
         return info
 
@@ -243,12 +205,14 @@ class PSROSPRunner(SPRunner):
             "max_iter_steps",
         )
         self.converged_indicator = ConvergedIndicator(**ci_kwargs)
-
-        if (population_dir := cfg.get("population_dir", None)) and os.path.isdir(population_dir):
+        if (population_dir := cfg.get("population_dir", None)) and os.path.isdir(
+            population_dir
+        ):
             _policy = []
             for p in os.listdir(population_dir):
                 tmp = copy.deepcopy(self.policy)
-                tmp.load_state_dict(torch.load(os.path.join(population_dir, p), map_location=self.cfg.device))
+                tmp.load_state_dict(torch.load(
+                    os.path.join(population_dir, p), map_location=self.cfg.device))
                 tmp.eval()
                 _policy.append(tmp)
         elif self.cfg.get("checkpoint", None):
@@ -256,12 +220,12 @@ class PSROSPRunner(SPRunner):
             _policy.eval()
         else:
             _policy = uniform_policy
-
         self.population = Population(
             initial_policy=_policy,
             dir=os.path.join(self.run_dir, "population"),
             device=cfg.device,
         )
+
         self.payoffs = init_payoffs_sp(
             env=self.eval_env,
             population=self.population,
@@ -270,44 +234,42 @@ class PSROSPRunner(SPRunner):
         print(repr(self.payoffs))
         self.meta_solver = get_meta_solver(cfg.get("meta_solver", "uniform"))
         if len(self.population) > 1:
-            self.meta_policy_black, self.meta_policy_white = self.meta_solver(payoffs=self.payoffs)
-            logging.info(f"Meta Policy: {self.meta_policy_black}, {self.meta_policy_white}")
+            self.meta_policy_black, self.meta_policy_white = self.meta_solver(
+                payoffs=self.payoffs
+            )
+            logging.info(
+                f"Meta Policy: {self.meta_policy_black}, {self.meta_policy_white}"
+            )
         else:
             self.meta_policy_black, self.meta_policy_white = None, None
 
-        self.collector_black = BlackPlayCollector(
-            self.env,
-            self.policy,
-            self.population,
-            out_device=self.cfg.get("out_device", None),
-            augment=self.cfg.get("augment", False),
-        )
-        self.collector_white = WhitePlayCollector(
-            copy.deepcopy(self.env),
-            self.population,
-            self.policy,
-            out_device=self.cfg.get("out_device", None),
-            augment=self.cfg.get("augment", False),
-        )
+        self.collector_black = BlackPlayCollector(self.env, self.policy, self.population, out_device=self.cfg.get(
+            "out_device", None), augment=self.cfg.get("augment", False),)
+        self.collector_white = WhitePlayCollector(copy.deepcopy(self.env), self.population, self.policy,  out_device=self.cfg.get(
+            "out_device", None), augment=self.cfg.get("augment", False),)
 
     def _epoch(self, epoch: int) -> dict[str, Any]:
         info = {}
         self.population.sample(self.meta_policy_white)
         info.update({"pure_strategy_white": self.population._idx})
-        data1, info1 = self.collector_black.rollout(steps=self.steps)
+        data1, info1 = self.collector_black.rollout(
+            steps=self.steps
+        )
         info.update(add_prefix(info1, "black_play/"))
-
         self.population.sample(self.meta_policy_black)
         info.update({"pure_strategy_black": self.population._idx})
-        data2, info2 = self.collector_white.rollout(steps=self.steps)
+        data2, info2 = self.collector_white.rollout(
+            steps=self.steps
+        )
         info.update(add_prefix(info2, "white_play/"))
-
         data = torch.cat([data1, data2], dim=-1)
-        info.update(add_prefix(self.policy.learn(data.to_tensordict()), "policy/"))
+        info.update(add_prefix(self.policy.learn(
+            data.to_tensordict()), "policy/"))
         del data
-        info["fps"] = (info["black_play/fps"] + info["white_play/fps"]) / 2
-        del info["black_play/fps"]
-        del info["white_play/fps"]
+
+        info['fps'] = (info['black_play/fps']+info['white_play/fps'])/2
+        del info['black_play/fps']
+        del info['white_play/fps']
 
         info.update(
             {
@@ -322,27 +284,27 @@ class PSROSPRunner(SPRunner):
                     player_white=self.policy,
                 ),
                 "eval/player_vs_baseline": eval_win_rate(
-                    self.eval_env,
-                    player_black=self.policy,
-                    player_white=self.baseline,
+                    self.eval_env, player_black=self.policy, player_white=self.baseline
                 ),
                 "eval/baseline_vs_player": eval_win_rate(
-                    self.eval_env,
-                    player_black=self.baseline,
-                    player_white=self.policy,
+                    self.eval_env, player_black=self.baseline, player_white=self.policy
                 ),
             }
         )
-        alpha = 0.5
-        weighted_wr = alpha * info["eval/player_vs_opponent"] + (1 - alpha) * (1 - info["eval/opponent_vs_player"])
-        info.update({"weighted_win_rate": weighted_wr})
-        self.converged_indicator.update(weighted_wr)
 
+        alpha = 0.5
+        weighted_wr = alpha * info["eval/player_vs_opponent"] + (1 - alpha) * (
+            1 - info["eval/opponent_vs_player"]
+        )
+        info.update({"weighted_win_rate": weighted_wr})
+
+        self.converged_indicator.update(weighted_wr)
         if self.converged_indicator.converged():
             self.converged_indicator.reset()
             _policy = copy.deepcopy(self.policy)
             _policy.eval()
             self.population.add(_policy)
+
             self.payoffs = get_new_payoffs_sp(
                 env=self.eval_env,
                 population=self.population,
@@ -350,8 +312,12 @@ class PSROSPRunner(SPRunner):
                 type=PayoffType.black_vs_white,
             )
             print(repr(self.payoffs))
-            self.meta_policy_black, self.meta_policy_white = self.meta_solver(payoffs=self.payoffs)
-            logging.info(f"Meta Policy: {self.meta_policy_black}, {self.meta_policy_white}")
+            self.meta_policy_black, self.meta_policy_white = self.meta_solver(
+                payoffs=self.payoffs
+            )
+            logging.info(
+                f"Meta Policy: {self.meta_policy_black}, {self.meta_policy_white}"
+            )
 
         return info
 

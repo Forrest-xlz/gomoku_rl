@@ -15,8 +15,8 @@ steps: 128
 save_interval: 300
 log_interval: 5
 
-#black_checkpoint: pretrained_models/${board_size}_${board_size}/${algo.name}/0.pt
-#white_checkpoint: pretrained_models/${board_size}_${board_size}/${algo.name}/1.pt
+black_checkpoint: wandb\run-20260405_043213-ez2jroe6\files\black_2100.pt
+white_checkpoint: wandb\run-20260405_043213-ez2jroe6\files\white_2100.pt
 
 gate:
   enabled: true

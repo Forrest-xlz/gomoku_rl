@@ -165,14 +165,16 @@ class PPO(Policy):
             "loss_critic": torch.stack(loss_critics).mean().item(),
             "loss_entropy": torch.stack(loss_entropies).mean().item(),
         }
+    
 
-    def state_dict(self) -> Dict:
+    def state_dict(self) -> Dict:   #同时保存actor和critic的参数，以及优化器的状态
         return {
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
+            "optimizer": self.optim.state_dict(),
         }
 
-    def load_state_dict(self, state_dict: Dict):
+    def load_state_dict(self, state_dict: Dict):    # 加载actor和critic的参数，以及优化器的状态
         self.critic.load_state_dict(state_dict["critic"], strict=False)
         self.actor.load_state_dict(state_dict["actor"])
 
@@ -185,8 +187,12 @@ class PPO(Policy):
             normalize_advantage=self.cfg.get("normalize_advantage", True),
             loss_critic_type="smooth_l1",
         )
-
         self.optim = get_optimizer(self.cfg.optimizer, self.loss_module.parameters())
+
+        opt_state = state_dict.get("optimizer", state_dict.get("optim", None))
+        if opt_state is not None:
+            self.optim.load_state_dict(opt_state)
+            print("optimizer state loaded successfully.")
 
     def train(self):
         self.actor.train()
