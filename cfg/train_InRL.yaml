@@ -6,7 +6,7 @@ device: cuda
 out_device: cpu
 run_dir:
 
-version_name: original - no - pretraining - v0
+version_name: inrl - no - pretrained - action - pruning - v1
 
 augment: false
 
@@ -15,11 +15,15 @@ steps: 128
 save_interval: 300
 log_interval: 5
 
-#black_checkpoint: pretrained_models/${board_size}_${board_size}/${algo.name}/0.pt
-#white_checkpoint: pretrained_models/${board_size}_${board_size}/${algo.name}/1.pt
+#black_checkpoint: wandb\run-20260405_043213-ez2jroe6\files\black_2100.pt
+#white_checkpoint: wandb\run-20260405_043213-ez2jroe6\files\white_2100.pt
+
+# action pruning settings
+action_pruning:
+  enabled: true
 
 gate:
-  enabled: true
+  enabled: false
   interval: 10  # number of epochs between gate evaluations
   warmup_epochs: 0  # number of epochs to wait before enabling the gate
   eval_n: 3 # number of evaluation games to play for gate decision
