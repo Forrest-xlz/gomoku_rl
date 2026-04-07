@@ -310,15 +310,8 @@ class Gomoku:
         if action_pruning is None:
             action_pruning = {}
 
+        # 只保留一个总开关：enable=true 时，T0/T1/T2/T3 全部启用
         self.action_pruning_enabled = bool(action_pruning.get("enabled", False))
-        self.action_pruning_self_win4 = bool(action_pruning.get("self_win4", True))
-        self.action_pruning_block_opp_win4 = bool(
-            action_pruning.get("block_opp_win4", True)
-        )
-        self.action_pruning_self_open4 = bool(
-            action_pruning.get("self_open4", False)
-        )
-        self.action_pruning_t3 = bool(action_pruning.get("t3", False))
 
         self.board: torch.Tensor = torch.zeros(
             num_envs,
@@ -535,18 +528,18 @@ class Gomoku:
         T0) current player immediate five
         T1) block opponent immediate five
         T2) current player creates true open four: _XXXX_
-        T3) opponent T2 full defense points  ∪  current player's forcing-four points
+        T3) opponent T2 full defense points ∪ current player's forcing-four points
         fallback) normal legal moves
 
-        Optimization goals:
-        - 5-cell counts computed once, reused by T0/T1/T3
-        - 6-cell counts computed once, reused by T2/T3
-        - endpoint-empty counts computed once, reused by T2/T3
-        - if T0/T1 solved everything, skip all 6-cell convolutions
-        - T3 is triggered only when opponent really has a T2 threat
+        Notes:
+        - enable=True 时，T0/T1/T2/T3 全部开启
+        - 5 格卷积只算 1 次，供 T0/T1/T3 复用
+        - 6 格卷积只算 1 次，供 T2/T3 复用
+        - end6 卷积只算 1 次，供 T2/T3 复用
+        - 若某个 env 在高优先级阶段命中，则不会进入后续低优先级阶段
+        - T3 只在“对手真的存在 T2 威胁”时触发
         """
         legal = (self.board == 0)
-
         if not self.action_pruning_enabled:
             return legal.flatten(start_dim=1)
 
@@ -557,14 +550,10 @@ class Gomoku:
         final_mask = legal.clone()
         remaining = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
 
-        # -------- Stage A: 5-cell counts, shared by T0/T1/T3 --------
-        need5 = (
-            self.action_pruning_self_win4
-            or self.action_pruning_block_opp_win4
-            or self.action_pruning_t3
-        )
-
-        active5 = remaining & (self.move_count >= 6) if need5 else torch.zeros_like(remaining)
+        # ============================================================
+        # Stage A: 5-cell counts, shared by T0 / T1 / T3
+        # ============================================================
+        active5 = remaining & (self.move_count >= 6)
 
         active5_ids = None
         active5_local_mc = None
@@ -573,7 +562,7 @@ class Gomoku:
         legal5 = None
         id_to_active5 = None
 
-        if need5 and active5.any():
+        if active5.any():
             active5_ids = active5.nonzero(as_tuple=False).squeeze(-1)
             active5_local_mc = self.move_count[active5_ids]
 
@@ -581,6 +570,7 @@ class Gomoku:
             opp5 = opp[active5]
             legal5 = legal[active5]
 
+            # 5 格卷积：只算一次，后续 T0/T1/T3 全复用
             mine5_h, mine5_v, mine5_d1, mine5_d2 = _compute_line_counts(
                 mine5,
                 self.kernel_horizontal,
@@ -594,7 +584,7 @@ class Gomoku:
                 self.kernel_diagonal,
             )
 
-            # map global env id -> local index in active5 tensors
+            # global env id -> local index in active5 tensors
             id_to_active5 = torch.full(
                 (self.num_envs,),
                 -1,
@@ -605,9 +595,11 @@ class Gomoku:
                 active5_ids.shape[0], device=self.device
             )
 
-        # T0
-        has_t0_local = None
-        if self.action_pruning_self_win4 and active5_ids is not None:
+            # ---------------- T0: current player immediate five ----------------
+            has_t0_local = torch.zeros(
+                active5_ids.shape[0], dtype=torch.bool, device=self.device
+            )
+
             t0_eligible = active5_local_mc >= 8
             if t0_eligible.any():
                 my_mask5 = _counts_to_immediate_five_mask(
@@ -616,13 +608,17 @@ class Gomoku:
                     legal5,
                 )
                 has_t0_local = my_mask5.flatten(start_dim=1).any(dim=1) & t0_eligible
+
                 if has_t0_local.any():
                     hit_ids = active5_ids[has_t0_local]
                     final_mask[hit_ids] = my_mask5[has_t0_local]
                     remaining[hit_ids] = False
 
-        # T1
-        if self.action_pruning_block_opp_win4 and active5_ids is not None:
+            # ---------------- T1: block opponent immediate five ----------------
+            has_t1_local = torch.zeros(
+                active5_ids.shape[0], dtype=torch.bool, device=self.device
+            )
+
             t1_eligible = active5_local_mc >= 7
             if t1_eligible.any():
                 opp_mask5 = _counts_to_immediate_five_mask(
@@ -631,28 +627,35 @@ class Gomoku:
                     legal5,
                 )
                 has_t1_local = opp_mask5.flatten(start_dim=1).any(dim=1) & t1_eligible
-                if has_t0_local is not None:
-                    has_t1_local = has_t1_local & (~has_t0_local)
+                has_t1_local = has_t1_local & (~has_t0_local)
+
                 if has_t1_local.any():
                     hit_ids = active5_ids[has_t1_local]
                     final_mask[hit_ids] = opp_mask5[has_t1_local]
                     remaining[hit_ids] = False
 
-        # Early exit: no need for any 6-cell convs
-        need6 = self.action_pruning_self_open4 or self.action_pruning_t3
-        active6 = (
-            remaining & (self.move_count >= 6) & (self.board_size >= 6)
-            if need6 else torch.zeros_like(remaining)
-        )
+        # 若高优先级阶段已经把所有 env 都处理完，直接返回
+        if not remaining.any():
+            return final_mask.flatten(start_dim=1)
+
+        # board_size < 6 时，不存在 T2/T3
+        if self.board_size < 6:
+            return final_mask.flatten(start_dim=1)
+
+        # ============================================================
+        # Stage B: 6-cell counts, shared by T2 / T3
+        # ============================================================
+        active6 = remaining & (self.move_count >= 6)
         if not active6.any():
             return final_mask.flatten(start_dim=1)
 
-        # -------- Stage B: 6-cell counts, shared by T2/T3 --------
         active6_ids = active6.nonzero(as_tuple=False).squeeze(-1)
+
         mine6 = mine[active6]
         opp6 = opp[active6]
         legal6 = legal[active6]
 
+        # 6 格卷积：只算一次，供 T2/T3 复用
         mine6_h, mine6_v, mine6_d1, mine6_d2 = _compute_line_counts(
             mine6,
             self.kernel_horizontal6,
@@ -665,6 +668,8 @@ class Gomoku:
             self.kernel_vertical6,
             self.kernel_diagonal6,
         )
+
+        # end6 卷积：只算一次，供 T2/T3 复用
         end6_h, end6_v, end6_d1, end6_d2 = _compute_line_counts(
             legal6,
             self.kernel_horizontal6_end,
@@ -672,53 +677,54 @@ class Gomoku:
             self.kernel_diagonal6_end,
         )
 
-        # T2
-        has_t2_local = None
-        if self.action_pruning_self_open4:
-            t2_mask = _counts_to_open_four_creation_mask(
-                mine6_h, mine6_v, mine6_d1, mine6_d2,
-                opp6_h, opp6_v, opp6_d1, opp6_d2,
-                end6_h, end6_v, end6_d1, end6_d2,
-                legal6,
+        # ---------------- T2: current player creates true open four ----------------
+        t2_mask = _counts_to_open_four_creation_mask(
+            mine6_h, mine6_v, mine6_d1, mine6_d2,
+            opp6_h, opp6_v, opp6_d1, opp6_d2,
+            end6_h, end6_v, end6_d1, end6_d2,
+            legal6,
+        )
+        has_t2_local = t2_mask.flatten(start_dim=1).any(dim=1)
+
+        if has_t2_local.any():
+            hit_ids = active6_ids[has_t2_local]
+            final_mask[hit_ids] = t2_mask[has_t2_local]
+            remaining[hit_ids] = False
+
+        # 若 T2 已经处理完所有还活跃 env，直接返回
+        if not remaining.any():
+            return final_mask.flatten(start_dim=1)
+
+        # ---------------- T3: opponent T2 defense ∪ my forcing-four ----------------
+        # 只有对手真的有 T2 威胁，才进入 T3
+        opp_t2_def_mask = _counts_to_open_four_defense_mask(
+            opp6_h, opp6_v, opp6_d1, opp6_d2,
+            mine6_h, mine6_v, mine6_d1, mine6_d2,
+            end6_h, end6_v, end6_d1, end6_d2,
+            legal6,
+        )
+        has_opp_t2_local = opp_t2_def_mask.flatten(start_dim=1).any(dim=1)
+        has_opp_t2_local = has_opp_t2_local & (~has_t2_local)
+
+        if has_opp_t2_local.any():
+            # T3 复用 Stage A 的 5 格卷积结果，不重复算
+            loc_in_active5 = id_to_active5[active6_ids[has_opp_t2_local]]
+
+            my_four_mask = _counts_to_four_creation_mask(
+                mine5_h[loc_in_active5],
+                mine5_v[loc_in_active5],
+                mine5_d1[loc_in_active5],
+                mine5_d2[loc_in_active5],
+                opp5_h[loc_in_active5],
+                opp5_v[loc_in_active5],
+                opp5_d1[loc_in_active5],
+                opp5_d2[loc_in_active5],
+                legal5[loc_in_active5],
             )
-            has_t2_local = t2_mask.flatten(start_dim=1).any(dim=1)
-            if has_t2_local.any():
-                hit_ids = active6_ids[has_t2_local]
-                final_mask[hit_ids] = t2_mask[has_t2_local]
-                remaining[hit_ids] = False
 
-        # T3: only if opponent REALLY has T2 threat
-        if self.action_pruning_t3:
-            opp_t2_def_mask = _counts_to_open_four_defense_mask(
-                opp6_h, opp6_v, opp6_d1, opp6_d2,
-                mine6_h, mine6_v, mine6_d1, mine6_d2,
-                end6_h, end6_v, end6_d1, end6_d2,
-                legal6,
-            )
-            has_opp_t2_local = opp_t2_def_mask.flatten(start_dim=1).any(dim=1)
-
-            if has_t2_local is not None:
-                has_opp_t2_local = has_opp_t2_local & (~has_t2_local)
-
-            if has_opp_t2_local.any():
-                # Reuse existing 5-cell counts instead of recomputing.
-                loc_in_active5 = id_to_active5[active6_ids[has_opp_t2_local]]
-
-                my_four_mask = _counts_to_four_creation_mask(
-                    mine5_h[loc_in_active5],
-                    mine5_v[loc_in_active5],
-                    mine5_d1[loc_in_active5],
-                    mine5_d2[loc_in_active5],
-                    opp5_h[loc_in_active5],
-                    opp5_v[loc_in_active5],
-                    opp5_d1[loc_in_active5],
-                    opp5_d2[loc_in_active5],
-                    legal5[loc_in_active5],
-                )
-
-                t3_mask = opp_t2_def_mask[has_opp_t2_local] | my_four_mask
-                hit_ids = active6_ids[has_opp_t2_local]
-                final_mask[hit_ids] = t3_mask
+            t3_mask = opp_t2_def_mask[has_opp_t2_local] | my_four_mask
+            hit_ids = active6_ids[has_opp_t2_local]
+            final_mask[hit_ids] = t3_mask
 
         return final_mask.flatten(start_dim=1)
 

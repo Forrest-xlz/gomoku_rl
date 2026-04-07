@@ -21,10 +21,6 @@ log_interval: 5
 # action pruning settings
 action_pruning:
   enabled: true
-  self_win4: true
-  block_opp_win4: true
-  self_open4: true
-  t3: true
 
 gate:
   enabled: false
