@@ -6,7 +6,7 @@ device: cuda
 out_device: cpu
 run_dir:
 
-version_name: inrl - no - pretrained - action - pruning - v0
+version_name: inrl - no - pretrained - action - pruning - v1
 
 augment: false
 
@@ -18,10 +18,13 @@ log_interval: 5
 #black_checkpoint: wandb\run-20260405_043213-ez2jroe6\files\black_2100.pt
 #white_checkpoint: wandb\run-20260405_043213-ez2jroe6\files\white_2100.pt
 
+# action pruning settings
 action_pruning:
   enabled: true
   self_win4: true
   block_opp_win4: true
+  self_open4: true
+  t3: true
 
 gate:
   enabled: false
