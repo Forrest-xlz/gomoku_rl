@@ -11,50 +11,52 @@ def compute_done(
     """Determines if any game has been won in a batch of Gomoku boards."""
     board = board.unsqueeze(1)  # (E,1,B,B)
 
-    output_horizontal = F.conv2d(
-        input=board, weight=kernel_horizontal
-    )  # (E,1,B-4,B)
+    output_horizontal = F.conv2d(board, kernel_horizontal)  # (E,1,B-4,B)
     done_horizontal = (output_horizontal.flatten(start_dim=1) > 4.5).any(dim=-1)
 
-    output_vertical = F.conv2d(
-        input=board, weight=kernel_vertical
-    )  # (E,1,B,B-4)
+    output_vertical = F.conv2d(board, kernel_vertical)  # (E,1,B,B-4)
     done_vertical = (output_vertical.flatten(start_dim=1) > 4.5).any(dim=-1)
 
-    output_diagonal = F.conv2d(
-        input=board, weight=kernel_diagonal
-    )  # (E,2,B-4,B-4)
+    output_diagonal = F.conv2d(board, kernel_diagonal)  # (E,2,B-4,B-4)
     done_diagonal = (output_diagonal.flatten(start_dim=1) > 4.5).any(dim=-1)
 
-    done = done_horizontal | done_vertical | done_diagonal
-    return done
+    return done_horizontal | done_vertical | done_diagonal
 
 
-def _compute_five_counts(
+def _compute_line_counts(
     stones: torch.Tensor,
     kernel_horizontal: torch.Tensor,
     kernel_vertical: torch.Tensor,
     kernel_diagonal: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Returns 5-cell window counts on 4 directions:
-      h:  (E, B-4, B)
-      v:  (E, B, B-4)
-      d1: (E, B-4, B-4)
-      d2: (E, B-4, B-4)
+    Generic directional count maps for one occupancy plane.
+
+    Returns:
+      h:  (E, H-k+1, W)
+      v:  (E, H, W-k+1)
+      d1: (E, H-k+1, W-k+1)
+      d2: (E, H-k+1, W-k+1)
     """
     E, B, _ = stones.shape
-    if stones.numel() == 0 or B < 5:
-        z_h = torch.zeros((E, max(B - 4, 0), B), device=stones.device, dtype=torch.float)
-        z_v = torch.zeros((E, B, max(B - 4, 0)), device=stones.device, dtype=torch.float)
-        z_d = torch.zeros((E, max(B - 4, 0), max(B - 4, 0)), device=stones.device, dtype=torch.float)
+    kh = kernel_horizontal.shape[-2]
+    kw = kernel_vertical.shape[-1]
+
+    if stones.numel() == 0 or B < max(kh, kw):
+        z_h = torch.zeros((E, max(B - kh + 1, 0), B), device=stones.device, dtype=torch.float)
+        z_v = torch.zeros((E, B, max(B - kw + 1, 0)), device=stones.device, dtype=torch.float)
+        z_d = torch.zeros(
+            (E, max(B - kh + 1, 0), max(B - kh + 1, 0)),
+            device=stones.device,
+            dtype=torch.float,
+        )
         return z_h, z_v, z_d, z_d.clone()
 
     x = stones.float().unsqueeze(1)  # (E,1,B,B)
-    h = F.conv2d(x, kernel_horizontal).squeeze(1)      # (E,B-4,B)
-    v = F.conv2d(x, kernel_vertical).squeeze(1)        # (E,B,B-4)
-    d1 = F.conv2d(x, kernel_diagonal[:1]).squeeze(1)   # (E,B-4,B-4)
-    d2 = F.conv2d(x, kernel_diagonal[1:2]).squeeze(1)  # (E,B-4,B-4)
+    h = F.conv2d(x, kernel_horizontal).squeeze(1)
+    v = F.conv2d(x, kernel_vertical).squeeze(1)
+    d1 = F.conv2d(x, kernel_diagonal[:1]).squeeze(1)
+    d2 = F.conv2d(x, kernel_diagonal[1:2]).squeeze(1)
     return h, v, d1, d2
 
 
@@ -70,8 +72,6 @@ def _counts_to_immediate_five_mask(
     empty: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Reconstruct immediate-five mask from precomputed 5-cell counts.
-    Returns shape (E, B, B), where True means:
     placing one stone there creates an immediate five-in-a-row.
     """
     if empty.numel() == 0:
@@ -79,30 +79,30 @@ def _counts_to_immediate_five_mask(
 
     out = torch.zeros_like(empty, dtype=torch.bool)
 
-    # 5x1 windows
-    win_seg = (atk_h == 4) & (def_h == 0)
-    h, w = win_seg.shape[-2:]
+    # 5x1
+    valid = (atk_h == 4) & (def_h == 0)
+    h, _ = valid.shape[-2:]
     for t in range(5):
-        out[:, t:t + h, :] |= win_seg & empty[:, t:t + h, :]
+        out[:, t:t + h, :] |= valid & empty[:, t:t + h, :]
 
-    # 1x5 windows
-    win_seg = (atk_v == 4) & (def_v == 0)
-    h, w = win_seg.shape[-2:]
+    # 1x5
+    valid = (atk_v == 4) & (def_v == 0)
+    _, w = valid.shape[-2:]
     for t in range(5):
-        out[:, :, t:t + w] |= win_seg & empty[:, :, t:t + w]
+        out[:, :, t:t + w] |= valid & empty[:, :, t:t + w]
 
     # main diagonal
-    win_seg = (atk_d1 == 4) & (def_d1 == 0)
-    h, w = win_seg.shape[-2:]
+    valid = (atk_d1 == 4) & (def_d1 == 0)
+    h, w = valid.shape[-2:]
     for t in range(5):
-        out[:, t:t + h, t:t + w] |= win_seg & empty[:, t:t + h, t:t + w]
+        out[:, t:t + h, t:t + w] |= valid & empty[:, t:t + h, t:t + w]
 
     # anti diagonal
-    win_seg = (atk_d2 == 4) & (def_d2 == 0)
-    h, w = win_seg.shape[-2:]
+    valid = (atk_d2 == 4) & (def_d2 == 0)
+    h, w = valid.shape[-2:]
     for t in range(5):
         out[:, t:t + h, 4 - t:4 - t + w] |= (
-            win_seg & empty[:, t:t + h, 4 - t:4 - t + w]
+            valid & empty[:, t:t + h, 4 - t:4 - t + w]
         )
 
     return out
@@ -120,12 +120,8 @@ def _counts_to_four_creation_mask(
     empty: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Returns a boolean mask of shape (E, B, B) where True means:
-    placing one stone there creates some 4-in-5 window (forcing four point candidate).
-
-    Local condition on a 5-cell window:
-      atk5 == 3 and def5 == 0
-    Then every empty cell in that window is a move that creates a four.
+    placing one stone there creates some 4-in-5 window (forcing-four point).
+    Local condition: atk5 == 3 and def5 == 0
     """
     if empty.numel() == 0:
         return torch.zeros_like(empty, dtype=torch.bool)
@@ -134,13 +130,13 @@ def _counts_to_four_creation_mask(
 
     # 5x1
     valid = (atk_h == 3) & (def_h == 0)
-    h, w = valid.shape[-2:]
+    h, _ = valid.shape[-2:]
     for t in range(5):
         out[:, t:t + h, :] |= valid & empty[:, t:t + h, :]
 
     # 1x5
     valid = (atk_v == 3) & (def_v == 0)
-    h, w = valid.shape[-2:]
+    _, w = valid.shape[-2:]
     for t in range(5):
         out[:, :, t:t + w] |= valid & empty[:, :, t:t + w]
 
@@ -161,34 +157,6 @@ def _counts_to_four_creation_mask(
     return out
 
 
-def _compute_six_counts(
-    stones: torch.Tensor,
-    kernel_horizontal6: torch.Tensor,
-    kernel_vertical6: torch.Tensor,
-    kernel_diagonal6: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Returns 6-cell window counts on 4 directions:
-      h:  (E, B-5, B)
-      v:  (E, B, B-5)
-      d1: (E, B-5, B-5)
-      d2: (E, B-5, B-5)
-    """
-    E, B, _ = stones.shape
-    if stones.numel() == 0 or B < 6:
-        z_h = torch.zeros((E, max(B - 5, 0), B), device=stones.device, dtype=torch.float)
-        z_v = torch.zeros((E, B, max(B - 5, 0)), device=stones.device, dtype=torch.float)
-        z_d = torch.zeros((E, max(B - 5, 0), max(B - 5, 0)), device=stones.device, dtype=torch.float)
-        return z_h, z_v, z_d, z_d.clone()
-
-    x = stones.float().unsqueeze(1)  # (E,1,B,B)
-    h = F.conv2d(x, kernel_horizontal6).squeeze(1)      # (E,B-5,B)
-    v = F.conv2d(x, kernel_vertical6).squeeze(1)        # (E,B,B-5)
-    d1 = F.conv2d(x, kernel_diagonal6[:1]).squeeze(1)   # (E,B-5,B-5)
-    d2 = F.conv2d(x, kernel_diagonal6[1:2]).squeeze(1)  # (E,B-5,B-5)
-    return h, v, d1, d2
-
-
 def _counts_to_open_four_creation_mask(
     atk6_h: torch.Tensor,
     atk6_v: torch.Tensor,
@@ -205,12 +173,11 @@ def _counts_to_open_four_creation_mask(
     empty: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Returns a boolean mask of shape (E, B, B) where True means:
-    placing one stone there creates a true open four: _XXXX_
+    T2: placing one stone there creates a true open four: _XXXX_
 
-    Local condition on a 6-cell window:
+    6-cell window condition:
       atk6 == 3, def6 == 0, endpoint-empty-count == 2
-    Then the unique empty among the middle 4 positions is the T2 move.
+    Then the unique empty among the middle 4 positions is the move.
     """
     if empty.numel() == 0:
         return torch.zeros_like(empty, dtype=torch.bool)
@@ -222,28 +189,28 @@ def _counts_to_open_four_creation_mask(
     out = torch.zeros_like(empty, dtype=torch.bool)
 
     # 6x1
-    valid = (atk6_h == 3) & (def6_h == 0) & (end6_h == 2)  # (E, B-5, B)
+    valid = (atk6_h == 3) & (def6_h == 0) & (end6_h == 2)
     out[:, 1:B-4, :] |= valid & empty[:, 1:B-4, :]
     out[:, 2:B-3, :] |= valid & empty[:, 2:B-3, :]
     out[:, 3:B-2, :] |= valid & empty[:, 3:B-2, :]
     out[:, 4:B-1, :] |= valid & empty[:, 4:B-1, :]
 
     # 1x6
-    valid = (atk6_v == 3) & (def6_v == 0) & (end6_v == 2)  # (E, B, B-5)
+    valid = (atk6_v == 3) & (def6_v == 0) & (end6_v == 2)
     out[:, :, 1:B-4] |= valid & empty[:, :, 1:B-4]
     out[:, :, 2:B-3] |= valid & empty[:, :, 2:B-3]
     out[:, :, 3:B-2] |= valid & empty[:, :, 3:B-2]
     out[:, :, 4:B-1] |= valid & empty[:, :, 4:B-1]
 
     # main diagonal
-    valid = (atk6_d1 == 3) & (def6_d1 == 0) & (end6_d1 == 2)  # (E, B-5, B-5)
+    valid = (atk6_d1 == 3) & (def6_d1 == 0) & (end6_d1 == 2)
     out[:, 1:B-4, 1:B-4] |= valid & empty[:, 1:B-4, 1:B-4]
     out[:, 2:B-3, 2:B-3] |= valid & empty[:, 2:B-3, 2:B-3]
     out[:, 3:B-2, 3:B-2] |= valid & empty[:, 3:B-2, 3:B-2]
     out[:, 4:B-1, 4:B-1] |= valid & empty[:, 4:B-1, 4:B-1]
 
     # anti diagonal
-    valid = (atk6_d2 == 3) & (def6_d2 == 0) & (end6_d2 == 2)  # (E, B-5, B-5)
+    valid = (atk6_d2 == 3) & (def6_d2 == 0) & (end6_d2 == 2)
     out[:, 1:B-4, 4:B-1] |= valid & empty[:, 1:B-4, 4:B-1]
     out[:, 2:B-3, 3:B-2] |= valid & empty[:, 2:B-3, 3:B-2]
     out[:, 3:B-2, 2:B-3] |= valid & empty[:, 3:B-2, 2:B-3]
@@ -268,15 +235,14 @@ def _counts_to_open_four_defense_mask(
     empty: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Returns a boolean mask of shape (E, B, B) for ALL defense points against
-    an opponent T2 window (a move that would create _XXXX_ next turn).
+    T3-defense part: ALL defense points against an opponent T2 window.
 
     For each valid 6-cell threat window:
       atk6 == 3, def6 == 0, endpoint-empty-count == 2
 
-    Defense points kept:
+    Keep:
       - both endpoints
-      - the unique middle empty cell (the opponent's T2 move itself)
+      - the unique middle empty (opponent's T2 move itself)
     """
     if empty.numel() == 0:
         return torch.zeros_like(empty, dtype=torch.bool)
@@ -354,7 +320,6 @@ class Gomoku:
         )
         self.action_pruning_t3 = bool(action_pruning.get("t3", False))
 
-        # board: 0 empty, 1 black, -1 white
         self.board: torch.Tensor = torch.zeros(
             num_envs,
             self.board_size,
@@ -381,15 +346,13 @@ class Gomoku:
             .unsqueeze(-1)
             .unsqueeze(0)
             .unsqueeze(0)
-        )  # (1,1,5,1)
-
+        )
         self.kernel_vertical = (
             torch.tensor([1, 1, 1, 1, 1], device=self.device, dtype=torch.float)
             .unsqueeze(0)
             .unsqueeze(0)
             .unsqueeze(0)
-        )  # (1,1,1,5)
-
+        )
         self.kernel_diagonal = torch.tensor(
             [
                 [
@@ -409,7 +372,7 @@ class Gomoku:
             ],
             device=self.device,
             dtype=torch.float,
-        ).unsqueeze(1)  # (2,1,5,5)
+        ).unsqueeze(1)
 
         # length-6 sum kernels
         self.kernel_horizontal6 = (
@@ -417,15 +380,13 @@ class Gomoku:
             .unsqueeze(-1)
             .unsqueeze(0)
             .unsqueeze(0)
-        )  # (1,1,6,1)
-
+        )
         self.kernel_vertical6 = (
             torch.tensor([1, 1, 1, 1, 1, 1], device=self.device, dtype=torch.float)
             .unsqueeze(0)
             .unsqueeze(0)
             .unsqueeze(0)
-        )  # (1,1,1,6)
-
+        )
         self.kernel_diagonal6 = torch.tensor(
             [
                 [
@@ -447,23 +408,21 @@ class Gomoku:
             ],
             device=self.device,
             dtype=torch.float,
-        ).unsqueeze(1)  # (2,1,6,6)
+        ).unsqueeze(1)
 
-        # length-6 endpoint-empty kernels
+        # endpoint-empty kernels for 6-cell windows
         self.kernel_horizontal6_end = (
             torch.tensor([1, 0, 0, 0, 0, 1], device=self.device, dtype=torch.float)
             .unsqueeze(-1)
             .unsqueeze(0)
             .unsqueeze(0)
-        )  # (1,1,6,1)
-
+        )
         self.kernel_vertical6_end = (
             torch.tensor([1, 0, 0, 0, 0, 1], device=self.device, dtype=torch.float)
             .unsqueeze(0)
             .unsqueeze(0)
             .unsqueeze(0)
-        )  # (1,1,1,6)
-
+        )
         self.kernel_diagonal6_end = torch.tensor(
             [
                 [
@@ -485,7 +444,7 @@ class Gomoku:
             ],
             device=self.device,
             dtype=torch.float,
-        ).unsqueeze(1)  # (2,1,6,6)
+        ).unsqueeze(1)
 
     def to(self, device):
         self.board.to(device=device)
@@ -532,9 +491,7 @@ class Gomoku:
 
         self.move_count = self.move_count + inc
 
-        board_one_side = (
-            self.board == piece.unsqueeze(-1).unsqueeze(-1)
-        ).float()
+        board_one_side = (self.board == piece.unsqueeze(-1).unsqueeze(-1)).float()
 
         self.done = compute_done(
             board_one_side,
@@ -568,18 +525,9 @@ class Gomoku:
                 == last_y.unsqueeze(-1)
             ).unsqueeze(1)
         )
-
         layer3 = layer3.float()
 
-        output = torch.stack(
-            [
-                layer1,
-                layer2,
-                layer3,
-            ],
-            dim=1,
-        )
-        return output
+        return torch.stack([layer1, layer2, layer3], dim=1)
 
     def get_action_mask(self) -> torch.Tensor:
         """
@@ -590,11 +538,12 @@ class Gomoku:
         T3) opponent T2 full defense points  ∪  current player's forcing-four points
         fallback) normal legal moves
 
-        Thresholds:
-        - T0 active when move_count >= 8
-        - T1 active when move_count >= 7
-        - T2 active when move_count >= 6
-        - T3 active when move_count >= 6
+        Optimization goals:
+        - 5-cell counts computed once, reused by T0/T1/T3
+        - 6-cell counts computed once, reused by T2/T3
+        - endpoint-empty counts computed once, reused by T2/T3
+        - if T0/T1 solved everything, skip all 6-cell convolutions
+        - T3 is triggered only when opponent really has a T2 threat
         """
         legal = (self.board == 0)
 
@@ -606,157 +555,170 @@ class Gomoku:
         opp = (self.board == -piece)
 
         final_mask = legal.clone()
-        remaining = torch.ones(
-            self.num_envs, dtype=torch.bool, device=self.device
+        remaining = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+
+        # -------- Stage A: 5-cell counts, shared by T0/T1/T3 --------
+        need5 = (
+            self.action_pruning_self_win4
+            or self.action_pruning_block_opp_win4
+            or self.action_pruning_t3
         )
 
-        # ----- T0 / T1 share the same 5-cell counts -----
-        use_win4 = self.action_pruning_self_win4 or self.action_pruning_block_opp_win4
-        win4_active = remaining & (self.move_count >= 7)
+        active5 = remaining & (self.move_count >= 6) if need5 else torch.zeros_like(remaining)
 
-        if use_win4 and win4_active.any():
-            active_ids = win4_active.nonzero(as_tuple=False).squeeze(-1)
-            mine_active = mine[win4_active]
-            opp_active = opp[win4_active]
-            legal_active = legal[win4_active]
+        active5_ids = None
+        active5_local_mc = None
+        mine5_h = mine5_v = mine5_d1 = mine5_d2 = None
+        opp5_h = opp5_v = opp5_d1 = opp5_d2 = None
+        legal5 = None
+        id_to_active5 = None
 
-            mine_h, mine_v, mine_d1, mine_d2 = _compute_five_counts(
-                mine_active,
+        if need5 and active5.any():
+            active5_ids = active5.nonzero(as_tuple=False).squeeze(-1)
+            active5_local_mc = self.move_count[active5_ids]
+
+            mine5 = mine[active5]
+            opp5 = opp[active5]
+            legal5 = legal[active5]
+
+            mine5_h, mine5_v, mine5_d1, mine5_d2 = _compute_line_counts(
+                mine5,
                 self.kernel_horizontal,
                 self.kernel_vertical,
                 self.kernel_diagonal,
             )
-            opp_h, opp_v, opp_d1, opp_d2 = _compute_five_counts(
-                opp_active,
+            opp5_h, opp5_v, opp5_d1, opp5_d2 = _compute_line_counts(
+                opp5,
                 self.kernel_horizontal,
                 self.kernel_vertical,
                 self.kernel_diagonal,
             )
 
-            has_my = None
-
-            # T0: current player immediate five
-            if self.action_pruning_self_win4:
-                my_mask = _counts_to_immediate_five_mask(
-                    mine_h, mine_v, mine_d1, mine_d2,
-                    opp_h, opp_v, opp_d1, opp_d2,
-                    legal_active,
-                )
-                t0_active_local = self.move_count[active_ids] >= 8
-                has_my = my_mask.flatten(start_dim=1).any(dim=1) & t0_active_local
-                if has_my.any():
-                    hit_ids = active_ids[has_my]
-                    final_mask[hit_ids] = my_mask[has_my]
-                    remaining[hit_ids] = False
-
-            # T1: block opponent immediate five
-            if self.action_pruning_block_opp_win4:
-                opp_mask = _counts_to_immediate_five_mask(
-                    opp_h, opp_v, opp_d1, opp_d2,
-                    mine_h, mine_v, mine_d1, mine_d2,
-                    legal_active,
-                )
-                has_opp = opp_mask.flatten(start_dim=1).any(dim=1)
-
-                if has_my is None:
-                    select_opp = has_opp
-                else:
-                    select_opp = has_opp & (~has_my)
-
-                if select_opp.any():
-                    hit_ids = active_ids[select_opp]
-                    final_mask[hit_ids] = opp_mask[select_opp]
-                    remaining[hit_ids] = False
-
-        # ----- T2 / T3 share the same 6-cell counts on remaining envs -----
-        use_t23 = self.action_pruning_self_open4 or self.action_pruning_t3
-        t23_active = remaining & (self.move_count >= 6) & (self.board_size >= 6)
-
-        if use_t23 and t23_active.any():
-            active_ids = t23_active.nonzero(as_tuple=False).squeeze(-1)
-
-            mine_active = mine[t23_active]
-            opp_active = opp[t23_active]
-            legal_active = legal[t23_active]
-            empty_active = legal_active  # bool
-
-            # 6-cell counts for T2/T3 and endpoint-empty counts
-            mine6_h, mine6_v, mine6_d1, mine6_d2 = _compute_six_counts(
-                mine_active,
-                self.kernel_horizontal6,
-                self.kernel_vertical6,
-                self.kernel_diagonal6,
+            # map global env id -> local index in active5 tensors
+            id_to_active5 = torch.full(
+                (self.num_envs,),
+                -1,
+                dtype=torch.long,
+                device=self.device,
             )
-            opp6_h, opp6_v, opp6_d1, opp6_d2 = _compute_six_counts(
-                opp_active,
-                self.kernel_horizontal6,
-                self.kernel_vertical6,
-                self.kernel_diagonal6,
-            )
-            end6_h, end6_v, end6_d1, end6_d2 = _compute_six_counts(
-                empty_active,
-                self.kernel_horizontal6_end,
-                self.kernel_vertical6_end,
-                self.kernel_diagonal6_end,
+            id_to_active5[active5_ids] = torch.arange(
+                active5_ids.shape[0], device=self.device
             )
 
-            has_t2 = None
-
-            # T2: current player creates true open four
-            if self.action_pruning_self_open4:
-                open4_mask = _counts_to_open_four_creation_mask(
-                    mine6_h, mine6_v, mine6_d1, mine6_d2,
-                    opp6_h, opp6_v, opp6_d1, opp6_d2,
-                    end6_h, end6_v, end6_d1, end6_d2,
-                    legal_active,
-                )
-                has_t2 = open4_mask.flatten(start_dim=1).any(dim=1)
-                if has_t2.any():
-                    hit_ids = active_ids[has_t2]
-                    final_mask[hit_ids] = open4_mask[has_t2]
-                    remaining[hit_ids] = False
-
-            # T3: opponent T2 full defense points ∪ my forcing-four points
-            if self.action_pruning_t3:
-                opp_t2_def_mask = _counts_to_open_four_defense_mask(
-                    opp6_h, opp6_v, opp6_d1, opp6_d2,
-                    mine6_h, mine6_v, mine6_d1, mine6_d2,
-                    end6_h, end6_v, end6_d1, end6_d2,
-                    legal_active,
-                )
-
-                # current player's forcing-four points on 5-cell windows
-                mine5_h, mine5_v, mine5_d1, mine5_d2 = _compute_five_counts(
-                    mine_active,
-                    self.kernel_horizontal,
-                    self.kernel_vertical,
-                    self.kernel_diagonal,
-                )
-                opp5_h, opp5_v, opp5_d1, opp5_d2 = _compute_five_counts(
-                    opp_active,
-                    self.kernel_horizontal,
-                    self.kernel_vertical,
-                    self.kernel_diagonal,
-                )
-
-                self_four_mask = _counts_to_four_creation_mask(
+        # T0
+        has_t0_local = None
+        if self.action_pruning_self_win4 and active5_ids is not None:
+            t0_eligible = active5_local_mc >= 8
+            if t0_eligible.any():
+                my_mask5 = _counts_to_immediate_five_mask(
                     mine5_h, mine5_v, mine5_d1, mine5_d2,
                     opp5_h, opp5_v, opp5_d1, opp5_d2,
-                    legal_active,
+                    legal5,
+                )
+                has_t0_local = my_mask5.flatten(start_dim=1).any(dim=1) & t0_eligible
+                if has_t0_local.any():
+                    hit_ids = active5_ids[has_t0_local]
+                    final_mask[hit_ids] = my_mask5[has_t0_local]
+                    remaining[hit_ids] = False
+
+        # T1
+        if self.action_pruning_block_opp_win4 and active5_ids is not None:
+            t1_eligible = active5_local_mc >= 7
+            if t1_eligible.any():
+                opp_mask5 = _counts_to_immediate_five_mask(
+                    opp5_h, opp5_v, opp5_d1, opp5_d2,
+                    mine5_h, mine5_v, mine5_d1, mine5_d2,
+                    legal5,
+                )
+                has_t1_local = opp_mask5.flatten(start_dim=1).any(dim=1) & t1_eligible
+                if has_t0_local is not None:
+                    has_t1_local = has_t1_local & (~has_t0_local)
+                if has_t1_local.any():
+                    hit_ids = active5_ids[has_t1_local]
+                    final_mask[hit_ids] = opp_mask5[has_t1_local]
+                    remaining[hit_ids] = False
+
+        # Early exit: no need for any 6-cell convs
+        need6 = self.action_pruning_self_open4 or self.action_pruning_t3
+        active6 = (
+            remaining & (self.move_count >= 6) & (self.board_size >= 6)
+            if need6 else torch.zeros_like(remaining)
+        )
+        if not active6.any():
+            return final_mask.flatten(start_dim=1)
+
+        # -------- Stage B: 6-cell counts, shared by T2/T3 --------
+        active6_ids = active6.nonzero(as_tuple=False).squeeze(-1)
+        mine6 = mine[active6]
+        opp6 = opp[active6]
+        legal6 = legal[active6]
+
+        mine6_h, mine6_v, mine6_d1, mine6_d2 = _compute_line_counts(
+            mine6,
+            self.kernel_horizontal6,
+            self.kernel_vertical6,
+            self.kernel_diagonal6,
+        )
+        opp6_h, opp6_v, opp6_d1, opp6_d2 = _compute_line_counts(
+            opp6,
+            self.kernel_horizontal6,
+            self.kernel_vertical6,
+            self.kernel_diagonal6,
+        )
+        end6_h, end6_v, end6_d1, end6_d2 = _compute_line_counts(
+            legal6,
+            self.kernel_horizontal6_end,
+            self.kernel_vertical6_end,
+            self.kernel_diagonal6_end,
+        )
+
+        # T2
+        has_t2_local = None
+        if self.action_pruning_self_open4:
+            t2_mask = _counts_to_open_four_creation_mask(
+                mine6_h, mine6_v, mine6_d1, mine6_d2,
+                opp6_h, opp6_v, opp6_d1, opp6_d2,
+                end6_h, end6_v, end6_d1, end6_d2,
+                legal6,
+            )
+            has_t2_local = t2_mask.flatten(start_dim=1).any(dim=1)
+            if has_t2_local.any():
+                hit_ids = active6_ids[has_t2_local]
+                final_mask[hit_ids] = t2_mask[has_t2_local]
+                remaining[hit_ids] = False
+
+        # T3: only if opponent REALLY has T2 threat
+        if self.action_pruning_t3:
+            opp_t2_def_mask = _counts_to_open_four_defense_mask(
+                opp6_h, opp6_v, opp6_d1, opp6_d2,
+                mine6_h, mine6_v, mine6_d1, mine6_d2,
+                end6_h, end6_v, end6_d1, end6_d2,
+                legal6,
+            )
+            has_opp_t2_local = opp_t2_def_mask.flatten(start_dim=1).any(dim=1)
+
+            if has_t2_local is not None:
+                has_opp_t2_local = has_opp_t2_local & (~has_t2_local)
+
+            if has_opp_t2_local.any():
+                # Reuse existing 5-cell counts instead of recomputing.
+                loc_in_active5 = id_to_active5[active6_ids[has_opp_t2_local]]
+
+                my_four_mask = _counts_to_four_creation_mask(
+                    mine5_h[loc_in_active5],
+                    mine5_v[loc_in_active5],
+                    mine5_d1[loc_in_active5],
+                    mine5_d2[loc_in_active5],
+                    opp5_h[loc_in_active5],
+                    opp5_v[loc_in_active5],
+                    opp5_d1[loc_in_active5],
+                    opp5_d2[loc_in_active5],
+                    legal5[loc_in_active5],
                 )
 
-                t3_mask = opp_t2_def_mask | self_four_mask
-                has_t3 = t3_mask.flatten(start_dim=1).any(dim=1)
-
-                if has_t2 is None:
-                    select_t3 = has_t3
-                else:
-                    select_t3 = has_t3 & (~has_t2)
-
-                if select_t3.any():
-                    hit_ids = active_ids[select_t3]
-                    final_mask[hit_ids] = t3_mask[select_t3]
-                    remaining[hit_ids] = False
+                t3_mask = opp_t2_def_mask[has_opp_t2_local] | my_four_mask
+                hit_ids = active6_ids[has_opp_t2_local]
+                final_mask[hit_ids] = t3_mask
 
         return final_mask.flatten(start_dim=1)
 
