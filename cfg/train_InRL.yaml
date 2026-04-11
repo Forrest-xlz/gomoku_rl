@@ -14,8 +14,8 @@ steps: 128
 save_interval: 300
 log_interval: 5
 
-black_checkpoint: wandb\run-20260409_071329-66odiox9\files\black_final.pt
-white_checkpoint: wandb\run-20260409_071329-66odiox9\files\white_final.pt
+black_checkpoint: wandb\run-20260411_020310-8r88jup1\files\black_final.pt
+white_checkpoint: wandb\run-20260411_020310-8r88jup1\files\white_final.pt
 
 # action pruning settings
 action_pruning:
@@ -31,8 +31,8 @@ action_pruning:
 # - 该单边更新只持续 1 个 rollout，之后自动恢复双边同时更新。
 balance:
   enabled: true
-  lower: 0.35
-  upper: 0.65
+  lower: 0.3
+  upper: 0.7
   ema_alpha: 0.33
 
 wandb:
