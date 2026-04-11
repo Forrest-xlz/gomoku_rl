@@ -1,6 +1,5 @@
-from typing import Union, Callable
+from typing import Callable
 from tensordict import TensorDict
-from tensordict.nn import TensorDictModule, set_interaction_type, InteractionType
 import torch
 
 from torchrl.data.tensor_specs import (
@@ -9,14 +8,8 @@ from torchrl.data.tensor_specs import (
     BinaryDiscreteTensorSpec,
     UnboundedContinuousTensorSpec,
 )
-import time
-from gomoku_rl.utils.policy import _policy_t
-from gomoku_rl.utils.misc import add_prefix
 from .core import Gomoku
 
-
-from gomoku_rl.utils.log import get_log_func
-from collections import defaultdict
 
 # 定义环境，并声明了环境的 observation_spec、action_spec 和 reward_spec，以及 reset 和 step 方法。
 class GomokuEnv:
@@ -26,6 +19,8 @@ class GomokuEnv:
         board_size: int,
         device=None,
         action_pruning=None,
+        use_temporal_feature: bool = False,
+        temporal_num_steps: int = 3,
     ):
         self.gomoku = Gomoku(
             num_envs=num_envs,
@@ -33,11 +28,31 @@ class GomokuEnv:
             device=device,
             action_pruning=action_pruning,
         )
+        self.use_temporal_feature = bool(use_temporal_feature)
+        self.temporal_num_steps = int(temporal_num_steps)
+        assert self.temporal_num_steps >= 1, "temporal_num_steps must be >= 1"
+
+        self.observation_channels = (
+            2 * self.temporal_num_steps if self.use_temporal_feature else 3
+        )
+
+        if self.use_temporal_feature:
+            self.board_history = torch.zeros(
+                num_envs,
+                self.temporal_num_steps,
+                board_size,
+                board_size,
+                device=self.device,
+                dtype=torch.long,
+            )
+        else:
+            self.board_history = None
 
         self.observation_spec = CompositeSpec(
             {
                 "observation": UnboundedContinuousTensorSpec(
-                    device=self.device, shape=[num_envs, 3, board_size, board_size],
+                    device=self.device,
+                    shape=[num_envs, self.observation_channels, board_size, board_size],
                 ),
                 "action_mask": BinaryDiscreteTensorSpec(
                     n=board_size * board_size,
@@ -56,11 +71,11 @@ class GomokuEnv:
             device=self.device,
         )
         self.reward_spec = UnboundedContinuousTensorSpec(
-            shape=[num_envs, 1], device=self.device,
+            shape=[num_envs, 1],
+            device=self.device,
         )
         self._post_step = None
 
-        
     @property
     def batch_size(self):
         return torch.Size((self.num_envs,))
@@ -77,6 +92,41 @@ class GomokuEnv:
     def num_envs(self):
         return self.gomoku.num_envs
 
+    def _build_temporal_observation(self) -> torch.Tensor:
+        # 历史第 0 维始终是当前局面，第 1 维是前一局面，以此类推。
+        # 每个局面拆成两个通道：[black_plane, white_plane]
+        black_planes = (self.board_history == 1).float()
+        white_planes = (self.board_history == -1).float()
+        stacked = torch.stack([black_planes, white_planes], dim=2)
+        return stacked.flatten(start_dim=1, end_dim=2)
+
+    def _build_observation(self) -> torch.Tensor:
+        if not self.use_temporal_feature:
+            return self.gomoku.get_encoded_board()
+        return self._build_temporal_observation()
+
+    def _init_or_clear_history(self, env_indices: torch.Tensor | None = None) -> None:
+        if not self.use_temporal_feature:
+            return
+
+        if env_indices is None:
+            self.board_history.zero_()
+            self.board_history[:, 0] = self.gomoku.board
+            return
+
+        if env_indices.numel() == 0:
+            return
+
+        self.board_history[env_indices] = 0
+        self.board_history[env_indices, 0] = self.gomoku.board[env_indices]
+
+    def _push_current_board_to_history(self, update_mask: torch.Tensor) -> None:
+        if not self.use_temporal_feature or not update_mask.any():
+            return
+
+        self.board_history[update_mask, 1:] = self.board_history[update_mask, :-1].clone()
+        self.board_history[update_mask, 0] = self.gomoku.board[update_mask]
+
     def reset(self, env_indices: torch.Tensor | None = None) -> TensorDict:
         """Resets the specified game environments to their initial states, or all environments if none are specified.
 
@@ -87,9 +137,11 @@ class GomokuEnv:
             TensorDict: A tensor dictionary containing the initial observations and action masks for all environments.
         """
         self.gomoku.reset(env_indices=env_indices)
+        self._init_or_clear_history(env_indices=env_indices)
+
         tensordict = TensorDict(
             {
-                "observation": self.gomoku.get_encoded_board(),
+                "observation": self._build_observation(),
                 "action_mask": self.gomoku.get_action_mask(),
             },
             self.batch_size,
@@ -111,10 +163,16 @@ class GomokuEnv:
         """
         action: torch.Tensor = tensordict.get("action")
         env_mask: torch.Tensor = tensordict.get("env_mask", None)
+        update_mask = (
+            torch.ones_like(action, dtype=torch.bool) if env_mask is None else env_mask
+        )
+
         episode_len = self.gomoku.move_count + 1  # (E,)
         win, illegal = self.gomoku.step(action=action, env_mask=env_mask)
 
         assert not illegal.any()
+
+        self._push_current_board_to_history(update_mask=update_mask)
 
         done = win
         black_win = win & (episode_len % 2 == 1)
@@ -122,7 +180,7 @@ class GomokuEnv:
         tensordict = TensorDict({}, self.batch_size, device=self.device)
         tensordict.update(
             {
-                "observation": self.gomoku.get_encoded_board(),
+                "observation": self._build_observation(),
                 "action_mask": self.gomoku.get_action_mask(),
                 "done": done,
                 "win": win,
@@ -161,7 +219,7 @@ class GomokuEnv:
         tensordict.exclude("env_mask", inplace=True)
 
         done: torch.Tensor = next_tensordict.get("done")  # (E,)
-        env_ids = done.nonzero().squeeze(0)
+        env_ids = done.nonzero(as_tuple=False).flatten()
         reset_td = self.reset(env_indices=env_ids)
         next_tensordict.update(reset_td)  # no impact on training
         return next_tensordict

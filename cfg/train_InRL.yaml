@@ -5,21 +5,26 @@ device: cuda
 out_device: cpu
 
 run_dir:
-version_name: inrl-balance-ema-v1
+version_name: inrl-temporal-6
 
 augment: false
 
-epochs: 2000
+epochs: 3000
 steps: 128
 save_interval: 300
 log_interval: 5
 
-black_checkpoint: wandb\run-20260411_020310-8r88jup1\files\black_final.pt
-white_checkpoint: wandb\run-20260411_020310-8r88jup1\files\white_final.pt
+#black_checkpoint: wandb\run-20260411_020310-8r88jup1\files\black_final.pt
+#white_checkpoint: wandb\run-20260411_020310-8r88jup1\files\white_final.pt
 
 # action pruning settings
 action_pruning:
   enabled: true
+
+# temporal feature settings
+use_temporal_feature: true
+temporal_num_steps: 6
+
 
 # 新的双网络平衡控制。
 # 语义：

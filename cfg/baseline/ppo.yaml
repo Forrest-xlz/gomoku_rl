@@ -23,4 +23,8 @@ optimizer:
 num_channels: 64
 num_residual_blocks: 4
 
+# baseline-specific temporal switches
+use_temporal_feature: false
+temporal_num_steps: 3
+
 
