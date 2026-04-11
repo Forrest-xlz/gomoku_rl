@@ -6,7 +6,6 @@ import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-from xml.parsers.expat import model
 
 import numpy as np
 import torch
@@ -19,6 +18,7 @@ from torchrl.data.tensor_specs import (
     UnboundedContinuousTensorSpec,
 )
 
+from gomoku_rl.core import Gomoku
 from gomoku_rl.policy import Policy, get_policy
 
 
@@ -133,39 +133,81 @@ def load_policy(cfg: DictConfig, checkpoint_path: str | Path) -> Policy:
     model.eval()
     return model
 
-# 构建神经网络输入，包括棋盘状态编码、当前玩家编码、最近一手编码，以及动作掩码。
+
+# 用 core.Gomoku 复用与训练侧完全一致的 observation / action_mask 生成逻辑。
+class CoreStateAdapter:
+    def __init__(self, cfg: DictConfig):
+        self.cfg = cfg
+        self.board_size = int(cfg.board_size)
+        self.device = cfg.device
+        self.action_pruning_cfg = cfg.get("action_pruning", None)
+        self.env = Gomoku(
+            num_envs=1,
+            board_size=self.board_size,
+            device=self.device,
+            action_pruning=self.action_pruning_cfg,
+        )
+        self.env.reset()
+
+    def _to_core_board(self, board: np.ndarray) -> torch.Tensor:
+        board_tensor = torch.as_tensor(board, dtype=torch.long, device=self.device)
+        signed_board = torch.zeros_like(board_tensor)
+        signed_board = torch.where(board_tensor == BLACK, torch.ones_like(signed_board), signed_board)
+        signed_board = torch.where(board_tensor == WHITE, -torch.ones_like(signed_board), signed_board)
+        return signed_board
+
+    @torch.no_grad()
+    def sync_state(
+        self,
+        board: np.ndarray,
+        current_player: Piece,
+        latest_move: Optional[tuple[int, int]],
+    ) -> None:
+        board_tensor = self._to_core_board(board)
+        self.env.board[0].copy_(board_tensor)
+        self.env.turn[0] = 0 if current_player == Piece.BLACK else 1
+        self.env.move_count[0] = int(np.count_nonzero(board != EMPTY))
+        self.env.done[0] = False
+
+        if latest_move is None:
+            self.env.last_move[0] = -1
+        else:
+            row, col = latest_move
+            self.env.last_move[0] = int(row * self.board_size + col)
+
+    @torch.no_grad()
+    def build_tensordict(
+        self,
+        board: np.ndarray,
+        current_player: Piece,
+        latest_move: Optional[tuple[int, int]],
+    ) -> TensorDict:
+        self.sync_state(
+            board=board,
+            current_player=current_player,
+            latest_move=latest_move,
+        )
+        return TensorDict(
+            {
+                "observation": self.env.get_encoded_board(),
+                "action_mask": self.env.get_action_mask(),
+            },
+            batch_size=1,
+            device=self.device,
+        )
+
+
+# 构建神经网络输入，直接复用 core 里的编码与动作掩码逻辑。
 def build_model_input(
     board: np.ndarray,
     current_player: Piece,
     latest_move: Optional[tuple[int, int]],
-    device: str,
+    state_adapter: CoreStateAdapter,
 ) -> TensorDict:
-    board_tensor = torch.tensor(board, dtype=torch.long, device=device)
-    signed_board = torch.zeros_like(board_tensor)
-    signed_board = torch.where(board_tensor == BLACK, torch.ones_like(signed_board), signed_board)  # 黑子用 1 表示
-    signed_board = torch.where(board_tensor == WHITE, -torch.ones_like(signed_board), signed_board) # 白子用 -1 表示，空位用 0 表示
-
-    piece_value = 1 if current_player == Piece.BLACK else -1    # 当前玩家的棋子用 1 表示，对手的棋子用 -1 表示，空位用 0 表示
-    layer_current = (signed_board == piece_value).float()   # 当前玩家棋子的位置为 1，其他位置为 0
-    layer_opponent = (signed_board == -piece_value).float() # 对手棋子的位置为 1，其他位置为 0
-    layer_last_move = torch.zeros_like(layer_current)   # 最近一手的位置为 1，其他位置为 0
-
-    if latest_move is not None:
-        row, col = latest_move
-        layer_last_move[row, col] = 1.0
-
-    observation = torch.stack(
-        [layer_current, layer_opponent, layer_last_move],
-        dim=0,
-    ).unsqueeze(0)
-    action_mask = (board_tensor == EMPTY).flatten().unsqueeze(0)    # 可落子位置为 True，其他位置为 False
-
-    return TensorDict(
-        {
-            "observation": observation,
-            "action_mask": action_mask,
-        },
-        batch_size=1,
+    return state_adapter.build_tensordict(
+        board=board,
+        current_player=current_player,
+        latest_move=latest_move,
     )
 
 
@@ -218,6 +260,7 @@ class NeuralMCTSInfer:
             temperature=float(cfg.get("mcts_temperature", 0.0)),
         )
         self.mcts_reuse_tree = bool(cfg.get("mcts_reuse_tree", True))
+        self.state_adapter = CoreStateAdapter(cfg)
         # 缓存当前搜索树 root
         self._cached_root: Optional[MCTSNode] = None
 
@@ -250,11 +293,23 @@ class NeuralMCTSInfer:
         self.white_checkpoint = checkpoint_path
         logging.info("Loaded white checkpoint: %s", checkpoint_path)
 
-    # 如果同时加载了 single_model 和 black_model/white_model，则优先使用 black_model/white_model；否则使用 single_model。
-    def _select_model(self, current_player: Piece) -> Optional[Policy]: 
+    # 推理期的模型选择规则：
+    # 1) 若 black/white 双模型都已加载，则按当前执棋方切换；
+    # 2) 否则若 single_model 已加载，则单双方都退回到 single_model；
+    # 3) 若只加载了 black_model 或只加载了 white_model，也把这一份模型当成单模型回退使用。
+    def _select_model(self, current_player: Piece) -> Optional[Policy]:
         if self.black_model is not None and self.white_model is not None:
             return self.black_model if current_player == Piece.BLACK else self.white_model
-        return self.single_model
+        if self.single_model is not None:
+            return self.single_model
+        if self.black_model is not None:
+            return self.black_model
+        if self.white_model is not None:
+            return self.white_model
+        return None
+
+    def _using_dual_models(self) -> bool:
+        return self.black_model is not None and self.white_model is not None
     
     # 重置缓存树
     def reset_search_tree(self) -> None:
@@ -356,7 +411,7 @@ class NeuralMCTSInfer:
             board=board,
             current_player=current_player,
             latest_move=latest_move,
-            device=self.cfg.device,
+            state_adapter=self.state_adapter,
         )
         actor_input = td.select("observation", "action_mask", strict=False)
         actor_out = model.actor(actor_input)
@@ -365,11 +420,13 @@ class NeuralMCTSInfer:
 
     def _policy_value(
         self,
-        model: Policy,
         board: np.ndarray,
         current_player: Piece,
         latest_move: Optional[tuple[int, int]],
-    ) -> tuple[np.ndarray, float]:
+    ) -> tuple[np.ndarray, float, np.ndarray]:
+        model = self._select_model(current_player)
+        if model is None:
+            raise RuntimeError("当前未加载可用于 MCTS 的模型。")
         if not (hasattr(model, "actor") and hasattr(model, "critic")):
             raise RuntimeError("当前 policy 不具备 actor / critic，无法执行神经网络引导 MCTS。")
 
@@ -389,21 +446,24 @@ class NeuralMCTSInfer:
                 probs = mask.float()
 
             probs = probs / probs.sum() # 归一化概率分布
+            allowed_actions = mask.nonzero(as_tuple=False).view(-1).detach().cpu().numpy()
 
             critic_input = td.select("hidden", "observation", strict=False)
-            critic_out = model.critic(critic_input) 
+            critic_out = model.critic(critic_input)
             value = float(critic_out["state_value"].view(-1)[0].item())
 
-        return probs.detach().cpu().numpy(), value  # 这里的probs本身就是已经归一化了
+        return probs.detach().cpu().numpy(), value, allowed_actions  # 这里的probs本身就是已经归一化了
 
     # 直接使用神经网络输出的动作概率分布，选择概率最高的合法动作作为建议落子位置。
     def _direct_argmax_action(
         self,
-        model: Policy,
         board: np.ndarray,
         current_player: Piece,
         latest_move: Optional[tuple[int, int]],
     ) -> int:
+        model = self._select_model(current_player)
+        if model is None:
+            raise RuntimeError("当前未加载可用于 direct infer 的模型。")
         with torch.no_grad():
             td = self._actor_forward(
                 model=model,
@@ -427,9 +487,10 @@ class NeuralMCTSInfer:
         self,
         node: MCTSNode,
         priors: np.ndarray,
+        allowed_actions: np.ndarray,
         add_root_noise: bool = False,
     ) -> None:
-        actions = legal_actions(node.board)
+        actions = allowed_actions.astype(np.int64, copy=False)
         if actions.size == 0:   # 如果没有合法动作了，说明当前节点是一个终局节点，直接标记为 terminal 并设置 terminal_value，然后返回，不再扩展子节点。
             node.terminal = True
             node.terminal_value = 0.0
@@ -508,7 +569,6 @@ class NeuralMCTSInfer:
 
     def _run_mcts_with_reuse(
         self,
-        model: Policy,
         board: np.ndarray,
         current_player: Piece,
         latest_move: Optional[tuple[int, int]],
@@ -521,13 +581,17 @@ class NeuralMCTSInfer:
 
         # 如果这个 root 还没展开，就先展开
         if not root.terminal and not root.children:
-            root_priors, _ = self._policy_value(
-                model=model,
+            root_priors, _root_value, root_allowed_actions = self._policy_value(
                 board=root.board,
                 current_player=root.to_play,
                 latest_move=root.latest_move,
             )
-            self._expand_node(root, root_priors, add_root_noise=False)
+            self._expand_node(
+                root,
+                root_priors,
+                root_allowed_actions,
+                add_root_noise=False,
+            )
 
         num_simulations = max(1, self.mcts_cfg.num_simulations)
         for _ in range(num_simulations):
@@ -541,13 +605,17 @@ class NeuralMCTSInfer:
             if node.terminal:
                 value = node.terminal_value
             else:
-                priors, value = self._policy_value(
-                    model=model,
+                priors, value, allowed_actions = self._policy_value(
                     board=node.board,
                     current_player=node.to_play,
                     latest_move=node.latest_move,
                 )
-                self._expand_node(node, priors, add_root_noise=False)
+                self._expand_node(
+                    node,
+                    priors,
+                    allowed_actions,
+                    add_root_noise=False,
+                )
 
             self._backpropagate(path, value)
 
@@ -577,7 +645,6 @@ class NeuralMCTSInfer:
     
     def _run_mcts(
         self,
-        model: Policy,
         board: np.ndarray,
         current_player: Piece,
         latest_move: Optional[tuple[int, int]],
@@ -588,13 +655,17 @@ class NeuralMCTSInfer:
             latest_move=latest_move,
         )
 
-        root_priors, _ = self._policy_value(
-            model=model,
+        root_priors, _root_value, root_allowed_actions = self._policy_value(
             board=root.board,
             current_player=root.to_play,
             latest_move=root.latest_move,
         )
-        self._expand_node(root, root_priors, add_root_noise=False)  # root 节点的 prior 由神经网络输出提供；如果启用了根节点噪声，则在扩展 root 时添加 Dirichlet 噪声以增加探索。
+        self._expand_node(
+            root,
+            root_priors,
+            root_allowed_actions,
+            add_root_noise=False,
+        )  # root 节点的 prior 由神经网络输出提供；如果启用了根节点噪声，则在扩展 root 时添加 Dirichlet 噪声以增加探索。
 
         num_simulations = max(1, self.mcts_cfg.num_simulations)
         for _ in range(num_simulations):
@@ -608,13 +679,17 @@ class NeuralMCTSInfer:
             if node.terminal:
                 value = node.terminal_value
             else:
-                priors, value = self._policy_value(
-                    model=model,
+                priors, value, allowed_actions = self._policy_value(
                     board=node.board,
                     current_player=node.to_play,
                     latest_move=node.latest_move,
                 )
-                self._expand_node(node, priors, add_root_noise=False)
+                self._expand_node(
+                    node,
+                    priors,
+                    allowed_actions,
+                    add_root_noise=False,
+                )
 
             self._backpropagate(path, value)
 
@@ -649,8 +724,7 @@ class NeuralMCTSInfer:
         if current_player is None:
             return None, "当前棋盘黑白子数量不合法，无法判断轮到谁。", None
 
-        model = self._select_model(current_player)
-        if model is None:
+        if self._select_model(current_player) is None:
             return None, "当前未加载模型，只完成棋盘识别。", current_player
 
         if latest_move is None and self.cfg.get("require_last_move", False):
@@ -660,36 +734,35 @@ class NeuralMCTSInfer:
             if self.mcts_cfg.enabled:   # 如果启用了 MCTS，则使用神经网络引导的 MCTS 来选择动作；否则直接使用神经网络输出概率最高的动作作为建议落子位置。
                 if self.mcts_reuse_tree:
                     action, best_child = self._run_mcts_with_reuse(
-                        model=model,
                         board=board,
                         current_player=current_player,
                         latest_move=latest_move,
                     )
                 else:
                     action, best_child = self._run_mcts(
-                        model=model,
                         board=board,
                         current_player=current_player,
                         latest_move=latest_move,
                     )
                 row, col = action_to_coord(int(action), int(self.cfg.board_size))
                 extra = "(未提供最近一手，root 的 last_move 通道置零）" if latest_move is None else ""
+                model_mode = "dual-model" if self._using_dual_models() else "single-model-fallback"
                 msg = (
-                    f"[mcts {self.mcts_cfg.num_simulations} sims] "
+                    f"[mcts {self.mcts_cfg.num_simulations} sims | {model_mode}] "
                     f"轮到{current_player.name.lower()}落子，建议第 {row + 1} 行第 {col + 1} 列；"
                     f"visit={best_child.visit_count}，Q={-best_child.q:.3f}{extra}"
                 )
                 return (row, col), msg, current_player
 
             action = self._direct_argmax_action(
-                model=model,
                 board=board,
                 current_player=current_player,
                 latest_move=latest_move,
             )
             row, col = action_to_coord(int(action), int(self.cfg.board_size))
             extra = "(未提供最近一手,last_move 通道置零）" if latest_move is None else ""
-            msg = f"[direct] 轮到{current_player.name.lower()}落子，建议第 {row + 1} 行第 {col + 1} 列{extra}"
+            model_mode = "dual-model" if self._using_dual_models() else "single-model-fallback"
+            msg = f"[direct | {model_mode}] 轮到{current_player.name.lower()}落子，建议第 {row + 1} 行第 {col + 1} 列{extra}"
             return (row, col), msg, current_player
 
         except Exception as exc:
