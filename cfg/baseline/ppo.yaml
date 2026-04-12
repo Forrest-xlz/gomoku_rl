@@ -23,8 +23,9 @@ optimizer:
 num_channels: 64
 num_residual_blocks: 4
 
-# baseline-specific temporal switches
+# baseline 也可以单独控制是否吃 move-onehot 时序特征
+# 如果为 false，则 baseline 仍吃原版 3 通道 [当前方, 对手方, 最近一步]
 use_temporal_feature: false
-temporal_num_steps: 3
-
+# 只有 use_temporal_feature=true 时才生效
+temporal_num_steps: 6
 

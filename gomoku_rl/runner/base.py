@@ -16,16 +16,13 @@ from gomoku_rl.utils.policy import _policy_t, uniform_policy
 
 
 class BaselineObservationAdapter:
-    """Adapt eval-env observations to the baseline policy's expected input format.
+    """Adapt runner observations to baseline observations.
 
-    Supported cases:
-    1) runner env temporal=False  -> baseline temporal=False  (direct pass-through)
-    2) runner env temporal=True   -> baseline temporal=True   (equal or fewer steps; slice prefix)
-    3) runner env temporal=True   -> baseline temporal=False  (convert absolute black/white history -> legacy 3ch)
+    Runner temporal observation semantics:
+      [current_player_board, opponent_board, last_1_move_one_hot, ..., last_n_move_one_hot]
 
-    Not supported:
-    - runner env temporal=False   -> baseline temporal=True
-      Because the env is not producing history, so the missing past boards cannot be reconstructed.
+    Legacy baseline observation semantics:
+      [current_player_board, opponent_board, last_move_one_hot]
     """
 
     def __init__(
@@ -41,7 +38,6 @@ class BaselineObservationAdapter:
             raise ValueError("target_temporal_num_steps must be >= 1")
 
     def train(self, mode: bool = True):
-        """Compat wrapper for both nn.Module-style train(mode) and custom PPO.train()."""
         if mode:
             if hasattr(self.policy, "train"):
                 self.policy.train()
@@ -56,39 +52,8 @@ class BaselineObservationAdapter:
         if hasattr(self.policy, "eval"):
             self.policy.eval()
         elif hasattr(self.policy, "train"):
-            # Fallback for policies that only expose train().
             self.policy.train()
         return self
-
-    def _temporal_to_legacy_3ch(self, obs: torch.Tensor) -> torch.Tensor:
-        """Convert absolute temporal planes [B_t,W_t,B_t-1,W_t-1,...] to legacy 3ch.
-
-        Legacy 3ch semantics expected by the original baseline model:
-        [current_player_stones, opponent_stones, last_move_one_hot]
-        """
-        if obs.ndim != 4 or obs.shape[1] < 2 or obs.shape[1] % 2 != 0:
-            raise ValueError(
-                f"Cannot convert observation with shape {tuple(obs.shape)} to legacy 3ch baseline input."
-            )
-
-        black_cur = obs[:, 0:1]
-        white_cur = obs[:, 1:2]
-
-        if obs.shape[1] >= 4:
-            black_prev = obs[:, 2:3]
-            white_prev = obs[:, 3:4]
-            last_move = ((black_cur != black_prev) | (white_cur != white_prev)).float()
-        else:
-            last_move = torch.zeros_like(black_cur)
-
-        black_count = black_cur.flatten(start_dim=1).sum(dim=1)
-        white_count = white_cur.flatten(start_dim=1).sum(dim=1)
-        black_to_play = (black_count == white_count).view(-1, 1, 1, 1)
-
-        current_player = torch.where(black_to_play, black_cur, white_cur)
-        opponent_player = torch.where(black_to_play, white_cur, black_cur)
-
-        return torch.cat([current_player, opponent_player, last_move], dim=1)
 
     def _convert_observation(self, obs: torch.Tensor) -> torch.Tensor:
         if obs.ndim != 4:
@@ -96,25 +61,27 @@ class BaselineObservationAdapter:
 
         channels = obs.shape[1]
 
+        # Target baseline expects temporal move-onehot observations.
         if self.target_use_temporal_feature:
-            target_channels = 2 * self.target_temporal_num_steps
+            target_channels = 2 + self.target_temporal_num_steps
             if channels == target_channels:
                 return obs
-            if channels > target_channels and channels % 2 == 0:
+            if channels > target_channels:
                 return obs[:, :target_channels]
             raise ValueError(
-                "Baseline temporal mode requires temporal observations from the env with at least "
-                f"{target_channels} channels, but got {channels}."
+                f"Baseline expects {target_channels} channels, but runner only provides {channels}."
             )
 
-        # Baseline expects legacy 3ch.
+        # Target baseline expects legacy 3ch.
         if channels == 3:
             return obs
-        if channels >= 4 and channels % 2 == 0:
-            return self._temporal_to_legacy_3ch(obs)
+        if channels >= 3:
+            current_board = obs[:, :2]
+            last_move = obs[:, 2:3]
+            return torch.cat([current_board, last_move], dim=1)
         raise ValueError(
-            "Baseline legacy mode requires either legacy 3ch observations or temporal observations "
-            f"that can be converted to legacy 3ch, but got {channels} channels."
+            "Cannot convert observation to legacy baseline format: "
+            f"got shape {tuple(obs.shape)}"
         )
 
     def __call__(self, tensordict: TensorDict) -> TensorDict:
@@ -131,7 +98,7 @@ class BaselineObservationAdapter:
 class _RunnerEnvMixin:
     def _get_temporal_cfg(self) -> Tuple[bool, int]:
         use_temporal_feature = bool(self.cfg.get("use_temporal_feature", False))
-        temporal_num_steps = int(self.cfg.get("temporal_num_steps", 3))
+        temporal_num_steps = int(self.cfg.get("temporal_num_steps", 6))
         if temporal_num_steps < 1:
             raise ValueError("temporal_num_steps must be >= 1")
         return use_temporal_feature, temporal_num_steps
@@ -184,7 +151,6 @@ class _RunnerEnvMixin:
         if not ckpts:
             return uniform_policy
 
-        # Build baseline with its own expected observation spec.
         baseline_env = self._make_env(
             num_envs=self.env.num_envs,
             use_temporal_feature=baseline_use_temporal,
@@ -203,24 +169,17 @@ class _RunnerEnvMixin:
         baseline.load_state_dict(torch.load(ckpts[0], map_location=self.cfg.device))
         baseline.eval()
 
-        # Same observation mode: use directly.
         if (
             baseline_use_temporal == runner_use_temporal
-            and (
-                (not baseline_use_temporal)
-                or baseline_temporal_steps == runner_temporal_steps
-            )
+            and ((not baseline_use_temporal) or baseline_temporal_steps == runner_temporal_steps)
         ):
             return baseline
 
-        # Env is legacy 3ch but baseline wants temporal: unsupported.
         if (not runner_use_temporal) and baseline_use_temporal:
             raise RuntimeError(
-                "baseline.use_temporal_feature=True requires the runner env to also provide temporal observations. "
-                "Current runner env is legacy 3ch, so baseline history cannot be reconstructed."
+                "baseline.use_temporal_feature=True requires runner temporal observations."
             )
 
-        # Env has fewer temporal steps than baseline wants: unsupported.
         if runner_use_temporal and baseline_use_temporal and baseline_temporal_steps > runner_temporal_steps:
             raise RuntimeError(
                 f"baseline.temporal_num_steps={baseline_temporal_steps} exceeds runner temporal_num_steps={runner_temporal_steps}."

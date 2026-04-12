@@ -21,10 +21,12 @@ log_interval: 5
 action_pruning:
   enabled: true
 
-# temporal feature settings
+# 新增：是否启用“当前局面 + 前 n 手 one-hot 落点图”
 use_temporal_feature: true
+# n 的含义：保留最近 n 手落点，每手一个 one-hot 平面
+# 开启后总通道数 = 2 + temporal_num_steps
+# 其中前 2 层是 [当前执子方棋子平面, 对手棋子平面]
 temporal_num_steps: 6
-
 
 # 新的双网络平衡控制。
 # 语义：
