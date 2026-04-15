@@ -131,10 +131,88 @@ class _RunnerEnvMixin:
         policy.load_state_dict(torch.load(checkpoint_path, map_location=self.cfg.device))
         logging.info(f"{tag}:{checkpoint_path}")
 
-    def _build_baseline_policy(self):
-        runner_use_temporal, runner_temporal_steps = self._get_temporal_cfg()
-        baseline_use_temporal, baseline_temporal_steps = self._get_baseline_temporal_cfg()
+    def _normalize_checkpoint_list(self, checkpoint_paths) -> list[str]:
+        if checkpoint_paths is None:
+            return []
+        if isinstance(checkpoint_paths, str):
+            checkpoint_paths = [checkpoint_paths]
+        result = []
+        for path in checkpoint_paths:
+            path = str(path).strip()
+            if path:
+                result.append(path)
+        return result
 
+    def _adapt_policy_for_runner_eval(
+        self,
+        policy: _policy_t,
+        policy_use_temporal: bool,
+        policy_temporal_steps: int,
+    ) -> _policy_t:
+        runner_use_temporal, runner_temporal_steps = self._get_temporal_cfg()
+
+        if (
+            policy_use_temporal == runner_use_temporal
+            and ((not policy_use_temporal) or policy_temporal_steps == runner_temporal_steps)
+        ):
+            return policy
+
+        if (not runner_use_temporal) and policy_use_temporal:
+            raise RuntimeError(
+                "baseline.use_temporal_feature=True requires runner temporal observations."
+            )
+
+        if (
+            runner_use_temporal
+            and policy_use_temporal
+            and policy_temporal_steps > runner_temporal_steps
+        ):
+            raise RuntimeError(
+                f"baseline.temporal_num_steps={policy_temporal_steps} exceeds runner temporal_num_steps={runner_temporal_steps}."
+            )
+
+        logging.info(
+            "Wrapping baseline with observation adapter: "
+            f"runner(use_temporal={runner_use_temporal}, steps={runner_temporal_steps}) -> "
+            f"baseline(use_temporal={policy_use_temporal}, steps={policy_temporal_steps})"
+        )
+        return BaselineObservationAdapter(
+            policy=policy,
+            target_use_temporal_feature=policy_use_temporal,
+            target_temporal_num_steps=policy_temporal_steps,
+        )
+
+    def _build_baseline_policy_from_checkpoint(
+        self,
+        checkpoint_path: str,
+        *,
+        tag: str,
+    ) -> _policy_t:
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(f"{tag} not found: {checkpoint_path}")
+
+        baseline_use_temporal, baseline_temporal_steps = self._get_baseline_temporal_cfg()
+        baseline_env = self._make_env(
+            num_envs=self.env.num_envs,
+            use_temporal_feature=baseline_use_temporal,
+            temporal_num_steps=baseline_temporal_steps,
+        )
+        baseline = get_policy(
+            name=self.cfg.baseline.name,
+            cfg=self.cfg.baseline,
+            action_spec=baseline_env.action_spec,
+            observation_spec=baseline_env.observation_spec,
+            device=baseline_env.device,
+        )
+        self._load_policy_checkpoint(baseline, checkpoint_path, tag)
+        baseline.eval()
+        return self._adapt_policy_for_runner_eval(
+            baseline,
+            policy_use_temporal=baseline_use_temporal,
+            policy_temporal_steps=baseline_temporal_steps,
+        )
+
+    def _build_baseline_policy(self):
         pretrained_dir = os.path.join(
             "pretrained_models",
             f"{self.cfg.board_size}_{self.cfg.board_size}",
@@ -151,50 +229,25 @@ class _RunnerEnvMixin:
         if not ckpts:
             return uniform_policy
 
-        baseline_env = self._make_env(
-            num_envs=self.env.num_envs,
-            use_temporal_feature=baseline_use_temporal,
-            temporal_num_steps=baseline_temporal_steps,
-        )
-        baseline = get_policy(
-            name=self.cfg.baseline.name,
-            cfg=self.cfg.baseline,
-            action_spec=baseline_env.action_spec,
-            observation_spec=baseline_env.observation_spec,
-            device=baseline_env.device,
-        )
-
         ckpts.sort()
-        logging.info(f"Baseline:{ckpts[0]}")
-        baseline.load_state_dict(torch.load(ckpts[0], map_location=self.cfg.device))
-        baseline.eval()
+        return self._build_baseline_policy_from_checkpoint(
+            ckpts[0],
+            tag="Baseline",
+        )
 
-        if (
-            baseline_use_temporal == runner_use_temporal
-            and ((not baseline_use_temporal) or baseline_temporal_steps == runner_temporal_steps)
+    def _build_eval_baseline_pool(self, checkpoint_paths, *, side_name: str) -> list[_policy_t]:
+        pool = []
+        for idx, checkpoint_path in enumerate(
+            self._normalize_checkpoint_list(checkpoint_paths),
+            start=1,
         ):
-            return baseline
-
-        if (not runner_use_temporal) and baseline_use_temporal:
-            raise RuntimeError(
-                "baseline.use_temporal_feature=True requires runner temporal observations."
+            pool.append(
+                self._build_baseline_policy_from_checkpoint(
+                    checkpoint_path,
+                    tag=f"eval_{side_name}_baseline{idx}",
+                )
             )
-
-        if runner_use_temporal and baseline_use_temporal and baseline_temporal_steps > runner_temporal_steps:
-            raise RuntimeError(
-                f"baseline.temporal_num_steps={baseline_temporal_steps} exceeds runner temporal_num_steps={runner_temporal_steps}."
-            )
-
-        logging.info(
-            "Wrapping baseline with observation adapter: "
-            f"runner(use_temporal={runner_use_temporal}, steps={runner_temporal_steps}) -> "
-            f"baseline(use_temporal={baseline_use_temporal}, steps={baseline_temporal_steps})"
-        )
-        return BaselineObservationAdapter(
-            policy=baseline,
-            target_use_temporal_feature=baseline_use_temporal,
-            target_temporal_num_steps=baseline_temporal_steps,
-        )
+        return pool
 
 
 class Runner(_RunnerEnvMixin, abc.ABC):
@@ -240,7 +293,15 @@ class Runner(_RunnerEnvMixin, abc.ABC):
         if white_checkpoint := cfg.get("white_checkpoint", None):
             self._load_policy_checkpoint(self.policy_white, white_checkpoint, "white_checkpoint")
 
-        self.baseline = self._build_baseline_policy()
+        eval_baseline_pool_cfg = cfg.get("eval_baseline_pool", {})
+        self.eval_baseline_black_pool = self._build_eval_baseline_pool(
+            eval_baseline_pool_cfg.get("black_pool", []),
+            side_name="black_pool",
+        )
+        self.eval_baseline_white_pool = self._build_eval_baseline_pool(
+            eval_baseline_pool_cfg.get("white_pool", []),
+            side_name="white_pool",
+        )
 
         run_dir = cfg.get("run_dir", None)
         if run_dir is None:
@@ -276,7 +337,6 @@ class Runner(_RunnerEnvMixin, abc.ABC):
                     os.path.join(self.run_dir, f"white_{i:04d}.pt"),
                 )
             pbar.set_postfix({"fps": info["fps"]})
-
         torch.save(
             self.policy_black.state_dict(),
             os.path.join(self.run_dir, "black_final.pt"),
@@ -322,7 +382,15 @@ class SPRunner(_RunnerEnvMixin, abc.ABC):
         if checkpoint := cfg.get("checkpoint", None):
             self._load_policy_checkpoint(self.policy, checkpoint, "checkpoint")
 
-        self.baseline = self._build_baseline_policy()
+        eval_baseline_pool_cfg = cfg.get("eval_baseline_pool", {})
+        self.eval_baseline_black_pool = self._build_eval_baseline_pool(
+            eval_baseline_pool_cfg.get("black_pool", []),
+            side_name="black_pool",
+        )
+        self.eval_baseline_white_pool = self._build_eval_baseline_pool(
+            eval_baseline_pool_cfg.get("white_pool", []),
+            side_name="white_pool",
+        )
 
         run_dir = cfg.get("run_dir", None)
         if run_dir is None:
@@ -354,6 +422,5 @@ class SPRunner(_RunnerEnvMixin, abc.ABC):
                     os.path.join(self.run_dir, f"{i:04d}.pt"),
                 )
             pbar.set_postfix({"fps": info["fps"]})
-
         torch.save(self.policy.state_dict(), os.path.join(self.run_dir, "final.pt"))
         self._post_run()

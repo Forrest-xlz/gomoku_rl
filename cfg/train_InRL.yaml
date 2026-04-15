@@ -9,13 +9,13 @@ version_name: inrl-temporal-6
 
 augment: false
 
-epochs: 3000
+epochs: 1000
 steps: 128
 save_interval: 300
 log_interval: 5
 
-#black_checkpoint: wandb\run-20260411_020310-8r88jup1\files\black_final.pt
-#white_checkpoint: wandb\run-20260411_020310-8r88jup1\files\white_final.pt
+black_checkpoint: wandb\run-20260415_121633-7x1svrpb\files\black_0600.pt
+white_checkpoint: wandb\run-20260415_121633-7x1svrpb\files\white_0600.pt
 
 # action pruning settings
 action_pruning:
@@ -27,6 +27,23 @@ use_temporal_feature: true
 # 开启后总通道数 = 2 + temporal_num_steps
 # 其中前 2 层是 [当前执子方棋子平面, 对手棋子平面]
 temporal_num_steps: 6
+
+# eval baseline 池：
+# - black_pool 里的模型会作为黑方 baseline，去和当前 white 对打；
+# - white_pool 里的模型会作为白方 baseline，去和当前 black 对打；
+# - 日志命名为 baseline1、baseline2...（按列表顺序，1-based）。
+#
+# 例子：
+# eval_baseline_pool:
+#   black_pool:
+#     - D:\gomoku_ckpts\black_a.pt
+#     - D:\gomoku_ckpts\black_b.pt
+#   white_pool:
+#     - D:\gomoku_ckpts\white_a.pt
+#     - D:\gomoku_ckpts\white_b.pt
+eval_baseline_pool:
+  black_pool: [pretrained_models\15_15\ppo\0.pt, wandb\run-20260411_070144-l2znhhtp\files\black_final.pt]
+  white_pool: [pretrained_models\15_15\ppo\0.pt, wandb\run-20260411_070144-l2znhhtp\files\white_final.pt]
 
 # 新的双网络平衡控制。
 # 语义：

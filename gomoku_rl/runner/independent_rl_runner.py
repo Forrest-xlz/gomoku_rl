@@ -225,6 +225,48 @@ class IndependentRLRunner(Runner):
         self.bias_turn_next = not self.bias_turn_next
         return applied_mode
 
+    def _eval_current_black_vs_white_pool(self) -> dict[str, float]:
+        if not self.eval_baseline_white_pool:
+            return {}
+
+        info: dict[str, float] = {}
+        scores: list[float] = []
+        for idx, baseline in enumerate(self.eval_baseline_white_pool, start=1):
+            score = float(
+                eval_win_rate(
+                    self.eval_env,
+                    player_black=self.policy_black,
+                    player_white=baseline,
+                )
+            )
+            info[f"eval/black_vs_white_pool{idx}"] = score
+            scores.append(score)
+
+        mean_score = float(sum(scores) / len(scores))
+        info["eval/black_vs_white_pool_mean"] = mean_score
+        return info
+
+    def _eval_black_pool_vs_current_white(self) -> dict[str, float]:
+        if not self.eval_baseline_black_pool:
+            return {}
+
+        info: dict[str, float] = {}
+        scores: list[float] = []
+        for idx, baseline in enumerate(self.eval_baseline_black_pool, start=1):
+            score = float(
+                eval_win_rate(
+                    self.eval_env,
+                    player_black=baseline,
+                    player_white=self.policy_white,
+                )
+            )
+            info[f"eval/black_pool{idx}_vs_white"] = score
+            scores.append(score)
+
+        mean_score = float(sum(scores) / len(scores))
+        info["eval/black_pool_vs_white_mean"] = mean_score
+        return info
+
     def _epoch(self, epoch: int) -> dict[str, Any]:
         data_black, data_white, info = self._collector.rollout(self.steps)
         info = add_prefix(info, "versus_play/")
@@ -265,6 +307,32 @@ class IndependentRLRunner(Runner):
     def _post_run(self):
         pass
 
+    def _format_eval_summary(self, info: dict[str, Any]) -> str:
+        parts = [
+            f"Black vs White:{info['eval/black_vs_white'] * 100.0:.2f}%",
+            f"EMA:{info['eval/black_vs_white_ema'] * 100.0:.2f}%",
+        ]
+        if "eval/black_vs_white_pool_mean" in info:
+            parts.append(f"Black vs WhitePool(mean):{info['eval/black_vs_white_pool_mean'] * 100.0:.2f}%")
+        if "eval/black_pool_vs_white_mean" in info:
+            parts.append(f"BlackPool(mean) vs White:{info['eval/black_pool_vs_white_mean'] * 100.0:.2f}%")
+        parts.extend(
+            [
+                f"white_pool:{len(self.eval_baseline_white_pool)}",
+                f"black_pool:{len(self.eval_baseline_black_pool)}",
+                f"bias_mode:{self.current_bias_mode}",
+                "next_turn:{}".format(
+                    "biased"
+                    if (
+                        self.current_bias_mode != self._MODE_BOTH
+                        and self.bias_turn_next
+                    )
+                    else "both"
+                ),
+            ]
+        )
+        return "	".join(parts)
+
     def _log(self, info: dict[str, Any], epoch: int):
         if epoch % self.log_interval == 0:
             black_vs_white_raw = float(
@@ -280,48 +348,23 @@ class IndependentRLRunner(Runner):
 
             info.update(
                 {
-                    # 保留原项目已有的三个 eval 指标
                     "eval/black_vs_white": black_vs_white_raw,
-                    "eval/black_vs_baseline": eval_win_rate(
-                        self.eval_env,
-                        player_black=self.policy_black,
-                        player_white=self.baseline,
-                    ),
-                    "eval/baseline_vs_white": eval_win_rate(
-                        self.eval_env,
-                        player_black=self.baseline,
-                        player_white=self.policy_white,
-                    ),
-                    # 新增：EMA 平滑后的 black vs white
                     "eval/black_vs_white_ema": black_vs_white_ema,
-                    # balance 配置
                     "balance/enabled": float(self.balance_enabled),
                     "balance/lower": self.balance_lower,
                     "balance/upper": self.balance_upper,
                     "balance/ema_alpha": self.balance_ema_alpha,
+                    "eval/white_pool_size": float(len(self.eval_baseline_white_pool)),
+                    "eval/black_pool_size": float(len(self.eval_baseline_black_pool)),
                 }
             )
+            info.update(self._eval_current_black_vs_white_pool())
+            info.update(self._eval_black_pool_vs_current_white())
             info.update(self._ema_trigger_flags())
             info.update(self._bias_mode_to_flags(self.current_bias_mode))
             info.update(self._phase_flags())
 
-            print(
-                "Black vs White:{:.2f}%\tEMA:{:.2f}%\t"
-                "Black vs Baseline:{:.2f}%\tBaseline vs White:{:.2f}%\t"
-                "bias_mode:{}\tnext_turn:{}".format(
-                    info["eval/black_vs_white"] * 100.0,
-                    info["eval/black_vs_white_ema"] * 100.0,
-                    info["eval/black_vs_baseline"] * 100.0,
-                    info["eval/baseline_vs_white"] * 100.0,
-                    self.current_bias_mode,
-                    "biased"
-                    if (
-                        self.current_bias_mode != self._MODE_BOTH
-                        and self.bias_turn_next
-                    )
-                    else "both",
-                )
-            )
+            print(self._format_eval_summary(info))
         else:
             # 非 eval epoch 也持续记录当前状态
             info.update(
@@ -330,6 +373,8 @@ class IndependentRLRunner(Runner):
                     "balance/lower": self.balance_lower,
                     "balance/upper": self.balance_upper,
                     "balance/ema_alpha": self.balance_ema_alpha,
+                    "eval/white_pool_size": float(len(self.eval_baseline_white_pool)),
+                    "eval/black_pool_size": float(len(self.eval_baseline_black_pool)),
                 }
             )
             info.update(self._bias_mode_to_flags(self.current_bias_mode))
@@ -368,6 +413,60 @@ class IndependentRLSPRunner(SPRunner):
     def _post_run(self):
         pass
 
+    def _eval_player_vs_white_pool(self) -> dict[str, float]:
+        if not self.eval_baseline_white_pool:
+            return {}
+
+        info: dict[str, float] = {}
+        scores: list[float] = []
+        for idx, baseline in enumerate(self.eval_baseline_white_pool, start=1):
+            score = float(
+                eval_win_rate(
+                    self.eval_env,
+                    player_black=self.policy,
+                    player_white=baseline,
+                )
+            )
+            info[f"eval/player_vs_baseline{idx}"] = score
+            scores.append(score)
+
+        mean_score = float(sum(scores) / len(scores))
+        info["eval/player_vs_baseline_mean"] = mean_score
+        info["eval/player_vs_baseline"] = mean_score
+        return info
+
+    def _eval_black_pool_vs_player(self) -> dict[str, float]:
+        if not self.eval_baseline_black_pool:
+            return {}
+
+        info: dict[str, float] = {}
+        scores: list[float] = []
+        for idx, baseline in enumerate(self.eval_baseline_black_pool, start=1):
+            score = float(
+                eval_win_rate(
+                    self.eval_env,
+                    player_black=baseline,
+                    player_white=self.policy,
+                )
+            )
+            info[f"eval/baseline{idx}_vs_player"] = score
+            scores.append(score)
+
+        mean_score = float(sum(scores) / len(scores))
+        info["eval/baseline_vs_player_mean"] = mean_score
+        info["eval/baseline_vs_player"] = mean_score
+        return info
+
+    def _format_sp_eval_summary(self, info: dict[str, Any]) -> str:
+        parts = [f"Player vs Player:{info['eval/player_vs_player'] * 100:.2f}%"]
+        if "eval/player_vs_baseline" in info:
+            parts.append(f"Player vs Baseline:{info['eval/player_vs_baseline'] * 100:.2f}%")
+        if "eval/baseline_vs_player" in info:
+            parts.append(f"Baseline vs Player:{info['eval/baseline_vs_player'] * 100:.2f}%")
+        parts.append(f"white_pool:{len(self.eval_baseline_white_pool)}")
+        parts.append(f"black_pool:{len(self.eval_baseline_black_pool)}")
+        return "	".join(parts)
+
     def _log(self, info: dict[str, Any], epoch: int):
         if epoch % 5 == 0:
             info.update(
@@ -377,24 +476,12 @@ class IndependentRLSPRunner(SPRunner):
                         player_black=self.policy,
                         player_white=self.policy,
                     ),
-                    "eval/player_vs_baseline": eval_win_rate(
-                        self.eval_env,
-                        player_black=self.policy,
-                        player_white=self.baseline,
-                    ),
-                    "eval/baseline_vs_player": eval_win_rate(
-                        self.eval_env,
-                        player_black=self.baseline,
-                        player_white=self.policy,
-                    ),
+                    "eval/white_pool_size": float(len(self.eval_baseline_white_pool)),
+                    "eval/black_pool_size": float(len(self.eval_baseline_black_pool)),
                 }
             )
-            print(
-                "Player vs Player:{:.2f}%\tPlayer vs Baseline:{:.2f}%\tBaseline vs Player:{:.2f}%".format(
-                    info["eval/player_vs_player"] * 100,
-                    info["eval/player_vs_baseline"] * 100,
-                    info["eval/baseline_vs_player"] * 100,
-                )
-            )
+            info.update(self._eval_player_vs_white_pool())
+            info.update(self._eval_black_pool_vs_player())
+            print(self._format_sp_eval_summary(info))
 
         return super()._log(info, epoch)
