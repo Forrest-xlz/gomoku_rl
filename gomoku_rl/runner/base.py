@@ -9,7 +9,12 @@ from omegaconf import DictConfig
 from tensordict import TensorDict
 from tqdm import tqdm
 
-from gomoku_rl.env import GomokuEnv
+from gomoku_rl.env import (
+    AZ_HISTORY_MODE,
+    LEGACY_MODE,
+    TEMPORAL_MOVE_HISTORY_MODE,
+    GomokuEnv,
+)
 from gomoku_rl.policy import get_policy
 from gomoku_rl.utils.misc import set_seed
 from gomoku_rl.utils.policy import _policy_t, uniform_policy
@@ -18,22 +23,33 @@ from gomoku_rl.utils.policy import _policy_t, uniform_policy
 class BaselineObservationAdapter:
     """Adapt runner observations to baseline observations.
 
-    Runner temporal observation semantics:
-      [current_player_board, opponent_board, last_1_move_one_hot, ..., last_n_move_one_hot]
+    Supported runner observation modes:
+    - legacy
+    - temporal_move_history
+    - az_history
 
-    Legacy baseline observation semantics:
-      [current_player_board, opponent_board, last_move_one_hot]
+    Supported baseline target modes:
+    - legacy
+    - temporal_move_history
+    - az_history (only when runner is already az_history)
     """
 
     def __init__(
         self,
         policy: _policy_t,
-        target_use_temporal_feature: bool,
+        source_observation_mode: str,
+        source_temporal_num_steps: int,
+        target_observation_mode: str,
         target_temporal_num_steps: int,
     ) -> None:
         self.policy = policy
-        self.target_use_temporal_feature = bool(target_use_temporal_feature)
+        self.source_observation_mode = str(source_observation_mode)
+        self.source_temporal_num_steps = int(source_temporal_num_steps)
+        self.target_observation_mode = str(target_observation_mode)
         self.target_temporal_num_steps = int(target_temporal_num_steps)
+
+        if self.source_temporal_num_steps < 1:
+            raise ValueError("source_temporal_num_steps must be >= 1")
         if self.target_temporal_num_steps < 1:
             raise ValueError("target_temporal_num_steps must be >= 1")
 
@@ -55,33 +71,161 @@ class BaselineObservationAdapter:
             self.policy.train()
         return self
 
+    @staticmethod
+    def _split_az_history(obs: torch.Tensor, steps: int):
+        black_hist = obs[:, :steps]
+        white_hist = obs[:, steps : 2 * steps]
+        side = obs[:, 2 * steps : 2 * steps + 1]
+        return black_hist, white_hist, side
+
+    @staticmethod
+    def _side_to_move_is_black(side_plane: torch.Tensor) -> torch.Tensor:
+        return side_plane[:, 0, 0, 0] > 0.5
+
+    @staticmethod
+    def _select_current_player_planes(
+        black: torch.Tensor,
+        white: torch.Tensor,
+        side_black: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mask = side_black.view(-1, 1, 1)
+        current = torch.where(mask, black, white)
+        opponent = torch.where(mask, white, black)
+        return current, opponent
+
+    @staticmethod
+    def _pad_channel_history(x: torch.Tensor, target_steps: int) -> torch.Tensor:
+        current_steps = x.shape[1]
+        if current_steps == target_steps:
+            return x
+        if current_steps > target_steps:
+            return x[:, :target_steps]
+        pad_shape = list(x.shape)
+        pad_shape[1] = target_steps - current_steps
+        pad = torch.zeros(pad_shape, dtype=x.dtype, device=x.device)
+        return torch.cat([x, pad], dim=1)
+
+    def _convert_from_az_to_legacy(self, obs: torch.Tensor) -> torch.Tensor:
+        black_hist, white_hist, side = self._split_az_history(
+            obs, self.source_temporal_num_steps
+        )
+        current_black = black_hist[:, 0]
+        current_white = white_hist[:, 0]
+        side_black = self._side_to_move_is_black(side)
+        current, opponent = self._select_current_player_planes(
+            current_black,
+            current_white,
+            side_black,
+        )
+
+        if self.source_temporal_num_steps >= 2:
+            prev_black = black_hist[:, 1]
+            prev_white = white_hist[:, 1]
+            last_move = ((current_black > prev_black) | (current_white > prev_white)).float()
+        else:
+            last_move = torch.zeros_like(current_black)
+
+        return torch.stack([current, opponent, last_move], dim=1)
+
+    def _convert_from_az_to_temporal_move_history(self, obs: torch.Tensor) -> torch.Tensor:
+        black_hist, white_hist, side = self._split_az_history(
+            obs, self.source_temporal_num_steps
+        )
+        current_black = black_hist[:, 0]
+        current_white = white_hist[:, 0]
+        side_black = self._side_to_move_is_black(side)
+        current, opponent = self._select_current_player_planes(
+            current_black,
+            current_white,
+            side_black,
+        )
+
+        max_available = max(self.source_temporal_num_steps - 1, 0)
+        move_planes = []
+        for i in range(min(self.target_temporal_num_steps, max_available)):
+            black_now = black_hist[:, i]
+            black_prev = black_hist[:, i + 1]
+            white_now = white_hist[:, i]
+            white_prev = white_hist[:, i + 1]
+            move_plane = ((black_now > black_prev) | (white_now > white_prev)).float()
+            move_planes.append(move_plane.unsqueeze(1))
+
+        if move_planes:
+            moves = torch.cat(move_planes, dim=1)
+        else:
+            moves = torch.zeros(
+                obs.shape[0],
+                0,
+                obs.shape[-2],
+                obs.shape[-1],
+                device=obs.device,
+                dtype=obs.dtype,
+            )
+        moves = self._pad_channel_history(moves, self.target_temporal_num_steps)
+        return torch.cat([current.unsqueeze(1), opponent.unsqueeze(1), moves], dim=1)
+
     def _convert_observation(self, obs: torch.Tensor) -> torch.Tensor:
         if obs.ndim != 4:
             raise ValueError(f"Expected 4D observation, got shape {tuple(obs.shape)}")
 
-        channels = obs.shape[1]
-
-        # Target baseline expects temporal move-onehot observations.
-        if self.target_use_temporal_feature:
-            target_channels = 2 + self.target_temporal_num_steps
-            if channels == target_channels:
-                return obs
-            if channels > target_channels:
-                return obs[:, :target_channels]
-            raise ValueError(
-                f"Baseline expects {target_channels} channels, but runner only provides {channels}."
+        # Fast path
+        if (
+            self.source_observation_mode == self.target_observation_mode
+            and (
+                self.target_observation_mode == LEGACY_MODE
+                or self.source_temporal_num_steps == self.target_temporal_num_steps
             )
-
-        # Target baseline expects legacy 3ch.
-        if channels == 3:
+        ):
             return obs
-        if channels >= 3:
-            current_board = obs[:, :2]
-            last_move = obs[:, 2:3]
-            return torch.cat([current_board, last_move], dim=1)
-        raise ValueError(
-            "Cannot convert observation to legacy baseline format: "
-            f"got shape {tuple(obs.shape)}"
+
+        if self.target_observation_mode == LEGACY_MODE:
+            if self.source_observation_mode == LEGACY_MODE:
+                return obs
+            if self.source_observation_mode == TEMPORAL_MOVE_HISTORY_MODE:
+                return obs[:, :3]
+            if self.source_observation_mode == AZ_HISTORY_MODE:
+                return self._convert_from_az_to_legacy(obs)
+
+        if self.target_observation_mode == TEMPORAL_MOVE_HISTORY_MODE:
+            if self.source_observation_mode == LEGACY_MODE:
+                current = obs[:, :2]
+                last_move = obs[:, 2:3]
+                last_move = self._pad_channel_history(
+                    last_move,
+                    self.target_temporal_num_steps,
+                )
+                return torch.cat([current, last_move], dim=1)
+            if self.source_observation_mode == TEMPORAL_MOVE_HISTORY_MODE:
+                current = obs[:, :2]
+                moves = self._pad_channel_history(
+                    obs[:, 2:],
+                    self.target_temporal_num_steps,
+                )
+                return torch.cat([current, moves], dim=1)
+            if self.source_observation_mode == AZ_HISTORY_MODE:
+                return self._convert_from_az_to_temporal_move_history(obs)
+
+        if self.target_observation_mode == AZ_HISTORY_MODE:
+            if self.source_observation_mode != AZ_HISTORY_MODE:
+                raise RuntimeError(
+                    "Cannot convert non-AZ observations to az_history baseline format."
+                )
+            black_hist, white_hist, side = self._split_az_history(
+                obs, self.source_temporal_num_steps
+            )
+            black_hist = self._pad_channel_history(
+                black_hist,
+                self.target_temporal_num_steps,
+            )
+            white_hist = self._pad_channel_history(
+                white_hist,
+                self.target_temporal_num_steps,
+            )
+            return torch.cat([black_hist, white_hist, side], dim=1)
+
+        raise RuntimeError(
+            "Unsupported observation adaptation: "
+            f"source={self.source_observation_mode}, target={self.target_observation_mode}"
         )
 
     def __call__(self, tensordict: TensorDict) -> TensorDict:
@@ -96,34 +240,56 @@ class BaselineObservationAdapter:
 
 
 class _RunnerEnvMixin:
-    def _get_temporal_cfg(self) -> Tuple[bool, int]:
-        use_temporal_feature = bool(self.cfg.get("use_temporal_feature", False))
+    def _get_observation_cfg(self) -> Tuple[str, int]:
+        observation_mode = self.cfg.get("observation_mode", None)
+        if observation_mode is None:
+            use_temporal_feature = bool(self.cfg.get("use_temporal_feature", False))
+            observation_mode = (
+                TEMPORAL_MOVE_HISTORY_MODE if use_temporal_feature else LEGACY_MODE
+            )
+        else:
+            observation_mode = str(observation_mode)
+
         temporal_num_steps = int(self.cfg.get("temporal_num_steps", 6))
         if temporal_num_steps < 1:
             raise ValueError("temporal_num_steps must be >= 1")
-        return use_temporal_feature, temporal_num_steps
+        return observation_mode, temporal_num_steps
 
-    def _get_baseline_temporal_cfg(self) -> Tuple[bool, int]:
+    def _get_baseline_observation_cfg(self) -> Tuple[str, int]:
         baseline_cfg = self.cfg.get("baseline", {})
-        runner_use_temporal, runner_temporal_steps = self._get_temporal_cfg()
-        baseline_use_temporal = bool(
-            baseline_cfg.get("use_temporal_feature", runner_use_temporal)
-        )
-        baseline_temporal_steps = int(
-            baseline_cfg.get("temporal_num_steps", runner_temporal_steps)
-        )
-        if baseline_temporal_steps < 1:
-            raise ValueError("baseline.temporal_num_steps must be >= 1")
-        return baseline_use_temporal, baseline_temporal_steps
+        runner_mode, runner_steps = self._get_observation_cfg()
 
-    def _make_env(self, num_envs: int, use_temporal_feature: bool, temporal_num_steps: int):
+        observation_mode = baseline_cfg.get("observation_mode", None)
+        if observation_mode is None:
+            if "use_temporal_feature" in baseline_cfg:
+                observation_mode = (
+                    TEMPORAL_MOVE_HISTORY_MODE
+                    if bool(baseline_cfg.get("use_temporal_feature", False))
+                    else LEGACY_MODE
+                )
+            else:
+                observation_mode = runner_mode
+        else:
+            observation_mode = str(observation_mode)
+
+        temporal_num_steps = int(baseline_cfg.get("temporal_num_steps", runner_steps))
+        if temporal_num_steps < 1:
+            raise ValueError("baseline.temporal_num_steps must be >= 1")
+        return observation_mode, temporal_num_steps
+
+    def _make_env(
+        self,
+        num_envs: int,
+        observation_mode: str,
+        temporal_num_steps: int,
+    ):
         action_pruning_cfg = self.cfg.get("action_pruning", None)
         return GomokuEnv(
             num_envs=num_envs,
             board_size=self.cfg.board_size,
             device=self.cfg.device,
             action_pruning=action_pruning_cfg,
-            use_temporal_feature=use_temporal_feature,
+            observation_mode=observation_mode,
             temporal_num_steps=temporal_num_steps,
         )
 
@@ -146,39 +312,33 @@ class _RunnerEnvMixin:
     def _adapt_policy_for_runner_eval(
         self,
         policy: _policy_t,
-        policy_use_temporal: bool,
+        policy_observation_mode: str,
         policy_temporal_steps: int,
     ) -> _policy_t:
-        runner_use_temporal, runner_temporal_steps = self._get_temporal_cfg()
-
+        runner_mode, runner_steps = self._get_observation_cfg()
         if (
-            policy_use_temporal == runner_use_temporal
-            and ((not policy_use_temporal) or policy_temporal_steps == runner_temporal_steps)
+            policy_observation_mode == runner_mode
+            and (
+                runner_mode == LEGACY_MODE or policy_temporal_steps == runner_steps
+            )
         ):
             return policy
 
-        if (not runner_use_temporal) and policy_use_temporal:
+        if policy_observation_mode == AZ_HISTORY_MODE and runner_mode != AZ_HISTORY_MODE:
             raise RuntimeError(
-                "baseline.use_temporal_feature=True requires runner temporal observations."
-            )
-
-        if (
-            runner_use_temporal
-            and policy_use_temporal
-            and policy_temporal_steps > runner_temporal_steps
-        ):
-            raise RuntimeError(
-                f"baseline.temporal_num_steps={policy_temporal_steps} exceeds runner temporal_num_steps={runner_temporal_steps}."
+                "az_history baseline requires runner observations to also be az_history."
             )
 
         logging.info(
             "Wrapping baseline with observation adapter: "
-            f"runner(use_temporal={runner_use_temporal}, steps={runner_temporal_steps}) -> "
-            f"baseline(use_temporal={policy_use_temporal}, steps={policy_temporal_steps})"
+            f"runner(mode={runner_mode}, steps={runner_steps}) -> "
+            f"baseline(mode={policy_observation_mode}, steps={policy_temporal_steps})"
         )
         return BaselineObservationAdapter(
             policy=policy,
-            target_use_temporal_feature=policy_use_temporal,
+            source_observation_mode=runner_mode,
+            source_temporal_num_steps=runner_steps,
+            target_observation_mode=policy_observation_mode,
             target_temporal_num_steps=policy_temporal_steps,
         )
 
@@ -191,10 +351,12 @@ class _RunnerEnvMixin:
         if not os.path.isfile(checkpoint_path):
             raise FileNotFoundError(f"{tag} not found: {checkpoint_path}")
 
-        baseline_use_temporal, baseline_temporal_steps = self._get_baseline_temporal_cfg()
+        baseline_observation_mode, baseline_temporal_steps = (
+            self._get_baseline_observation_cfg()
+        )
         baseline_env = self._make_env(
             num_envs=self.env.num_envs,
-            use_temporal_feature=baseline_use_temporal,
+            observation_mode=baseline_observation_mode,
             temporal_num_steps=baseline_temporal_steps,
         )
         baseline = get_policy(
@@ -208,7 +370,7 @@ class _RunnerEnvMixin:
         baseline.eval()
         return self._adapt_policy_for_runner_eval(
             baseline,
-            policy_use_temporal=baseline_use_temporal,
+            policy_observation_mode=baseline_observation_mode,
             policy_temporal_steps=baseline_temporal_steps,
         )
 
@@ -238,8 +400,7 @@ class _RunnerEnvMixin:
     def _build_eval_baseline_pool(self, checkpoint_paths, *, side_name: str) -> list[_policy_t]:
         pool = []
         for idx, checkpoint_path in enumerate(
-            self._normalize_checkpoint_list(checkpoint_paths),
-            start=1,
+            self._normalize_checkpoint_list(checkpoint_paths), start=1
         ):
             pool.append(
                 self._build_baseline_policy_from_checkpoint(
@@ -253,26 +414,23 @@ class _RunnerEnvMixin:
 class Runner(_RunnerEnvMixin, abc.ABC):
     def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
+        observation_mode, temporal_num_steps = self._get_observation_cfg()
 
-        use_temporal_feature, temporal_num_steps = self._get_temporal_cfg()
         self.env = self._make_env(
             num_envs=cfg.num_envs,
-            use_temporal_feature=use_temporal_feature,
+            observation_mode=observation_mode,
             temporal_num_steps=temporal_num_steps,
         )
         self.eval_env = self._make_env(
             num_envs=512,
-            use_temporal_feature=use_temporal_feature,
+            observation_mode=observation_mode,
             temporal_num_steps=temporal_num_steps,
         )
-
         seed = cfg.get("seed", None)
         set_seed(seed)
-
         self.epochs: int = cfg.get("epochs")
         self.steps = cfg.steps
         self.save_interval: int = cfg.get("save_interval", -1)
-
         self.policy_black = get_policy(
             name=cfg.algo.name,
             cfg=cfg.algo,
@@ -287,11 +445,18 @@ class Runner(_RunnerEnvMixin, abc.ABC):
             observation_spec=self.env.observation_spec,
             device=self.env.device,
         )
-
         if black_checkpoint := cfg.get("black_checkpoint", None):
-            self._load_policy_checkpoint(self.policy_black, black_checkpoint, "black_checkpoint")
+            self._load_policy_checkpoint(
+                self.policy_black,
+                black_checkpoint,
+                "black_checkpoint",
+            )
         if white_checkpoint := cfg.get("white_checkpoint", None):
-            self._load_policy_checkpoint(self.policy_white, white_checkpoint, "white_checkpoint")
+            self._load_policy_checkpoint(
+                self.policy_white,
+                white_checkpoint,
+                "white_checkpoint",
+            )
 
         eval_baseline_pool_cfg = cfg.get("eval_baseline_pool", {})
         self.eval_baseline_black_pool = self._build_eval_baseline_pool(
@@ -311,8 +476,7 @@ class Runner(_RunnerEnvMixin, abc.ABC):
         self.run_dir = run_dir
 
     @abc.abstractmethod
-    def _epoch(self, epoch: int) -> dict[str, Any]:
-        ...
+    def _epoch(self, epoch: int) -> dict[str, Any]: ...
 
     def _post_run(self):
         pass
@@ -351,26 +515,23 @@ class Runner(_RunnerEnvMixin, abc.ABC):
 class SPRunner(_RunnerEnvMixin, abc.ABC):
     def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
+        observation_mode, temporal_num_steps = self._get_observation_cfg()
 
-        use_temporal_feature, temporal_num_steps = self._get_temporal_cfg()
         self.env = self._make_env(
             num_envs=cfg.num_envs,
-            use_temporal_feature=use_temporal_feature,
+            observation_mode=observation_mode,
             temporal_num_steps=temporal_num_steps,
         )
         self.eval_env = self._make_env(
             num_envs=512,
-            use_temporal_feature=use_temporal_feature,
+            observation_mode=observation_mode,
             temporal_num_steps=temporal_num_steps,
         )
-
         seed = cfg.get("seed", None)
         set_seed(seed)
-
         self.epochs: int = cfg.get("epochs")
         self.steps: int = cfg.steps
         self.save_interval: int = cfg.get("save_interval", -1)
-
         self.policy = get_policy(
             name=cfg.algo.name,
             cfg=cfg.algo,
@@ -378,7 +539,6 @@ class SPRunner(_RunnerEnvMixin, abc.ABC):
             observation_spec=self.env.observation_spec,
             device=self.env.device,
         )
-
         if checkpoint := cfg.get("checkpoint", None):
             self._load_policy_checkpoint(self.policy, checkpoint, "checkpoint")
 
@@ -400,8 +560,7 @@ class SPRunner(_RunnerEnvMixin, abc.ABC):
         self.run_dir = run_dir
 
     @abc.abstractmethod
-    def _epoch(self, epoch: int) -> dict[str, Any]:
-        ...
+    def _epoch(self, epoch: int) -> dict[str, Any]: ...
 
     def _post_run(self):
         pass

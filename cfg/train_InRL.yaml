@@ -14,8 +14,8 @@ steps: 128
 save_interval: 300
 log_interval: 5
 
-black_checkpoint: wandb\run-20260415_121633-7x1svrpb\files\black_0600.pt
-white_checkpoint: wandb\run-20260415_121633-7x1svrpb\files\white_0600.pt
+black_checkpoint: wandb\run-20260417_024131-4te2g3if\files\black_2700.pt
+white_checkpoint: wandb\run-20260417_024131-4te2g3if\files\white_2700.pt
 
 # action pruning settings
 action_pruning:
