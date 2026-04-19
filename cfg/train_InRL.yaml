@@ -9,13 +9,13 @@ version_name: inrl-temporal-6
 
 augment: false
 
-epochs: 1000
+epochs: 3000
 steps: 128
 save_interval: 300
 log_interval: 5
 
-black_checkpoint: wandb\run-20260417_024131-4te2g3if\files\black_2700.pt
-white_checkpoint: wandb\run-20260417_024131-4te2g3if\files\white_2700.pt
+black_checkpoint: wandb\run-20260418_235123-eb1vjnd0\files\black_2700.pt
+white_checkpoint: wandb\run-20260418_235123-eb1vjnd0\files\white_2700.pt
 
 # action pruning settings
 action_pruning:

@@ -27,9 +27,9 @@ population_mode: fifo
 opponent_sampling: uniform
 
 # 每个颜色各自维护一个大小为 n 的模型池
-pool_size: 30
+pool_size: 5
 
-pool_sample_start_ratio: 0.5
+pool_sample_start_ratio: 1
 
 # 每隔多少个 epoch，把当前黑/白策略各自压入各自 FIFO 池
 pool_update_interval: 1
