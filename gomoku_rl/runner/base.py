@@ -15,6 +15,7 @@ from gomoku_rl.env import (
     TEMPORAL_MOVE_HISTORY_MODE,
     GomokuEnv,
 )
+
 from gomoku_rl.policy import get_policy
 from gomoku_rl.utils.misc import set_seed
 from gomoku_rl.utils.policy import _policy_t, uniform_policy
@@ -509,77 +510,4 @@ class Runner(_RunnerEnvMixin, abc.ABC):
             self.policy_white.state_dict(),
             os.path.join(self.run_dir, "white_final.pt"),
         )
-        self._post_run()
-
-
-class SPRunner(_RunnerEnvMixin, abc.ABC):
-    def __init__(self, cfg: DictConfig) -> None:
-        self.cfg = cfg
-        observation_mode, temporal_num_steps = self._get_observation_cfg()
-
-        self.env = self._make_env(
-            num_envs=cfg.num_envs,
-            observation_mode=observation_mode,
-            temporal_num_steps=temporal_num_steps,
-        )
-        self.eval_env = self._make_env(
-            num_envs=512,
-            observation_mode=observation_mode,
-            temporal_num_steps=temporal_num_steps,
-        )
-        seed = cfg.get("seed", None)
-        set_seed(seed)
-        self.epochs: int = cfg.get("epochs")
-        self.steps: int = cfg.steps
-        self.save_interval: int = cfg.get("save_interval", -1)
-        self.policy = get_policy(
-            name=cfg.algo.name,
-            cfg=cfg.algo,
-            action_spec=self.env.action_spec,
-            observation_spec=self.env.observation_spec,
-            device=self.env.device,
-        )
-        if checkpoint := cfg.get("checkpoint", None):
-            self._load_policy_checkpoint(self.policy, checkpoint, "checkpoint")
-
-        eval_baseline_pool_cfg = cfg.get("eval_baseline_pool", {})
-        self.eval_baseline_black_pool = self._build_eval_baseline_pool(
-            eval_baseline_pool_cfg.get("black_pool", []),
-            side_name="black_pool",
-        )
-        self.eval_baseline_white_pool = self._build_eval_baseline_pool(
-            eval_baseline_pool_cfg.get("white_pool", []),
-            side_name="white_pool",
-        )
-
-        run_dir = cfg.get("run_dir", None)
-        if run_dir is None:
-            run_dir = wandb.run.dir
-        os.makedirs(run_dir, exist_ok=True)
-        logging.info(f"run_dir:{run_dir}")
-        self.run_dir = run_dir
-
-    @abc.abstractmethod
-    def _epoch(self, epoch: int) -> dict[str, Any]: ...
-
-    def _post_run(self):
-        pass
-
-    def _log(self, info: dict[str, Any], epoch: int):
-        if wandb.run is not None:
-            wandb.run.log(info)
-
-    def run(self, disable_tqdm: bool = False):
-        pbar = tqdm(range(self.epochs), disable=disable_tqdm)
-        for i in pbar:
-            info = {}
-            info.update(self._epoch(epoch=i))
-            self._log(info=info, epoch=i)
-            if i % self.save_interval == 0 and self.save_interval > 0:
-                torch.save(
-                    self.policy.state_dict(),
-                    os.path.join(self.run_dir, f"{i:04d}.pt"),
-                )
-            pbar.set_postfix({"fps": info["fps"]})
-        torch.save(self.policy.state_dict(), os.path.join(self.run_dir, "final.pt"))
         self._post_run()

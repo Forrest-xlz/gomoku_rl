@@ -3,8 +3,8 @@ from typing import Any
 import torch
 from omegaconf import DictConfig
 
-from .base import Runner, SPRunner
-from gomoku_rl.collector import SelfPlayCollector, VersusPlayCollector
+from .base import Runner
+from gomoku_rl.collector import VersusPlayCollector
 from gomoku_rl.utils.eval import eval_win_rate
 from gomoku_rl.utils.misc import add_prefix
 
@@ -383,105 +383,5 @@ class IndependentRLRunner(Runner):
 
             if self.black_vs_white_ema is not None:
                 info["eval/black_vs_white_ema"] = self.black_vs_white_ema
-
-        return super()._log(info, epoch)
-
-
-class IndependentRLSPRunner(SPRunner):
-    def __init__(self, cfg: DictConfig) -> None:
-        super().__init__(cfg)
-        self._collector = SelfPlayCollector(
-            self.env,
-            self.policy,
-            out_device=self.cfg.get("out_device", None),
-            augment=self.cfg.get("augment", False),
-        )
-
-    def _epoch(self, epoch: int) -> dict[str, Any]:
-        data, info = self._collector.rollout(self.steps)
-        info = add_prefix(info, "self_play/")
-        info["fps"] = info["self_play/fps"]
-        del info["self_play/fps"]
-        info.update(add_prefix(self.policy.learn(data.to_tensordict()), "policy/"))
-        del data
-
-        if epoch % 50 == 0 and epoch != 0 and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        return info
-
-    def _post_run(self):
-        pass
-
-    def _eval_player_vs_white_pool(self) -> dict[str, float]:
-        if not self.eval_baseline_white_pool:
-            return {}
-
-        info: dict[str, float] = {}
-        scores: list[float] = []
-        for idx, baseline in enumerate(self.eval_baseline_white_pool, start=1):
-            score = float(
-                eval_win_rate(
-                    self.eval_env,
-                    player_black=self.policy,
-                    player_white=baseline,
-                )
-            )
-            info[f"eval/player_vs_baseline{idx}"] = score
-            scores.append(score)
-
-        mean_score = float(sum(scores) / len(scores))
-        info["eval/player_vs_baseline_mean"] = mean_score
-        info["eval/player_vs_baseline"] = mean_score
-        return info
-
-    def _eval_black_pool_vs_player(self) -> dict[str, float]:
-        if not self.eval_baseline_black_pool:
-            return {}
-
-        info: dict[str, float] = {}
-        scores: list[float] = []
-        for idx, baseline in enumerate(self.eval_baseline_black_pool, start=1):
-            score = float(
-                eval_win_rate(
-                    self.eval_env,
-                    player_black=baseline,
-                    player_white=self.policy,
-                )
-            )
-            info[f"eval/baseline{idx}_vs_player"] = score
-            scores.append(score)
-
-        mean_score = float(sum(scores) / len(scores))
-        info["eval/baseline_vs_player_mean"] = mean_score
-        info["eval/baseline_vs_player"] = mean_score
-        return info
-
-    def _format_sp_eval_summary(self, info: dict[str, Any]) -> str:
-        parts = [f"Player vs Player:{info['eval/player_vs_player'] * 100:.2f}%"]
-        if "eval/player_vs_baseline" in info:
-            parts.append(f"Player vs Baseline:{info['eval/player_vs_baseline'] * 100:.2f}%")
-        if "eval/baseline_vs_player" in info:
-            parts.append(f"Baseline vs Player:{info['eval/baseline_vs_player'] * 100:.2f}%")
-        parts.append(f"white_pool:{len(self.eval_baseline_white_pool)}")
-        parts.append(f"black_pool:{len(self.eval_baseline_black_pool)}")
-        return "	".join(parts)
-
-    def _log(self, info: dict[str, Any], epoch: int):
-        if epoch % 5 == 0:
-            info.update(
-                {
-                    "eval/player_vs_player": eval_win_rate(
-                        self.eval_env,
-                        player_black=self.policy,
-                        player_white=self.policy,
-                    ),
-                    "eval/white_pool_size": float(len(self.eval_baseline_white_pool)),
-                    "eval/black_pool_size": float(len(self.eval_baseline_black_pool)),
-                }
-            )
-            info.update(self._eval_player_vs_white_pool())
-            info.update(self._eval_black_pool_vs_player())
-            print(self._format_sp_eval_summary(info))
 
         return super()._log(info, epoch)

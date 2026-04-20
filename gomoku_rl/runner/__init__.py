@@ -1,3 +1,3 @@
-from .psro_runner import PSRORunner, PSROSPRunner
-from .independent_rl_runner import IndependentRLSPRunner, IndependentRLRunner
+from .independent_rl_runner import IndependentRLRunner
 
+__all__ = ["IndependentRLRunner"]
