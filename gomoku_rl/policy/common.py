@@ -1,32 +1,20 @@
-from typing import Generator
-
+from typing import Generator, Iterable, Union
 
 from torch.optim import Optimizer, Adam, AdamW
 import torch
-import torch.nn as nn
 from torch.nn import Parameter
-import torch
-from typing import Union
-DeviceLike = Union[torch.device, str, int, None]
-from torchrl.modules import ProbabilisticActor
+from torchrl.modules import ProbabilisticActor, ValueOperator
 from torch.distributions.categorical import Categorical
-from torchrl.modules.models import ConvNet, MLP
-from torchrl.modules import ValueOperator
 from torchrl.data import TensorSpec
 from torchrl.modules import (
-    DuelingCnnDQNet,
     EGreedyModule,
     QValueActor,
     ActorValueOperator,
     SafeModule,
 )
-
 from tensordict.nn import TensorDictModule, TensorDictSequential
 from tensordict import TensorDict
-
-
-from omegaconf import DictConfig, OmegaConf
-from typing import Callable, Iterable
+from omegaconf import DictConfig
 
 from gomoku_rl.utils.module import (
     ValueNet,
@@ -38,15 +26,24 @@ from gomoku_rl.utils.module import (
 )
 from gomoku_rl.utils.misc import get_kwargs
 
+DeviceLike = Union[torch.device, str, int, None]
+
+
+def _get_in_channels(observation_spec: TensorSpec) -> int:
+    return int(observation_spec["observation"].shape[-3])
+
 
 def make_dqn_actor(
     cfg: DictConfig,
     action_spec: TensorSpec,
+    observation_spec: TensorSpec,
     device: DeviceLike,
 ):
     net_kwargs = get_kwargs(cfg, "num_residual_blocks", "num_channels")
     net = MyDuelingCnnDQNet(
-        in_channels=3, out_features=action_spec.space.n, **net_kwargs
+        in_channels=_get_in_channels(observation_spec),
+        out_features=action_spec.space.n,
+        **net_kwargs,
     )
     actor = QValueActor(
         net,
@@ -79,11 +76,13 @@ def make_egreedy_actor(
 def make_ppo_actor(
     cfg: DictConfig,
     action_spec: TensorSpec,
+    observation_spec: TensorSpec,
     device: DeviceLike,
 ):
+    in_channels = _get_in_channels(observation_spec)
     actor_net = ActorNet(
         residual_tower=ResidualTower(
-            in_channels=3,
+            in_channels=in_channels,
             num_channels=cfg.num_channels,
             num_residual_blocks=cfg.num_residual_blocks,
         ),
@@ -92,7 +91,9 @@ def make_ppo_actor(
     ).to(device)
 
     policy_module = TensorDictModule(
-        module=actor_net, in_keys=["observation", "action_mask"], out_keys=["probs"]
+        module=actor_net,
+        in_keys=["observation", "action_mask"],
+        out_keys=["probs"],
     )
 
     policy_module = ProbabilisticActor(
@@ -108,49 +109,51 @@ def make_ppo_actor(
 
 def make_critic(
     cfg: DictConfig,
+    observation_spec: TensorSpec,
     device: DeviceLike,
 ):
+    in_channels = _get_in_channels(observation_spec)
     value_net = ValueNet(
         residual_tower=ResidualTower(
-            in_channels=3,
+            in_channels=in_channels,
             num_channels=cfg.num_channels,
             num_residual_blocks=cfg.num_residual_blocks,
         ),
         num_channels=cfg.num_channels,
     ).to(device)
-
     value_module = ValueOperator(
         module=value_net,
         in_keys=["observation"],
     )
-
     return value_module
 
 
 def make_ppo_ac(
     cfg: DictConfig,
     action_spec: TensorSpec,
+    observation_spec: TensorSpec,
     device: DeviceLike,
 ):
+    in_channels = _get_in_channels(observation_spec)
     residual_tower = ResidualTower(
-        in_channels=3,
+        in_channels=in_channels,
         num_channels=cfg.num_channels,
         num_residual_blocks=cfg.num_residual_blocks,
     ).to(device)
-
     common_module = SafeModule(
-        module=residual_tower, in_keys=["observation"], out_keys=["hidden"]
+        module=residual_tower,
+        in_keys=["observation"],
+        out_keys=["hidden"],
     )
-
     policy_head = PolicyHead(
         out_features=action_spec.space.n,
         num_channels=cfg.num_channels,
     ).to(device)
-
     policy_module = TensorDictModule(
-        module=policy_head, in_keys=["hidden", "action_mask"], out_keys=["probs"]
+        module=policy_head,
+        in_keys=["hidden", "action_mask"],
+        out_keys=["probs"],
     )
-
     policy_module = ProbabilisticActor(
         module=policy_module,
         spec=action_spec,
@@ -158,16 +161,11 @@ def make_ppo_ac(
         distribution_class=Categorical,
         return_log_prob=True,
     )
-
-    value_head = ValueHead(
-        num_channels=cfg.num_channels,
-    ).to(device)
-
+    value_head = ValueHead(num_channels=cfg.num_channels).to(device)
     value_module = ValueOperator(
         module=value_head,
         in_keys=["hidden"],
     )
-
     return ActorValueOperator(common_module, policy_module, value_module)
 
 
@@ -189,5 +187,4 @@ def get_optimizer(cfg: DictConfig, params: Iterable[Parameter]) -> Optimizer:
     }
     name: str = cfg.name.lower()
     assert name in dict_cls
-
     return dict_cls[name](params=params, **cfg.kwargs)

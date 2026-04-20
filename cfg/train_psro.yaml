@@ -1,33 +1,52 @@
 seed: 0
+
 num_envs: 512
 board_size: 15
 device: cuda
 out_device: cpu
+
 run_dir:
 augment: false
-epochs: 2000
+
+epochs: 1000
 steps: 128
 save_interval: 250
-version_name: psro - active-archive - base
 
-# psro
-meta_solver: uniform
+version_name: psro-fifo-uniform-dual-train
+
+# ===== 与 InRL 一样的 feature 设置 =====
+use_temporal_feature: true
+temporal_num_steps: 6
+
+# ===== 打开动作剪枝 =====
+action_pruning:
+  enabled: true
+
+# ===== FIFO pool settings =====
+population_mode: fifo
+opponent_sampling: uniform
+
+# 每个颜色各自维护一个大小为 n 的模型池
+pool_size: 5
+
+pool_sample_start_ratio: 1
+
+# 每隔多少个 epoch，把当前黑/白策略各自压入各自 FIFO 池
+pool_update_interval: 1
+
+# 池中被抽到的策略自己的 action sampling 模式
+# 这是“策略怎么出手”，不是“怎么抽模型”
 population_interaction_type: random
-mean_threshold: 0.99
-std_threshold: 0.005
-min_iter_steps: 1
-max_iter_steps: 5
-max_size: 1
 
-# active / archive management
-mid_low: 0.3
-mid_high: 0.7
-active_min: 5
-protect_latest: 2
-archive_max: 10
+eval_baseline_pool:
+  black_pool: [pretrained_models\15_15\ppo\0.pt, wandb\run-20260411_070144-l2znhhtp\files\black_final.pt]
+  white_pool: [pretrained_models\15_15\ppo\0.pt, wandb\run-20260411_070144-l2znhhtp\files\white_final.pt]
 
-# black_checkpoint: pretrained_models/${board_size}_${board_size}/${algo.name}/0.pt
-# white_checkpoint: pretrained_models/${board_size}_${board_size}/${algo.name}/1.pt
+eval_interval: 5
+
+# 可选：从已有模型开始
+black_checkpoint: wandb\run-20260417_173718-q7xqlwr4\files\black_final.pt
+white_checkpoint: wandb\run-20260417_173718-q7xqlwr4\files\white_final.pt
 
 wandb:
   name: ${version_name}

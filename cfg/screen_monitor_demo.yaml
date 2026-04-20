@@ -1,9 +1,9 @@
 board_size: 15
 device: cpu
 
-checkpoint: wandb\run-20260409_202545-48spqjis\files\black_final.pt
-black_checkpoint: wandb\run-20260409_202545-48spqjis\files\black_final.pt
-white_checkpoint: wandb\run-20260409_202545-48spqjis\files\white_final.pt
+checkpoint: wandb\run-20260411_070144-l2znhhtp\files\black_final.pt
+black_checkpoint: wandb\run-20260411_070144-l2znhhtp\files\black_final.pt
+white_checkpoint: wandb\run-20260411_070144-l2znhhtp\files\white_final.pt
 
 cell: 60
 margin: 60
@@ -19,13 +19,18 @@ auto_suggest_enabled: false
 poll_interval_ms: 500
 
 mcts_infer_enabled: true
-mcts_num_simulations: 2000
-mcts_c_puct: 1.5
+mcts_num_simulations: 3000
+mcts_c_puct: 2.0
 mcts_dirichlet_alpha: 0.0
 mcts_dirichlet_epsilon: 0.0
 mcts_temperature: 0.0
 mcts_reuse_subtree: true
 mcts_reuse_tree: true
+
+# 自适应num simulation
+mcts_adaptive_num_simulations: true
+mcts_adaptive_budget_alpha: 1.0
+mcts_adaptive_budget_max: 6000
 
 # 关键：让 system 侧和训练侧走同一套 core action_mask / pruning 逻辑
 action_pruning:
@@ -34,3 +39,6 @@ action_pruning:
 defaults:
   - algo: ppo
   - _self_
+
+
+

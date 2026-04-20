@@ -220,31 +220,6 @@ class MCTSConfig:
     dirichlet_epsilon: float = 0.0
     temperature: float = 0.0
 
-    # 自适应搜索预算：
-    # B = B_base * (1 + alpha * (1 - R'))
-    # 其中 R' = actual_child.visit_count / max_sibling_visits
-    adaptive_num_simulations: bool = True
-    adaptive_budget_alpha: float = 1.0
-    # 这个版本固定使用 min = base，不单独暴露下界配置
-    adaptive_budget_max: int = 256
-
-
-@dataclass
-class ReuseStats:
-    reused: bool = False
-    matched: bool = False
-    reused_depth: int = 0
-
-    # R' = actual_child.visit_count / max_sibling_visits
-    reuse_ratio: float = 1.0
-
-    # 真实落子在兄弟节点中的 visit 排名（1 表示最高）
-    reuse_rank: int = 1
-
-    matched_action: Optional[int] = None
-    matched_child_visits: int = 0
-    parent_max_child_visits: int = 0
-
 
 @dataclass
 class MCTSNode:
@@ -276,24 +251,18 @@ class NeuralMCTSInfer:
         self.black_checkpoint: Optional[str] = None
         self.white_checkpoint: Optional[str] = None
 
-        base_sims = int(cfg.get("mcts_num_simulations", 64))
         self.mcts_cfg = MCTSConfig(
             enabled=bool(cfg.get("mcts_infer_enabled", True)),
-            num_simulations=base_sims,
+            num_simulations=int(cfg.get("mcts_num_simulations", 64)),
             c_puct=float(cfg.get("mcts_c_puct", 1.5)),
             dirichlet_alpha=float(cfg.get("mcts_dirichlet_alpha", 0.0)),
             dirichlet_epsilon=float(cfg.get("mcts_dirichlet_epsilon", 0.0)),
             temperature=float(cfg.get("mcts_temperature", 0.0)),
-            adaptive_num_simulations=bool(cfg.get("mcts_adaptive_num_simulations", True)),
-            adaptive_budget_alpha=float(cfg.get("mcts_adaptive_budget_alpha", 1.0)),
-            adaptive_budget_max=int(cfg.get("mcts_adaptive_budget_max", max(base_sims, base_sims * 4))),
         )
         self.mcts_reuse_tree = bool(cfg.get("mcts_reuse_tree", True))
         self.state_adapter = CoreStateAdapter(cfg)
         # 缓存当前搜索树 root
         self._cached_root: Optional[MCTSNode] = None
-        self._last_dynamic_num_simulations: int = self.mcts_cfg.num_simulations
-        self._last_reuse_stats: ReuseStats = ReuseStats()
 
     def load_from_cfg(self) -> None:
         if self.cfg.get("checkpoint"):
@@ -345,8 +314,6 @@ class NeuralMCTSInfer:
     # 重置缓存树
     def reset_search_tree(self) -> None:
         self._cached_root = None
-        self._last_dynamic_num_simulations = self.mcts_cfg.num_simulations
-        self._last_reuse_stats = ReuseStats()
 
     def _same_state(
         self,
@@ -377,106 +344,52 @@ class NeuralMCTSInfer:
                 return None
 
         return int(len(diff))
-    # 在旧树中找匹配当前棋盘的 descendant 路径。
-    # 返回 [(action_1, node_1), ..., (action_k, node_k)]，不包含 root 自身。
-    def _find_descendant_path_by_board(
+    # 在旧树中找匹配当前棋盘的 descendant
+    def _find_descendant_by_board(
         self,
         root: MCTSNode,
         board: np.ndarray,
         current_player: Piece,
         max_depth: int,
-    ) -> Optional[list[tuple[int, MCTSNode]]]:
-        stack: list[tuple[MCTSNode, list[tuple[int, MCTSNode]], int]] = [(root, [], 0)]
+    ) -> Optional[MCTSNode]:
+        stack: list[tuple[MCTSNode, int]] = [(root, 0)]
 
         while stack:
-            node, path, depth = stack.pop()
+            node, depth = stack.pop()
 
             if self._same_state(node, board, current_player):
-                return path
+                return node
 
             if depth >= max_depth:
                 continue
 
-            for action, child in node.children.items():
-                stack.append((child, path + [(action, child)], depth + 1))
+            for child in node.children.values():
+                stack.append((child, depth + 1))
 
         return None
-
-    def _build_reuse_stats_from_path(
-        self,
-        previous_root: MCTSNode,
-        matched_path: list[tuple[int, MCTSNode]],
-    ) -> ReuseStats:
-        # 没有前进到新边，说明当前棋盘就是旧 root，本次不需要因为“对手偏离”加预算。
-        if len(matched_path) == 0:
-            return ReuseStats(
-                reused=True,
-                matched=True,
-                reused_depth=0,
-                reuse_ratio=1.0,
-                reuse_rank=1,
-                matched_action=None,
-                matched_child_visits=previous_root.visit_count,
-                parent_max_child_visits=previous_root.visit_count,
-            )
-
-        matched_action, matched_node = matched_path[-1]
-        parent_node = previous_root if len(matched_path) == 1 else matched_path[-2][1]
-
-        sibling_visits = [child.visit_count for child in parent_node.children.values()]
-        parent_max_child_visits = max(sibling_visits) if sibling_visits else 0
-        matched_child_visits = matched_node.visit_count
-
-        # 如果这个父节点下所有兄弟都没真正被搜索过，R' 没信息量，回退成 1.0。
-        if parent_max_child_visits <= 0:
-            reuse_ratio = 1.0
-            reuse_rank = 1
-        else:
-            reuse_ratio = float(matched_child_visits) / float(parent_max_child_visits)
-            reuse_ratio = max(0.0, min(1.0, reuse_ratio))
-            reuse_rank = 1 + sum(
-                1 for child in parent_node.children.values()
-                if child.visit_count > matched_child_visits
-            )
-
-        return ReuseStats(
-            reused=True,
-            matched=True,
-            reused_depth=len(matched_path),
-            reuse_ratio=reuse_ratio,
-            reuse_rank=reuse_rank,
-            matched_action=matched_action,
-            matched_child_visits=matched_child_visits,
-            parent_max_child_visits=parent_max_child_visits,
-        )
-
-    # 尝试复用旧树中的子树作为新树根，同时返回 R' 相关统计量。
-    def _get_reusable_root_with_stats(
+    # 尝试复用旧树中的子树作为新树的根节点，以保留搜索树中的信息；如果新棋盘与旧棋盘之间的差异过大（超过 max_depth），或者找不到匹配的新棋盘的节点，则放弃复用，重新创建一个新的根节点。
+    def _get_reusable_root(
         self,
         board: np.ndarray,
         current_player: Piece,
         latest_move: Optional[tuple[int, int]],
-    ) -> tuple[MCTSNode, ReuseStats]:
+    ) -> MCTSNode:
         if self._cached_root is not None:
-            previous_root = self._cached_root
-            ply_gap = self._forward_ply_distance(previous_root.board, board)
+            ply_gap = self._forward_ply_distance(self._cached_root.board, board)
 
             if ply_gap is not None:
-                matched_path = self._find_descendant_path_by_board(
-                    root=previous_root,
+                matched = self._find_descendant_by_board(
+                    root=self._cached_root,
                     board=board,
                     current_player=current_player,
                     max_depth=ply_gap,
                 )
-                if matched_path is not None:
-                    matched = previous_root if len(matched_path) == 0 else matched_path[-1][1]
-
+                if matched is not None:
+                    # 如果外部这次提供了 latest_move，就用新的覆盖一下
                     if latest_move is not None:
                         matched.latest_move = latest_move
-
                     self._cached_root = matched
-                    reuse_stats = self._build_reuse_stats_from_path(previous_root, matched_path)
-                    return matched, reuse_stats
+                    return matched
 
         # 复用失败，重新建 root
         root = MCTSNode(
@@ -485,36 +398,7 @@ class NeuralMCTSInfer:
             latest_move=latest_move,
         )
         self._cached_root = root
-        return root, ReuseStats(
-            reused=False,
-            matched=False,
-            reused_depth=0,
-            reuse_ratio=1.0,
-            reuse_rank=1,
-            matched_action=None,
-            matched_child_visits=0,
-            parent_max_child_visits=0,
-        )
-
-    def _compute_dynamic_num_simulations(self, reuse_stats: ReuseStats) -> int:
-        base = max(1, int(self.mcts_cfg.num_simulations))
-
-        if not self.mcts_cfg.adaptive_num_simulations:
-            return base
-
-        # 没有成功复用到旧树信息时，不因为 R' 额外加预算。
-        if not reuse_stats.reused or not reuse_stats.matched:
-            return base
-
-        alpha = max(0.0, float(self.mcts_cfg.adaptive_budget_alpha))
-        r = max(0.0, min(1.0, float(reuse_stats.reuse_ratio)))
-
-        sims = int(round(base * (1.0 + alpha * (1.0 - r))))
-        lower = base
-        upper = max(lower, int(self.mcts_cfg.adaptive_budget_max))
-        sims = max(lower, sims)
-        sims = min(upper, sims)
-        return sims
+        return root
 
     def _actor_forward(
         self,
@@ -689,14 +573,11 @@ class NeuralMCTSInfer:
         current_player: Piece,
         latest_move: Optional[tuple[int, int]],
     ) -> tuple[int, MCTSNode]:
-        root, reuse_stats = self._get_reusable_root_with_stats(
+        root = self._get_reusable_root(
             board=board,
             current_player=current_player,
             latest_move=latest_move,
         )
-        self._last_reuse_stats = reuse_stats
-        num_simulations = self._compute_dynamic_num_simulations(reuse_stats)
-        self._last_dynamic_num_simulations = num_simulations
 
         # 如果这个 root 还没展开，就先展开
         if not root.terminal and not root.children:
@@ -712,6 +593,7 @@ class NeuralMCTSInfer:
                 add_root_noise=False,
             )
 
+        num_simulations = max(1, self.mcts_cfg.num_simulations)
         for _ in range(num_simulations):
             node = root
             path = [node]
@@ -865,26 +747,11 @@ class NeuralMCTSInfer:
                 row, col = action_to_coord(int(action), int(self.cfg.board_size))
                 extra = "(未提供最近一手，root 的 last_move 通道置零）" if latest_move is None else ""
                 model_mode = "dual-model" if self._using_dual_models() else "single-model-fallback"
-
-                if self.mcts_reuse_tree:
-                    actual_sims = self._last_dynamic_num_simulations
-                    reuse_stats = self._last_reuse_stats
-                    reuse_info = (
-                        f"reuse_depth={reuse_stats.reused_depth}, "
-                        f"R'={reuse_stats.reuse_ratio:.3f}, "
-                        f"rank={reuse_stats.reuse_rank}"
-                    )
-                    msg = (
-                        f"[mcts {actual_sims} sims | {model_mode} | {reuse_info}] "
-                        f"轮到{current_player.name.lower()}落子，建议第 {row + 1} 行第 {col + 1} 列；"
-                        f"visit={best_child.visit_count}，Q={-best_child.q:.3f}{extra}"
-                    )
-                else:
-                    msg = (
-                        f"[mcts {self.mcts_cfg.num_simulations} sims | {model_mode}] "
-                        f"轮到{current_player.name.lower()}落子，建议第 {row + 1} 行第 {col + 1} 列；"
-                        f"visit={best_child.visit_count}，Q={-best_child.q:.3f}{extra}"
-                    )
+                msg = (
+                    f"[mcts {self.mcts_cfg.num_simulations} sims | {model_mode}] "
+                    f"轮到{current_player.name.lower()}落子，建议第 {row + 1} 行第 {col + 1} 列；"
+                    f"visit={best_child.visit_count}，Q={-best_child.q:.3f}{extra}"
+                )
                 return (row, col), msg, current_player
 
             action = self._direct_argmax_action(

@@ -1,14 +1,11 @@
-from typing import Callable, Dict, List, Any, Union, Iterable
+from typing import Dict, Union
 from tensordict import TensorDict
 import torch
 from torchrl.data import TensorSpec, DiscreteTensorSpec
-import torch
-from typing import Union
-DeviceLike = Union[torch.device, str, int, None]
-from omegaconf import DictConfig, OmegaConf
-import logging
+from omegaconf import DictConfig
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value.functional import vec_generalized_advantage_estimate
+
 from .base import Policy
 from .common import (
     make_dataset_naive,
@@ -17,9 +14,8 @@ from .common import (
     make_critic,
     make_ppo_actor,
 )
-from gomoku_rl.utils.module import (
-    count_parameters,
-)
+
+DeviceLike = Union[torch.device, str, int, None]
 
 
 class PPO(Policy):
@@ -46,23 +42,31 @@ class PPO(Policy):
         self.max_grad_norm: float = cfg.max_grad_norm
         if self.cfg.get("share_network"):
             actor_value_operator = make_ppo_ac(
-                cfg, action_spec=action_spec, device=self.device
+                cfg,
+                action_spec=action_spec,
+                observation_spec=observation_spec,
+                device=self.device,
             )
             self.actor = actor_value_operator.get_policy_operator()
             self.critic = actor_value_operator.get_value_head()
         else:
             self.actor = make_ppo_actor(
-                cfg=cfg, action_spec=action_spec, device=self.device
+                cfg=cfg,
+                action_spec=action_spec,
+                observation_spec=observation_spec,
+                device=self.device,
             )
-            self.critic = make_critic(cfg=cfg, device=self.device)
+            self.critic = make_critic(
+                cfg=cfg,
+                observation_spec=observation_spec,
+                device=self.device,
+            )
 
         fake_input = observation_spec.zero()
         fake_input["action_mask"] = ~fake_input["action_mask"]
         with torch.no_grad():
             self.actor(fake_input)
             self.critic(fake_input)
-        # print(f"actor params:{count_parameters(self.actor)}")
-        # print(f"critic params:{count_parameters(self.critic)}")
 
         self.loss_module = ClipPPOLoss(
             actor=self.actor,
@@ -77,7 +81,7 @@ class PPO(Policy):
         self.optim = get_optimizer(self.cfg.optimizer, self.loss_module.parameters())
 
     def __call__(self, tensordict: TensorDict):
-        tensordict=tensordict.to(self.device)
+        tensordict = tensordict.to(self.device)
         actor_input = tensordict.select("observation", "action_mask", strict=False)
         actor_output: TensorDict = self.actor(actor_input)
         actor_output = actor_output.exclude("probs")
@@ -92,7 +96,6 @@ class PPO(Policy):
         return tensordict
 
     def learn(self, data: TensorDict):
-        # to do: compute the gae for each batch
         value = data["state_value"].to(self.device)
         next_value = data["next", "state_value"].to(self.device)
         done = data["next", "done"].unsqueeze(-1).to(self.device)
@@ -117,13 +120,10 @@ class PPO(Policy):
             data.set("advantage", adv)
             data.set("value_target", value_target)
 
-        # filter out invalid white transitions
         invalid = data.get("invalid", None)
         if invalid is not None:
             data = data[~invalid]
-
-        data=data.reshape(-1)
-
+        data = data.reshape(-1)
         self.train()
         loss_objectives = []
         loss_critics = []
@@ -131,9 +131,7 @@ class PPO(Policy):
         losses = []
         grad_norms = []
         for _ in range(self.ppo_epoch):
-            for minibatch in make_dataset_naive(
-                data, batch_size=self.batch_size
-            ):
+            for minibatch in make_dataset_naive(data, batch_size=self.batch_size):
                 minibatch: TensorDict = minibatch.to(self.device)
                 loss_vals = self.loss_module(minibatch)
                 loss_value = (
@@ -145,16 +143,14 @@ class PPO(Policy):
                 loss_critics.append(loss_vals["loss_critic"].clone().detach())
                 loss_entropies.append(loss_vals["loss_entropy"].clone().detach())
                 losses.append(loss_value.clone().detach())
-                # Optimization: backward, grad clipping and optim step
                 loss_value.backward()
-
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.loss_module.parameters(), self.max_grad_norm
+                    self.loss_module.parameters(),
+                    self.max_grad_norm,
                 )
                 grad_norms.append(grad_norm.clone().detach())
                 self.optim.step()
                 self.optim.zero_grad()
-
         self.eval()
         return {
             "advantage_meam": loc.item(),
@@ -165,19 +161,17 @@ class PPO(Policy):
             "loss_critic": torch.stack(loss_critics).mean().item(),
             "loss_entropy": torch.stack(loss_entropies).mean().item(),
         }
-    
 
-    def state_dict(self) -> Dict:   #同时保存actor和critic的参数，以及优化器的状态
+    def state_dict(self) -> Dict:
         return {
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
             "optimizer": self.optim.state_dict(),
         }
 
-    def load_state_dict(self, state_dict: Dict):    # 加载actor和critic的参数，以及优化器的状态
+    def load_state_dict(self, state_dict: Dict):
         self.critic.load_state_dict(state_dict["critic"], strict=False)
         self.actor.load_state_dict(state_dict["actor"])
-
         self.loss_module = ClipPPOLoss(
             actor=self.actor,
             critic=self.critic,
@@ -188,7 +182,6 @@ class PPO(Policy):
             loss_critic_type="smooth_l1",
         )
         self.optim = get_optimizer(self.cfg.optimizer, self.loss_module.parameters())
-
         opt_state = state_dict.get("optimizer", state_dict.get("optim", None))
         if opt_state is not None:
             self.optim.load_state_dict(opt_state)

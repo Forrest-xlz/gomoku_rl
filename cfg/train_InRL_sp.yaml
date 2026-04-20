@@ -1,25 +1,49 @@
 seed: 0
-num_envs: 1024
+num_envs: 512
 board_size: 15
 device: cuda
 out_device: cpu
 run_dir:
-version_name: sp - original
+version_name: inrl-sp-az-history
 augment: false
 
-epochs: 100
+epochs: 2000
 steps: 128
-save_interval: -1
+save_interval: 300
+log_interval: 5
 
+# AZ-style absolute-color history observation:
+# [black_t ... black_t-(n-1), white_t ... white_t-(n-1), side_to_move]
+observation_mode: az_history
+temporal_num_steps: 1
 
+# Old checkpoints trained with legacy / temporal_move_history inputs will not load,
+# because the first conv input channel count is different.
+checkpoint: 
 
-checkpoint: pretrained_models/${board_size}_${board_size}/${algo.name}/0.pt
+# Reuse InRL pruning logic in SP.
+action_pruning:
+  enabled: true
+
+# Optional: evaluate current shared policy as black against these white-side baselines,
+# and these black-side baselines against current shared policy as white.
+eval_baseline_pool:
+  black_pool:
+    - pretrained_models\15_15\ppo\0.pt
+  white_pool:
+    - pretrained_models\15_15\ppo\0.pt
+
+# Baseline checkpoints above are legacy 3-channel models by default.
+# The adapter in runner/base.py converts AZ-history observations to legacy inputs.
+baseline:
+  name: ppo
+  observation_mode: legacy
 
 wandb:
   name: ${version_name}
   group: ${board_size}_${board_size}_${algo.name}_InRL_sp
   project: gomoku_rl
-  mode: online # set to 'disabled' when debugging locally
+  mode: online
 
 defaults:
   - algo: ppo
