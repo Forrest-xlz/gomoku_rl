@@ -111,6 +111,7 @@ class InferJob:
     generation: int
     board: np.ndarray
     latest_move: Optional[tuple[int, int]]
+    recent_moves: tuple[tuple[int, int], ...]
     current_turn: Optional[Piece]
     board_hash_value: str
     perspective_matrix: np.ndarray
@@ -481,6 +482,26 @@ def derive_opponent_last_move(
     return row, col
 
 
+def derive_single_added_move(
+    previous_board: Optional[np.ndarray],
+    current_board: np.ndarray,
+) -> Optional[tuple[int, int]]:
+    if previous_board is None or previous_board.shape != current_board.shape:
+        return None
+
+    prev = previous_board != EMPTY
+    curr = current_board != EMPTY
+
+    removed = np.argwhere(prev & (~curr))
+    added = np.argwhere((~prev) & curr)
+
+    if len(removed) != 0 or len(added) != 1:
+        return None
+
+    row, col = map(int, added[0])
+    return row, col
+
+
 def board_hash(board: np.ndarray) -> str:
     return board.tobytes().hex()
 
@@ -594,7 +615,11 @@ def run_infer_job(job: InferJob, model_manager: MCTSManager) -> InferResult:
             result.ok = True
             return result
 
-        move, msg, _current_player = model_manager.predict(job.board, job.latest_move)
+        move, msg, _current_player = model_manager.predict(
+            job.board,
+            job.latest_move,
+            recent_moves=job.recent_moves,
+        )
         result.ok = True
         result.predicted = True
         result.move = move
@@ -641,6 +666,7 @@ class ScreenMonitorWidget(QWidget):
         self.corners_in_roi: Optional[np.ndarray] = None
         self.latest_move: Optional[tuple[int, int]] = None
         self.latest_move_board_hash: Optional[str] = None
+        self.recent_moves: list[tuple[int, int]] = []
         self.latest_warped: Optional[np.ndarray] = None
         self.latest_board: Optional[np.ndarray] = None
         self.lastmove_reference_board: Optional[np.ndarray] = None
@@ -696,6 +722,41 @@ class ScreenMonitorWidget(QWidget):
     def my_color(self) -> Piece:
         data = self.color_combo.currentData()
         return data if data is not None else Piece.BLACK
+
+    @property
+    def temporal_num_steps(self) -> int:
+        for key in ("infer_temporal_num_steps", "model_temporal_num_steps", "temporal_num_steps", "n"):
+            value = self.cfg.get(key, None)
+            if value is not None:
+                steps = int(value)
+                if steps >= 1:
+                    return steps
+        return 1
+
+    def push_recent_move(self, move: Optional[tuple[int, int]]) -> None:
+        if move is None:
+            return
+        row, col = int(move[0]), int(move[1])
+        rc = (row, col)
+        if self.recent_moves and self.recent_moves[0] == rc:
+            return
+        self.recent_moves.insert(0, rc)
+        limit = max(1, self.temporal_num_steps)
+        if len(self.recent_moves) > limit:
+            del self.recent_moves[limit:]
+        self.latest_move = self.recent_moves[0]
+
+    def sync_latest_move_label(self) -> None:
+        if self.recent_moves:
+            self.latest_move = self.recent_moves[0]
+        else:
+            self.latest_move = None
+
+        if self.latest_move is None:
+            self.last_move_label.setText("最近一手：None")
+        else:
+            r, c = self.latest_move
+            self.last_move_label.setText(f"最近一手：第 {r + 1} 行第 {c + 1} 列")
 
     def _build_ui(self) -> None:
         root_layout = QVBoxLayout(self)
@@ -971,6 +1032,7 @@ class ScreenMonitorWidget(QWidget):
     def reset_game_runtime(self) -> None:
         self.latest_move = None
         self.latest_move_board_hash = None
+        self.recent_moves = []
         self.lastmove_reference_board = None
         self.lastmove_reference_hash = None
         self.suggested_move = None
@@ -1235,9 +1297,11 @@ class ScreenMonitorWidget(QWidget):
             if self.pending_click_reference_board is not None:
                 self.lastmove_reference_board = self.pending_click_reference_board.copy()
                 self.lastmove_reference_hash = board_hash(self.pending_click_reference_board)
-                self.latest_move = None
-                self.latest_move_board_hash = None
-                self.last_move_label.setText("最近一手：None")
+            if self.pending_click_move is not None:
+                self.push_recent_move(self.pending_click_move)
+                self.latest_move_board_hash = self.lastmove_reference_hash
+                self.sync_latest_move_label()
+                self.update_overlay()
             self.schedule_fast_refresh(30)
         self.pending_click_reference_board = None
         self.pending_click_move = None
@@ -1272,6 +1336,7 @@ class ScreenMonitorWidget(QWidget):
             generation=self.run_generation,
             board=self.latest_board.copy(),
             latest_move=self.latest_move,
+            recent_moves=tuple(self.recent_moves),
             current_turn=self.last_turn,
             board_hash_value=self.last_board_hash,
             perspective_matrix=self.perspective_matrix.copy(),
@@ -1314,33 +1379,42 @@ class ScreenMonitorWidget(QWidget):
                 self.maybe_submit_infer_job(request_manual_infer=True)
             return
 
+        prev_board = None if self.latest_board is None else self.latest_board.copy()
+
         self.last_turn = result.current_turn
         self.perspective_matrix = result.perspective_matrix
         self.latest_warped = result.warped
         self.latest_board = result.board
         self.last_board_hash = result.board_hash_value
 
+        candidate_move: Optional[tuple[int, int]] = None
         if result.board is not None and result.board_hash_value is not None:
             if result.current_turn == self.my_color:
                 expected_stone = opponent_piece_value(self.my_color)
-                candidate = derive_opponent_last_move(
+                candidate_move = derive_opponent_last_move(
                     self.lastmove_reference_board,
                     result.board,
                     expected_stone,
                 )
-                self.latest_move = candidate
+
+            if candidate_move is None and result.board_changed:
+                candidate_move = derive_single_added_move(prev_board, result.board)
+
+            if candidate_move is not None:
+                self.push_recent_move(candidate_move)
+                self.latest_move_board_hash = result.board_hash_value
+            elif self.recent_moves:
+                self.latest_move = self.recent_moves[0]
                 self.latest_move_board_hash = result.board_hash_value
             else:
                 self.latest_move = None
                 self.latest_move_board_hash = result.board_hash_value
+
+            if result.current_turn != self.my_color:
                 self.lastmove_reference_board = result.board.copy()
                 self.lastmove_reference_hash = result.board_hash_value
 
-        if self.latest_move is None:
-            self.last_move_label.setText("最近一手：None")
-        else:
-            r, c = self.latest_move
-            self.last_move_label.setText(f"最近一手：第 {r + 1} 行第 {c + 1} 列")
+        self.sync_latest_move_label()
 
         if result.current_turn is None:
             self.turn_label.setText("当前轮次：无法判断")

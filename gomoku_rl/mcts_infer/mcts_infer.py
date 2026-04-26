@@ -22,6 +22,58 @@ from gomoku_rl.core import Gomoku
 from gomoku_rl.policy import Policy, get_policy
 
 
+TEMPORAL_MOVE_HISTORY_MODE = "temporal_move_history"
+
+
+def _resolve_temporal_num_steps(cfg: DictConfig) -> int:
+    for key in ("infer_temporal_num_steps", "model_temporal_num_steps", "temporal_num_steps", "n"):
+        value = cfg.get(key, None)
+        if value is not None:
+            steps = int(value)
+            if steps >= 1:
+                return steps
+    return 1
+
+
+def _normalize_recent_moves(
+    recent_moves: Optional[list[tuple[int, int]] | tuple[tuple[int, int], ...]],
+    latest_move: Optional[tuple[int, int]],
+    max_steps: int,
+) -> tuple[tuple[int, int], ...]:
+    normalized: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+
+    if recent_moves is not None:
+        for move in recent_moves:
+            if move is None:
+                continue
+            row, col = int(move[0]), int(move[1])
+            rc = (row, col)
+            if rc in seen:
+                continue
+            normalized.append(rc)
+            seen.add(rc)
+            if len(normalized) >= max_steps:
+                return tuple(normalized[:max_steps])
+
+    if latest_move is not None and len(normalized) < max_steps:
+        row, col = int(latest_move[0]), int(latest_move[1])
+        rc = (row, col)
+        if rc not in seen:
+            normalized.insert(0, rc)
+
+    return tuple(normalized[:max_steps])
+
+
+def _prepend_recent_move(
+    recent_moves: tuple[tuple[int, int], ...],
+    move: tuple[int, int],
+    max_steps: int,
+) -> tuple[tuple[int, int], ...]:
+    row, col = int(move[0]), int(move[1])
+    return ((row, col), *recent_moves[: max(0, max_steps - 1)])
+
+
 class Piece(enum.Enum):
     EMPTY = 0
     BLACK = 1
@@ -93,8 +145,41 @@ def is_terminal_after_move(
     return False, 0.0
 
 # 根据配置创建一个 policy 实例，供 MCTS 引导使用。
-def make_model(cfg: DictConfig) -> Policy:
+def _resolve_model_layout(
+    cfg: DictConfig,
+    temporal_num_steps: Optional[int] = None,
+) -> tuple[int, int]:
+    temporal_num_steps = int(temporal_num_steps or _resolve_temporal_num_steps(cfg))
+    if temporal_num_steps < 1:
+        raise ValueError(f"temporal_num_steps must be >= 1, got {temporal_num_steps}")
+    observation_channels = 2 + temporal_num_steps
+    return temporal_num_steps, observation_channels
+
+
+
+def _infer_layout_from_state_dict(state_dict: dict) -> Optional[tuple[int, int]]:
+    in_channels = None
+    for key, value in state_dict.items():
+        if key.endswith('cnn.weight') and hasattr(value, 'shape') and len(value.shape) == 4:
+            in_channels = int(value.shape[1])
+            break
+    if in_channels is None:
+        return None
+    if in_channels < 3:
+        raise ValueError(f"Unsupported checkpoint input channels: {in_channels}")
+    return in_channels - 2, in_channels
+
+
+
+def make_model(
+    cfg: DictConfig,
+    temporal_num_steps: Optional[int] = None,
+) -> Policy:
     board_size = int(cfg.board_size)
+    temporal_num_steps, observation_channels = _resolve_model_layout(
+        cfg,
+        temporal_num_steps=temporal_num_steps,
+    )
 
     action_spec = DiscreteTensorSpec(
         board_size * board_size,
@@ -105,7 +190,7 @@ def make_model(cfg: DictConfig) -> Policy:
         {
             "observation": UnboundedContinuousTensorSpec(
                 device=cfg.device,
-                shape=[2, 3, board_size, board_size],
+                shape=[2, observation_channels, board_size, board_size],
             ),
             "action_mask": BinaryDiscreteTensorSpec(
                 n=board_size * board_size,
@@ -117,7 +202,7 @@ def make_model(cfg: DictConfig) -> Policy:
         shape=[2],
         device=cfg.device,
     )
-    return get_policy(  # 返回一个 Policy 实例
+    return get_policy(
         name=cfg.algo.name,
         cfg=cfg.algo,
         action_spec=action_spec,
@@ -125,22 +210,56 @@ def make_model(cfg: DictConfig) -> Policy:
         device=cfg.device,
     )
 
+
 # 加载指定路径的 checkpoint，并返回一个 Policy 实例，供 MCTS 引导使用。
-def load_policy(cfg: DictConfig, checkpoint_path: str | Path) -> Policy:    
-    model = make_model(cfg)
+def load_policy(
+    cfg: DictConfig,
+    checkpoint_path: str | Path,
+    temporal_num_steps: Optional[int] = None,
+) -> tuple[Policy, int]:
     state_dict = torch.load(str(checkpoint_path), map_location=cfg.device)
+
+    inferred_layout = _infer_layout_from_state_dict(state_dict)
+    cfg_steps, cfg_channels = _resolve_model_layout(
+        cfg,
+        temporal_num_steps=temporal_num_steps,
+    )
+
+    if inferred_layout is not None:
+        inferred_steps, inferred_channels = inferred_layout
+        if inferred_channels != cfg_channels:
+            logging.warning(
+                'Checkpoint input channels (%d) do not match cfg-derived channels (%d). '
+                'Auto-switching infer temporal_num_steps to %d.',
+                inferred_channels,
+                cfg_channels,
+                inferred_steps,
+            )
+            cfg_steps = inferred_steps
+
+    model = make_model(cfg, temporal_num_steps=cfg_steps)
     model.load_state_dict(state_dict)
     model.eval()
-    return model
+    return model, cfg_steps
 
 
-# 用 core.Gomoku 复用与训练侧完全一致的 observation / action_mask 生成逻辑。
+
+# 用 core.Gomoku 复用训练侧的当前棋盘编码与动作掩码逻辑，
+# 再在推理侧补上 temporal_move_history 所需的最近 n 手 one-hot 通道。
 class CoreStateAdapter:
-    def __init__(self, cfg: DictConfig):
+    def __init__(
+        self,
+        cfg: DictConfig,
+        temporal_num_steps: Optional[int] = None,
+    ):
         self.cfg = cfg
         self.board_size = int(cfg.board_size)
         self.device = cfg.device
         self.action_pruning_cfg = cfg.get("action_pruning", None)
+        self.temporal_num_steps, _ = _resolve_model_layout(
+            cfg,
+            temporal_num_steps=temporal_num_steps,
+        )
         self.env = Gomoku(
             num_envs=1,
             board_size=self.board_size,
@@ -176,20 +295,42 @@ class CoreStateAdapter:
             self.env.last_move[0] = int(row * self.board_size + col)
 
     @torch.no_grad()
+    def _build_temporal_move_history(self, recent_moves: tuple[tuple[int, int], ...]) -> torch.Tensor:
+        history = torch.zeros(
+            1,
+            self.temporal_num_steps,
+            self.board_size,
+            self.board_size,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        for idx, move in enumerate(recent_moves[: self.temporal_num_steps]):
+            row, col = int(move[0]), int(move[1])
+            if 0 <= row < self.board_size and 0 <= col < self.board_size:
+                history[0, idx, row, col] = 1.0
+        return history
+
+    @torch.no_grad()
     def build_tensordict(
         self,
         board: np.ndarray,
         current_player: Piece,
         latest_move: Optional[tuple[int, int]],
+        recent_moves: Optional[tuple[tuple[int, int], ...]] = None,
     ) -> TensorDict:
         self.sync_state(
             board=board,
             current_player=current_player,
             latest_move=latest_move,
         )
+
+        current_planes = self.env.get_encoded_board()[:, :2]
+        history_planes = self._build_temporal_move_history(recent_moves or ())
+        observation = torch.cat([current_planes, history_planes], dim=1)
+
         return TensorDict(
             {
-                "observation": self.env.get_encoded_board(),
+                "observation": observation,
                 "action_mask": self.env.get_action_mask(),
             },
             batch_size=1,
@@ -202,12 +343,14 @@ def build_model_input(
     board: np.ndarray,
     current_player: Piece,
     latest_move: Optional[tuple[int, int]],
+    recent_moves: Optional[tuple[tuple[int, int], ...]],
     state_adapter: CoreStateAdapter,
 ) -> TensorDict:
     return state_adapter.build_tensordict(
         board=board,
         current_player=current_player,
         latest_move=latest_move,
+        recent_moves=recent_moves,
     )
 
 
@@ -216,9 +359,6 @@ class MCTSConfig:
     enabled: bool = True
     num_simulations: int = 64
     c_puct: float = 1.5
-    dirichlet_alpha: float = 0.0
-    dirichlet_epsilon: float = 0.0
-    temperature: float = 0.0
 
     # 自适应搜索预算：
     # B = B_base * (1 + alpha * (1 - R'))
@@ -227,6 +367,12 @@ class MCTSConfig:
     adaptive_budget_alpha: float = 1.0
     # 这个版本固定使用 min = base，不单独暴露下界配置
     adaptive_budget_max: int = 256
+
+    # 根节点完成一轮基础搜索后，如果“visit 最优动作”和“Q 最优动作”不一致，
+    # 则按小步长继续加搜，直到二者一致或达到额外预算上限。
+    extend_on_root_disagreement: bool = True
+    disagreement_extra_simulations_ratio: float = 0.5
+    disagreement_max_extra_simulations_ratio: float = 1.0
 
 
 @dataclass
@@ -247,10 +393,26 @@ class ReuseStats:
 
 
 @dataclass
+class RootSearchStats:
+    visit_best_action: Optional[int] = None
+    q_best_action: Optional[int] = None
+    visit_best_visits: int = 0
+    q_best_visits: int = 0
+    visit_best_q: float = 0.0
+    q_best_q: float = 0.0
+    q_gap: float = 0.0
+    disagreement: bool = False
+    extension_triggered: bool = False
+    extension_rounds: int = 0
+    extra_simulations: int = 0
+
+
+@dataclass
 class MCTSNode:
     board: np.ndarray
     to_play: Piece  # 当前节点表示的棋盘状态下，轮到哪个玩家落子
     latest_move: Optional[tuple[int, int]]
+    recent_moves: tuple[tuple[int, int], ...] = field(default_factory=tuple)
     prior: float = 1.0  # 从父节点到当前节点的先验概率，通常由神经网络输出提供
     visit_count: int = 0    # 从父节点到当前节点的访问次数，在 MCTS 中用于平衡探索和利用
     value_sum: float = 0.0  # 从父节点到当前节点的累计价值总和，通常在回溯时更新，用于计算平均价值 Q = value_sum / visit_count
@@ -281,19 +443,24 @@ class NeuralMCTSInfer:
             enabled=bool(cfg.get("mcts_infer_enabled", True)),
             num_simulations=base_sims,
             c_puct=float(cfg.get("mcts_c_puct", 1.5)),
-            dirichlet_alpha=float(cfg.get("mcts_dirichlet_alpha", 0.0)),
-            dirichlet_epsilon=float(cfg.get("mcts_dirichlet_epsilon", 0.0)),
-            temperature=float(cfg.get("mcts_temperature", 0.0)),
             adaptive_num_simulations=bool(cfg.get("mcts_adaptive_num_simulations", True)),
             adaptive_budget_alpha=float(cfg.get("mcts_adaptive_budget_alpha", 1.0)),
             adaptive_budget_max=int(cfg.get("mcts_adaptive_budget_max", max(base_sims, base_sims * 4))),
+            extend_on_root_disagreement=bool(cfg.get("mcts_extend_on_root_disagreement", True)),
+            disagreement_extra_simulations_ratio=float(cfg.get("mcts_disagreement_extra_simulations_ratio", 0.5)),
+            disagreement_max_extra_simulations_ratio=float(cfg.get("mcts_disagreement_max_extra_simulations_ratio", 1.0)),
         )
         self.mcts_reuse_tree = bool(cfg.get("mcts_reuse_tree", True))
-        self.state_adapter = CoreStateAdapter(cfg)
+        self.temporal_num_steps = _resolve_temporal_num_steps(cfg)
+        self.state_adapter = CoreStateAdapter(
+            cfg,
+            temporal_num_steps=self.temporal_num_steps,
+        )
         # 缓存当前搜索树 root
         self._cached_root: Optional[MCTSNode] = None
         self._last_dynamic_num_simulations: int = self.mcts_cfg.num_simulations
         self._last_reuse_stats: ReuseStats = ReuseStats()
+        self._last_root_search_stats: RootSearchStats = RootSearchStats()
 
     def load_from_cfg(self) -> None:
         if self.cfg.get("checkpoint"):
@@ -306,23 +473,48 @@ class NeuralMCTSInfer:
         self.reset_search_tree()
 
 
+    def _update_infer_layout(self, temporal_num_steps: int) -> None:
+        changed = int(temporal_num_steps) != int(self.temporal_num_steps)
+        self.temporal_num_steps = int(temporal_num_steps)
+        if changed:
+            self.state_adapter = CoreStateAdapter(
+                self.cfg,
+                temporal_num_steps=self.temporal_num_steps,
+            )
+            self.reset_search_tree()
+
     def load_single(self, checkpoint_path: str | Path) -> None:
         checkpoint_path = str(checkpoint_path)
-        self.single_model = load_policy(self.cfg, checkpoint_path)
+        self.single_model, temporal_num_steps = load_policy(self.cfg, checkpoint_path)
+        self._update_infer_layout(temporal_num_steps)
         self.single_checkpoint = checkpoint_path
-        logging.info("Loaded single checkpoint: %s", checkpoint_path)
+        logging.info(
+            "Loaded single checkpoint: %s (temporal_num_steps=%d)",
+            checkpoint_path,
+            temporal_num_steps,
+        )
 
     def load_black(self, checkpoint_path: str | Path) -> None:
         checkpoint_path = str(checkpoint_path)
-        self.black_model = load_policy(self.cfg, checkpoint_path)
+        self.black_model, temporal_num_steps = load_policy(self.cfg, checkpoint_path)
+        self._update_infer_layout(temporal_num_steps)
         self.black_checkpoint = checkpoint_path
-        logging.info("Loaded black checkpoint: %s", checkpoint_path)
+        logging.info(
+            "Loaded black checkpoint: %s (temporal_num_steps=%d)",
+            checkpoint_path,
+            temporal_num_steps,
+        )
 
     def load_white(self, checkpoint_path: str | Path) -> None:
         checkpoint_path = str(checkpoint_path)
-        self.white_model = load_policy(self.cfg, checkpoint_path)
+        self.white_model, temporal_num_steps = load_policy(self.cfg, checkpoint_path)
+        self._update_infer_layout(temporal_num_steps)
         self.white_checkpoint = checkpoint_path
-        logging.info("Loaded white checkpoint: %s", checkpoint_path)
+        logging.info(
+            "Loaded white checkpoint: %s (temporal_num_steps=%d)",
+            checkpoint_path,
+            temporal_num_steps,
+        )
 
     # 推理期的模型选择规则：
     # 1) 若 black/white 双模型都已加载，则按当前执棋方切换；
@@ -347,6 +539,7 @@ class NeuralMCTSInfer:
         self._cached_root = None
         self._last_dynamic_num_simulations = self.mcts_cfg.num_simulations
         self._last_reuse_stats = ReuseStats()
+        self._last_root_search_stats = RootSearchStats()
 
     def _same_state(
         self,
@@ -456,6 +649,7 @@ class NeuralMCTSInfer:
         board: np.ndarray,
         current_player: Piece,
         latest_move: Optional[tuple[int, int]],
+        recent_moves: tuple[tuple[int, int], ...],
     ) -> tuple[MCTSNode, ReuseStats]:
         if self._cached_root is not None:
             previous_root = self._cached_root
@@ -471,8 +665,8 @@ class NeuralMCTSInfer:
                 if matched_path is not None:
                     matched = previous_root if len(matched_path) == 0 else matched_path[-1][1]
 
-                    if latest_move is not None:
-                        matched.latest_move = latest_move
+                    matched.latest_move = latest_move
+                    matched.recent_moves = tuple(recent_moves)
 
                     self._cached_root = matched
                     reuse_stats = self._build_reuse_stats_from_path(previous_root, matched_path)
@@ -483,6 +677,7 @@ class NeuralMCTSInfer:
             board=board.copy(),
             to_play=current_player,
             latest_move=latest_move,
+            recent_moves=tuple(recent_moves),
         )
         self._cached_root = root
         return root, ReuseStats(
@@ -522,11 +717,13 @@ class NeuralMCTSInfer:
         board: np.ndarray,
         current_player: Piece,
         latest_move: Optional[tuple[int, int]],
+        recent_moves: tuple[tuple[int, int], ...],
     ) -> TensorDict:
         td = build_model_input(
             board=board,
             current_player=current_player,
             latest_move=latest_move,
+            recent_moves=recent_moves,
             state_adapter=self.state_adapter,
         )
         actor_input = td.select("observation", "action_mask", strict=False)
@@ -539,6 +736,7 @@ class NeuralMCTSInfer:
         board: np.ndarray,
         current_player: Piece,
         latest_move: Optional[tuple[int, int]],
+        recent_moves: tuple[tuple[int, int], ...],
     ) -> tuple[np.ndarray, float, np.ndarray]:
         model = self._select_model(current_player)
         if model is None:
@@ -552,6 +750,7 @@ class NeuralMCTSInfer:
                 board=board,
                 current_player=current_player,
                 latest_move=latest_move,
+                recent_moves=recent_moves,
             )
 
             probs = td["probs"].squeeze(0).float()
@@ -576,6 +775,7 @@ class NeuralMCTSInfer:
         board: np.ndarray,
         current_player: Piece,
         latest_move: Optional[tuple[int, int]],
+        recent_moves: tuple[tuple[int, int], ...],
     ) -> int:
         model = self._select_model(current_player)
         if model is None:
@@ -586,6 +786,7 @@ class NeuralMCTSInfer:
                 board=board,
                 current_player=current_player,
                 latest_move=latest_move,
+                recent_moves=recent_moves,
             )
 
             probs = td["probs"].squeeze(0).float()
@@ -604,7 +805,6 @@ class NeuralMCTSInfer:
         node: MCTSNode,
         priors: np.ndarray,
         allowed_actions: np.ndarray,
-        add_root_noise: bool = False,
     ) -> None:
         actions = allowed_actions.astype(np.int64, copy=False)
         if actions.size == 0:   # 如果没有合法动作了，说明当前节点是一个终局节点，直接标记为 terminal 并设置 terminal_value，然后返回，不再扩展子节点。
@@ -615,14 +815,6 @@ class NeuralMCTSInfer:
         local_priors = priors[actions].astype(np.float64)
         assert local_priors.sum() > 0
 
-        # 给根节点加dirichlet噪声以增加探索，特别是在搜索初期；dirichlet_alpha 控制噪声的分布，dirichlet_epsilon 原始先验概率 和 噪声 混合的比例
-        if add_root_noise and self.mcts_cfg.dirichlet_epsilon > 0.0 and self.mcts_cfg.dirichlet_alpha > 0.0:
-            noise = np.random.dirichlet(
-                alpha=np.full(len(local_priors), self.mcts_cfg.dirichlet_alpha, dtype=np.float64)
-            )
-            eps = self.mcts_cfg.dirichlet_epsilon
-            local_priors = (1.0 - eps) * local_priors + eps * noise
-            local_priors = local_priors / local_priors.sum()
 
         board_size = int(self.cfg.board_size)
         stone = BLACK if node.to_play == Piece.BLACK else WHITE # 当前节点表示的棋盘状态下，轮到哪个玩家落子，就用哪个玩家的棋子来扩展子节点
@@ -649,6 +841,7 @@ class NeuralMCTSInfer:
                 board=next_board,
                 to_play=opponent(node.to_play),
                 latest_move=(row, col),
+                recent_moves=_prepend_recent_move(node.recent_moves, (row, col), self.state_adapter.temporal_num_steps),
                 prior=float(prior),
                 terminal=terminal,
                 terminal_value=terminal_value,
@@ -677,6 +870,122 @@ class NeuralMCTSInfer:
             raise RuntimeError("MCTS 选择子节点失败。")
         return best_action, best_child
 
+    def _child_value_from_parent_view(self, child: MCTSNode) -> float:
+        return -child.q
+
+    def _best_action_by_visit(self, root: MCTSNode) -> tuple[int, MCTSNode]:
+        if not root.children:
+            raise RuntimeError("根节点没有合法子节点。")
+        return max(
+            root.children.items(),
+            key=lambda kv: (
+                kv[1].visit_count,
+                self._child_value_from_parent_view(kv[1]),
+                -kv[0],
+            ),
+        )
+
+    def _best_action_by_value(self, root: MCTSNode) -> tuple[int, MCTSNode]:
+        if not root.children:
+            raise RuntimeError("根节点没有合法子节点。")
+
+        visited_items = [
+            (action, child)
+            for action, child in root.children.items()
+            if child.visit_count > 0
+        ]
+        candidates = visited_items if visited_items else list(root.children.items())
+        return max(
+            candidates,
+            key=lambda kv: (
+                self._child_value_from_parent_view(kv[1]),
+                kv[1].visit_count,
+                -kv[0],
+            ),
+        )
+
+    def _analyze_root_search_stats(self, root: MCTSNode) -> RootSearchStats:
+        visit_action, visit_child = self._best_action_by_visit(root)
+        q_action, q_child = self._best_action_by_value(root)
+
+        visit_q = self._child_value_from_parent_view(visit_child)
+        q_best_q = self._child_value_from_parent_view(q_child)
+        q_gap = q_best_q - visit_q
+
+        disagreement = visit_action != q_action
+
+        return RootSearchStats(
+            visit_best_action=visit_action,
+            q_best_action=q_action,
+            visit_best_visits=visit_child.visit_count,
+            q_best_visits=q_child.visit_count,
+            visit_best_q=visit_q,
+            q_best_q=q_best_q,
+            q_gap=q_gap,
+            disagreement=disagreement,
+        )
+
+    def _run_single_simulation(self, root: MCTSNode) -> None:
+        node = root
+        path = [node]
+
+        while node.children and not node.terminal:
+            _action, node = self._select_child(node)
+            path.append(node)
+
+        if node.terminal:
+            value = node.terminal_value
+        else:
+            priors, value, allowed_actions = self._policy_value(
+                board=node.board,
+                current_player=node.to_play,
+                latest_move=node.latest_move,
+                recent_moves=node.recent_moves,
+            )
+            self._expand_node(
+                node,
+                priors,
+                allowed_actions,
+            )
+
+        self._backpropagate(path, value)
+
+    def _run_simulations(self, root: MCTSNode, num_simulations: int) -> None:
+        for _ in range(max(0, int(num_simulations))):
+            self._run_single_simulation(root)
+
+    def _maybe_extend_search_on_root_disagreement(
+        self,
+        root: MCTSNode,
+        base_num_simulations: int,
+    ) -> RootSearchStats:
+        stats = self._analyze_root_search_stats(root)
+        if not self.mcts_cfg.extend_on_root_disagreement:
+            return stats
+
+        chunk_ratio = max(0.0, float(self.mcts_cfg.disagreement_extra_simulations_ratio))
+        max_extra_ratio = max(0.0, float(self.mcts_cfg.disagreement_max_extra_simulations_ratio))
+        chunk_size = max(1, int(round(base_num_simulations * chunk_ratio))) if chunk_ratio > 0 else 0
+        max_extra = max(0, int(round(base_num_simulations * max_extra_ratio)))
+
+        if chunk_size <= 0 or max_extra <= 0:
+            return stats
+
+        extra_used = 0
+        extension_rounds = 0
+
+        while stats.disagreement and extra_used < max_extra:
+            sims_to_add = min(chunk_size, max_extra - extra_used)
+            self._run_simulations(root, sims_to_add)
+            extra_used += sims_to_add
+            extension_rounds += 1
+            stats = self._analyze_root_search_stats(root)
+
+        stats.extension_triggered = extra_used > 0
+        stats.extension_rounds = extension_rounds
+        stats.extra_simulations = extra_used
+        return stats
+
     def _backpropagate(self, path: list[MCTSNode], value: float) -> None:   # 从叶子节点开始，沿着路径向上回溯，更新每个节点的访问次数和价值总和；value 的符号在每层反转，以反映当前节点的视角。
         for node in reversed(path):
             node.visit_count += 1
@@ -688,11 +997,13 @@ class NeuralMCTSInfer:
         board: np.ndarray,
         current_player: Piece,
         latest_move: Optional[tuple[int, int]],
+        recent_moves: tuple[tuple[int, int], ...],
     ) -> tuple[int, MCTSNode]:
         root, reuse_stats = self._get_reusable_root_with_stats(
             board=board,
             current_player=current_player,
             latest_move=latest_move,
+            recent_moves=recent_moves,
         )
         self._last_reuse_stats = reuse_stats
         num_simulations = self._compute_dynamic_num_simulations(reuse_stats)
@@ -704,38 +1015,18 @@ class NeuralMCTSInfer:
                 board=root.board,
                 current_player=root.to_play,
                 latest_move=root.latest_move,
+                recent_moves=root.recent_moves,
             )
             self._expand_node(
                 root,
                 root_priors,
                 root_allowed_actions,
-                add_root_noise=False,
             )
 
-        for _ in range(num_simulations):
-            node = root
-            path = [node]
-
-            while node.children and not node.terminal:
-                _action, node = self._select_child(node)
-                path.append(node)
-
-            if node.terminal:
-                value = node.terminal_value
-            else:
-                priors, value, allowed_actions = self._policy_value(
-                    board=node.board,
-                    current_player=node.to_play,
-                    latest_move=node.latest_move,
-                )
-                self._expand_node(
-                    node,
-                    priors,
-                    allowed_actions,
-                    add_root_noise=False,
-                )
-
-            self._backpropagate(path, value)
+        self._run_simulations(root, num_simulations)
+        root_search_stats = self._maybe_extend_search_on_root_disagreement(root, num_simulations)
+        self._last_root_search_stats = root_search_stats
+        self._last_dynamic_num_simulations = num_simulations + root_search_stats.extra_simulations
 
         if not root.children:
             raise RuntimeError("根节点没有合法子节点。")
@@ -743,100 +1034,53 @@ class NeuralMCTSInfer:
         # 当前真实状态对应的 root 继续缓存下来
         self._cached_root = root
 
-        temperature = float(self.mcts_cfg.temperature)
-        if temperature <= 1e-8:
-            best_action, best_child = max(
-                root.children.items(),
-                key=lambda kv: kv[1].visit_count,
-            )
-            return best_action, best_child
-
-        actions = np.array(list(root.children.keys()), dtype=np.int64)
-        visits = np.array([child.visit_count for child in root.children.values()], dtype=np.float64)
-        logits = np.log(np.maximum(visits, 1.0)) / temperature
-        logits = logits - logits.max()
-        probs = np.exp(logits)
-        probs = probs / probs.sum()
-        sampled_idx = int(np.random.choice(len(actions), p=probs))
-        action = int(actions[sampled_idx])
-        return action, root.children[action]
+        best_action, best_child = self._best_action_by_visit(root)
+        return best_action, best_child
     
     def _run_mcts(
         self,
         board: np.ndarray,
         current_player: Piece,
         latest_move: Optional[tuple[int, int]],
+        recent_moves: tuple[tuple[int, int], ...],
     ) -> tuple[int, MCTSNode]:
         root = MCTSNode(
             board=board.copy(),
             to_play=current_player,
             latest_move=latest_move,
+            recent_moves=tuple(recent_moves),
         )
 
         root_priors, _root_value, root_allowed_actions = self._policy_value(
             board=root.board,
             current_player=root.to_play,
             latest_move=root.latest_move,
+            recent_moves=root.recent_moves,
         )
         self._expand_node(
             root,
             root_priors,
             root_allowed_actions,
-            add_root_noise=False,
         )  # root 节点的 prior 由神经网络输出提供；如果启用了根节点噪声，则在扩展 root 时添加 Dirichlet 噪声以增加探索。
 
         num_simulations = max(1, self.mcts_cfg.num_simulations)
-        for _ in range(num_simulations):
-            node = root
-            path = [node]
-
-            while node.children and not node.terminal:
-                _action, node = self._select_child(node)
-                path.append(node)
-
-            if node.terminal:
-                value = node.terminal_value
-            else:
-                priors, value, allowed_actions = self._policy_value(
-                    board=node.board,
-                    current_player=node.to_play,
-                    latest_move=node.latest_move,
-                )
-                self._expand_node(
-                    node,
-                    priors,
-                    allowed_actions,
-                    add_root_noise=False,
-                )
-
-            self._backpropagate(path, value)
+        self._run_simulations(root, num_simulations)
+        root_search_stats = self._maybe_extend_search_on_root_disagreement(root, num_simulations)
+        self._last_root_search_stats = root_search_stats
+        self._last_dynamic_num_simulations = num_simulations + root_search_stats.extra_simulations
+        self._last_reuse_stats = ReuseStats()
 
         if not root.children:
             raise RuntimeError("根节点没有合法子节点。")
 
-        #  如果 temperature很小，选择访问次数最多的动作
-        temperature = float(self.mcts_cfg.temperature)  
-        if temperature <= 1e-8:
-            best_action, best_child = max(
-                root.children.items(),
-                key=lambda kv: kv[1].visit_count,
-            )
-            return best_action, best_child
-        # 根据访问次数分布采样一个动作，temperature 控制分布的平坦程度；temperature 越高，采样越随机；temperature 越低，越倾向于选择访问次数最多的动作。
-        actions = np.array(list(root.children.keys()), dtype=np.int64)
-        visits = np.array([child.visit_count for child in root.children.values()], dtype=np.float64)
-        logits = np.log(np.maximum(visits, 1.0)) / temperature
-        logits = logits - logits.max()
-        probs = np.exp(logits)
-        probs = probs / probs.sum()
-        sampled_idx = int(np.random.choice(len(actions), p=probs))
-        action = int(actions[sampled_idx])
-        return action, root.children[action]
+        best_action, best_child = self._best_action_by_visit(root)
+        return best_action, best_child
 
     def predict(
         self,
         board: np.ndarray,
         latest_move: Optional[tuple[int, int]],
+        recent_moves: Optional[list[tuple[int, int]] | tuple[tuple[int, int], ...]] = None,
     ) -> tuple[Optional[tuple[int, int]], str, Optional[Piece]]:
         current_player = infer_current_player(board)
         if current_player is None:
@@ -845,8 +1089,12 @@ class NeuralMCTSInfer:
         if self._select_model(current_player) is None:
             return None, "当前未加载模型，只完成棋盘识别。", current_player
 
-        if latest_move is None and self.cfg.get("require_last_move", False):
-            return None, "模型需要 last_move 通道；请先标记最近一手或等待自动差分。", current_player
+        recent_moves_tuple = _normalize_recent_moves(
+            recent_moves=recent_moves,
+            latest_move=latest_move,
+            max_steps=self.state_adapter.temporal_num_steps,
+        )
+        latest_move = recent_moves_tuple[0] if recent_moves_tuple else latest_move
 
         try:
             if self.mcts_cfg.enabled:   # 如果启用了 MCTS，则使用神经网络引导的 MCTS 来选择动作；否则直接使用神经网络输出概率最高的动作作为建议落子位置。
@@ -855,16 +1103,26 @@ class NeuralMCTSInfer:
                         board=board,
                         current_player=current_player,
                         latest_move=latest_move,
+                        recent_moves=recent_moves_tuple,
                     )
                 else:
                     action, best_child = self._run_mcts(
                         board=board,
                         current_player=current_player,
                         latest_move=latest_move,
+                        recent_moves=recent_moves_tuple,
                     )
                 row, col = action_to_coord(int(action), int(self.cfg.board_size))
-                extra = "(未提供最近一手，root 的 last_move 通道置零）" if latest_move is None else ""
+                extra = f"(时序输入最近 {self.state_adapter.temporal_num_steps} 手，当前有效 {len(recent_moves_tuple)} 手）"
                 model_mode = "dual-model" if self._using_dual_models() else "single-model-fallback"
+
+                root_search_stats = self._last_root_search_stats
+                extend_info = ""
+                if root_search_stats.extension_triggered:
+                    extend_info = (
+                        f", disagree_extend=+{root_search_stats.extra_simulations}"
+                        f"/{root_search_stats.extension_rounds}轮"
+                    )
 
                 if self.mcts_reuse_tree:
                     actual_sims = self._last_dynamic_num_simulations
@@ -872,7 +1130,7 @@ class NeuralMCTSInfer:
                     reuse_info = (
                         f"reuse_depth={reuse_stats.reused_depth}, "
                         f"R'={reuse_stats.reuse_ratio:.3f}, "
-                        f"rank={reuse_stats.reuse_rank}"
+                        f"rank={reuse_stats.reuse_rank}{extend_info}"
                     )
                     msg = (
                         f"[mcts {actual_sims} sims | {model_mode} | {reuse_info}] "
@@ -880,8 +1138,9 @@ class NeuralMCTSInfer:
                         f"visit={best_child.visit_count}，Q={-best_child.q:.3f}{extra}"
                     )
                 else:
+                    actual_sims = self._last_dynamic_num_simulations
                     msg = (
-                        f"[mcts {self.mcts_cfg.num_simulations} sims | {model_mode}] "
+                        f"[mcts {actual_sims} sims | {model_mode}{extend_info}] "
                         f"轮到{current_player.name.lower()}落子，建议第 {row + 1} 行第 {col + 1} 列；"
                         f"visit={best_child.visit_count}，Q={-best_child.q:.3f}{extra}"
                     )
@@ -891,9 +1150,10 @@ class NeuralMCTSInfer:
                 board=board,
                 current_player=current_player,
                 latest_move=latest_move,
+                recent_moves=recent_moves_tuple,
             )
             row, col = action_to_coord(int(action), int(self.cfg.board_size))
-            extra = "(未提供最近一手,last_move 通道置零）" if latest_move is None else ""
+            extra = f"(时序输入最近 {self.state_adapter.temporal_num_steps} 手，当前有效 {len(recent_moves_tuple)} 手）"
             model_mode = "dual-model" if self._using_dual_models() else "single-model-fallback"
             msg = f"[direct | {model_mode}] 轮到{current_player.name.lower()}落子，建议第 {row + 1} 行第 {col + 1} 列{extra}"
             return (row, col), msg, current_player
