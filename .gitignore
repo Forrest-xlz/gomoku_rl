@@ -166,8 +166,8 @@ outputs
 wandb
 /*.pt
 /*.png
-elo_models
-elo_eval_outputs
 dist/
 build/
 *.rar
+/elo_models/
+/elo_eval_outputs/

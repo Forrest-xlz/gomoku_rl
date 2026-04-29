@@ -19,7 +19,7 @@ import numpy as np
 import pyautogui
 from omegaconf import DictConfig, OmegaConf
 from PIL import ImageGrab
-from PyQt5.QtCore import Qt, QRect, QTimer, QEvent
+from PyQt5.QtCore import Qt, QRect, QTimer
 from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAction,
@@ -140,13 +140,7 @@ class InferResult:
 
 
 class MonitorOverlay(QWidget):
-    """Top-level transparent overlay to mark the monitored ROI.
-
-    The overlay must stay visible while the user clicks the real game window.
-    Therefore it is implemented as a top-level, click-through, non-focus window
-    instead of a Qt.Tool window. Qt.Tool can be hidden/minimized by the window
-    manager when focus leaves the application on Windows.
-    """
+    """Top-level transparent overlay to mark the monitored ROI."""
 
     def __init__(self):
         super().__init__(None)
@@ -167,20 +161,17 @@ class MonitorOverlay(QWidget):
         self.setFocusPolicy(Qt.NoFocus)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        if hasattr(Qt, "WA_ShowWithoutActivating"):
+            self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.hide()
 
     def ensure_overlay_visible(self) -> None:
-        """Keep the overlay visible without stealing focus from the game window."""
+        """Show the overlay as a visual, non-focus HUD."""
         if self.isMinimized():
             self.showNormal()
         elif not self.isVisible():
             self.show()
         self.raise_()
-
-    def changeEvent(self, event):
-        super().changeEvent(event)
-        if event.type() == QEvent.WindowStateChange and self.isMinimized():
-            QTimer.singleShot(0, self.showNormal)
 
     def update_overlay(self, roi: Optional[list[int]], message_lines: list[str], visible: bool) -> None:
         if not visible or roi is None:
@@ -734,7 +725,6 @@ class ScreenMonitorWidget(QWidget):
         self.global_key_timer.timeout.connect(self.poll_global_keys)
         self.global_key_timer.start(30)
         self._esc_was_down = False
-
         self._build_ui()
         self.load_runtime_config()
         self.apply_mode(RunMode.AUTO_PLAY)
@@ -1174,9 +1164,8 @@ class ScreenMonitorWidget(QWidget):
         self.update_overlay()
 
     def select_roi(self) -> None:
-        was_active = self.game_active
         self.set_window_topmost(False)
-        self.overlay.hide()
+        self.overlay.update_overlay(None, [], False)
         try:
             screen = grab_screen_bgr()
             roi = cv2.selectROI("Select Board ROI", screen, showCrosshair=True, fromCenter=False)
@@ -1193,8 +1182,7 @@ class ScreenMonitorWidget(QWidget):
             logging.exception("select_roi failed")
             self.set_status(f"选择棋盘区域失败：{exc}")
         finally:
-            if was_active:
-                self.set_window_topmost(True)
+            self.set_window_topmost(True)
             self.update_overlay()
 
     def select_corners(self) -> None:
@@ -1202,9 +1190,8 @@ class ScreenMonitorWidget(QWidget):
             self.set_status("请先选择棋盘区域。")
             return
 
-        was_active = self.game_active
         self.set_window_topmost(False)
-        self.overlay.hide()
+        self.overlay.update_overlay(None, [], False)
         try:
             roi_img = crop_roi_from_screen(self.roi)
             if roi_img is None:
@@ -1258,8 +1245,7 @@ class ScreenMonitorWidget(QWidget):
                 cv2.destroyWindow("Pick 4 Corners")
             except Exception:
                 pass
-            if was_active:
-                self.set_window_topmost(True)
+            self.set_window_topmost(True)
             self.update_overlay()
 
     def current_vis(self) -> np.ndarray:

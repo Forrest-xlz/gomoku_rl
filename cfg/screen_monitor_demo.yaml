@@ -21,7 +21,7 @@ auto_suggest_enabled: false
 poll_interval_ms: 500
 
 mcts_infer_enabled: true
-mcts_num_simulations: 1000
+mcts_num_simulations: 500
 mcts_c_puct: 2.0
 mcts_reuse_subtree: true
 mcts_reuse_tree: true
