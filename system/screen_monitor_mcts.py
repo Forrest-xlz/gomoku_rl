@@ -19,7 +19,7 @@ import numpy as np
 import pyautogui
 from omegaconf import DictConfig, OmegaConf
 from PIL import ImageGrab
-from PyQt5.QtCore import Qt, QRect, QTimer
+from PyQt5.QtCore import Qt, QRect, QTimer, QEvent
 from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAction,
@@ -140,7 +140,13 @@ class InferResult:
 
 
 class MonitorOverlay(QWidget):
-    """Top-level transparent overlay to mark the monitored ROI."""
+    """Top-level transparent overlay to mark the monitored ROI.
+
+    The overlay must stay visible while the user clicks the real game window.
+    Therefore it is implemented as a top-level, click-through, non-focus window
+    instead of a Qt.Tool window. Qt.Tool can be hidden/minimized by the window
+    manager when focus leaves the application on Windows.
+    """
 
     def __init__(self):
         super().__init__(None)
@@ -148,15 +154,33 @@ class MonitorOverlay(QWidget):
         self.board_rect = QRect()
         self.label_rect = QRect()
         self._last_layout_key = None
-        self.setWindowFlags(
-            Qt.FramelessWindowHint
-            | Qt.WindowStaysOnTopHint
-            | Qt.Tool
-            | Qt.BypassWindowManagerHint
-        )
+        self._normal_font = QFont("Microsoft YaHei", 9)
+        self._title_font = QFont("Microsoft YaHei", 10)
+        self._title_font.setBold(True)
+
+        flags = Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+        if hasattr(Qt, "WindowDoesNotAcceptFocus"):
+            flags |= Qt.WindowDoesNotAcceptFocus
+        if hasattr(Qt, "NoDropShadowWindowHint"):
+            flags |= Qt.NoDropShadowWindowHint
+        self.setWindowFlags(flags)
+        self.setFocusPolicy(Qt.NoFocus)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.hide()
+
+    def ensure_overlay_visible(self) -> None:
+        """Keep the overlay visible without stealing focus from the game window."""
+        if self.isMinimized():
+            self.showNormal()
+        elif not self.isVisible():
+            self.show()
+        self.raise_()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange and self.isMinimized():
+            QTimer.singleShot(0, self.showNormal)
 
     def update_overlay(self, roi: Optional[list[int]], message_lines: list[str], visible: bool) -> None:
         if not visible or roi is None:
@@ -164,11 +188,15 @@ class MonitorOverlay(QWidget):
             self.hide()
             return
 
-        lines = list(message_lines)
+        lines = [str(line).strip() for line in message_lines if str(line).strip()]
+        if not lines:
+            lines = ["正在监控此区域"]
+
         x, y, w, h = roi
         line_count = max(len(lines), 1)
-        label_height = 12 + line_count * 18 + 10
-        label_width = min(max(w - 16, 240), 420)
+        line_height = 20
+        label_height = 18 + line_count * line_height + 12
+        label_width = min(max(w - 16, 280), 480)
         desired_top_padding = label_height + 12
         overlay_top = max(0, y - desired_top_padding)
         board_top = y - overlay_top
@@ -184,30 +212,48 @@ class MonitorOverlay(QWidget):
             self.setGeometry(*geom)
             self.board_rect = board_rect
             self.label_rect = label_rect
-            if not self.isVisible():
-                self.show()
-            self.raise_()
+            self.ensure_overlay_visible()
             self.update()
-        elif not self.isVisible():
-            self.show()
+        else:
+            self.ensure_overlay_visible()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        border_pen = QPen(QColor(0, 255, 170, 220), 2)
-        painter.setPen(border_pen)
+        painter.setPen(QPen(QColor(0, 255, 170, 230), 2))
         painter.drawRect(self.board_rect.adjusted(1, 1, -2, -2))
 
-        painter.fillRect(self.label_rect, QColor(0, 0, 0, 115))
-        painter.setPen(QColor(255, 255, 255))
-        painter.setFont(QFont("Microsoft YaHei", 9))
-        painter.drawText(
-            self.label_rect.adjusted(7, 5, -7, -5),
-            Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap,
-            "\n".join(self.message_lines),
-        )
+        painter.setPen(QPen(QColor(0, 255, 170, 150), 1))
+        painter.setBrush(QColor(8, 16, 28, 175))
+        painter.drawRoundedRect(self.label_rect, 10, 10)
 
+        accent_rect = QRect(
+            self.label_rect.left(),
+            self.label_rect.top(),
+            4,
+            self.label_rect.height(),
+        )
+        painter.fillRect(accent_rect, QColor(0, 255, 170, 210))
+
+        text_rect = self.label_rect.adjusted(14, 8, -10, -8)
+        line_height = 20
+        for idx, line in enumerate(self.message_lines):
+            y = text_rect.top() + idx * line_height
+            row_rect = QRect(text_rect.left(), y, text_rect.width(), line_height)
+            if idx == 0:
+                painter.setFont(self._title_font)
+                painter.setPen(QColor(150, 255, 215))
+            elif line.startswith("建议"):
+                painter.setFont(self._normal_font)
+                painter.setPen(QColor(255, 236, 140))
+            elif line.startswith("最近一手"):
+                painter.setFont(self._normal_font)
+                painter.setPen(QColor(145, 220, 255))
+            else:
+                painter.setFont(self._normal_font)
+                painter.setPen(QColor(245, 248, 252))
+            painter.drawText(row_rect, Qt.AlignLeft | Qt.AlignVCenter, line)
 
 def grab_screen_bgr() -> np.ndarray:
     try:
@@ -223,7 +269,7 @@ def grab_screen_bgr() -> np.ndarray:
 def crop_roi_from_screen(roi: list[int]) -> Optional[np.ndarray]:
     screen = grab_screen_bgr()
     x, y, w, h = roi
-    roi_img = screen[y : y + h, x : x + w].copy()
+    roi_img = screen[y: y + h, x: x + w].copy()
     if roi_img.size == 0:
         return None
     return roi_img
@@ -265,9 +311,8 @@ def warp_board(
 
 def build_local_masks(cell: int) -> tuple[int, np.ndarray, np.ndarray]:
     outer_r = int(round(cell * 0.60))
-    yy, xx = np.ogrid[-outer_r : outer_r + 1, -outer_r : outer_r + 1]
+    yy, xx = np.ogrid[-outer_r: outer_r + 1, -outer_r: outer_r + 1]
     dist = np.sqrt(xx * xx + yy * yy)
-
     center_mask = dist <= cell * 0.28
     ring_mask = (dist >= cell * 0.45) & (dist <= cell * 0.60)
     return outer_r, center_mask, ring_mask
@@ -283,7 +328,7 @@ def classify_intersection(
     black_thresh: float,
     white_thresh: float,
 ) -> tuple[int, float, float, float]:
-    patch = gray[y - outer_r : y + outer_r + 1, x - outer_r : x + outer_r + 1]
+    patch = gray[y - outer_r: y + outer_r + 1, x - outer_r: x + outer_r + 1]
     if patch.shape != center_mask.shape:
         return EMPTY, 0.0, 0.0, 0.0
 
@@ -297,7 +342,6 @@ def classify_intersection(
         state = WHITE
     else:
         state = EMPTY
-
     return state, diff, center_mean, ring_mean
 
 
@@ -312,7 +356,6 @@ def detect_board_state(
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     board = np.zeros((board_size, board_size), dtype=np.int32)
     debug_info: list[dict] = []
-
     outer_r, center_mask, ring_mask = build_local_masks(cell)
 
     for row in range(board_size):
@@ -342,7 +385,6 @@ def detect_board_state(
                     "ring_mean": float(ring_mean),
                 }
             )
-
     return board, debug_info
 
 
@@ -361,7 +403,6 @@ def draw_result(
         for col in range(board_size):
             x = int(round(margin + col * cell))
             y = int(round(margin + row * cell))
-
             cv2.drawMarker(
                 vis,
                 (x, y),
@@ -439,7 +480,6 @@ def draw_result(
             2,
             cv2.LINE_AA,
         )
-
     return vis
 
 
@@ -468,16 +508,12 @@ def derive_opponent_last_move(
 ) -> Optional[tuple[int, int]]:
     if previous_board is None or previous_board.shape != current_board.shape:
         return None
-
     prev_opponent = previous_board == opponent_value
     curr_opponent = current_board == opponent_value
-
     removed = np.argwhere(prev_opponent & (~curr_opponent))
     added = np.argwhere((~prev_opponent) & curr_opponent)
-
     if len(removed) != 0 or len(added) != 1:
         return None
-
     row, col = map(int, added[0])
     return row, col
 
@@ -488,16 +524,12 @@ def derive_single_added_move(
 ) -> Optional[tuple[int, int]]:
     if previous_board is None or previous_board.shape != current_board.shape:
         return None
-
     prev = previous_board != EMPTY
     curr = current_board != EMPTY
-
     removed = np.argwhere(prev & (~curr))
     added = np.argwhere((~prev) & curr)
-
     if len(removed) != 0 or len(added) != 1:
         return None
-
     row, col = map(int, added[0])
     return row, col
 
@@ -521,9 +553,7 @@ def board_to_screen(
     point = np.array([[[x, y]]], dtype=np.float32)
     roi_point = cv2.perspectiveTransform(point, inv_matrix)[0][0]
     rx, ry = int(roi_point[0]), int(roi_point[1])
-    screen_x = roi[0] + rx
-    screen_y = roi[1] + ry
-    return screen_x, screen_y
+    return roi[0] + rx, roi[1] + ry
 
 
 def run_click_job(
@@ -553,10 +583,12 @@ def run_click_job(
 
 def run_frame_job(job: FrameJob, model_manager: MCTSManager) -> FrameResult:
     result = FrameResult(generation=job.generation, ok=False)
-
     try:
         if job.roi is None or job.corners_in_roi is None:
             result.error = "请先设置棋盘区域并标记四角交点。"
+            return result
+        if job.stop_event.is_set() or not job.game_active:
+            result.ok = True
             return result
 
         roi_img = crop_roi_from_screen(job.roi)
@@ -571,7 +603,6 @@ def run_frame_job(job: FrameJob, model_manager: MCTSManager) -> FrameResult:
             cell=job.cell,
             margin=job.margin,
         )
-
         board, debug_info = detect_board_state(
             warped=warped,
             board_size=job.board_size,
@@ -582,17 +613,14 @@ def run_frame_job(job: FrameJob, model_manager: MCTSManager) -> FrameResult:
         )
 
         current_hash = board_hash(board)
-        board_changed = current_hash != job.last_board_hash
-        current_turn = infer_current_player(board)
-
         result.ok = True
         result.warped = warped
         result.board = board
         result.debug_info = debug_info
         result.perspective_matrix = matrix
-        result.current_turn = current_turn
+        result.current_turn = infer_current_player(board)
         result.board_hash_value = current_hash
-        result.board_changed = board_changed
+        result.board_changed = current_hash != job.last_board_hash
         return result
     except Exception as exc:
         logging.exception("run_frame_job failed")
@@ -606,11 +634,9 @@ def run_infer_job(job: InferJob, model_manager: MCTSManager) -> InferResult:
         if job.stop_event.is_set() or not job.game_active:
             result.ok = True
             return result
-
         if job.current_turn is None:
             result.ok = True
             return result
-
         if job.current_turn != job.my_color:
             result.ok = True
             return result
@@ -747,11 +773,7 @@ class ScreenMonitorWidget(QWidget):
         self.latest_move = self.recent_moves[0]
 
     def sync_latest_move_label(self) -> None:
-        if self.recent_moves:
-            self.latest_move = self.recent_moves[0]
-        else:
-            self.latest_move = None
-
+        self.latest_move = self.recent_moves[0] if self.recent_moves else None
         if self.latest_move is None:
             self.last_move_label.setText("最近一手：None")
         else:
@@ -760,11 +782,12 @@ class ScreenMonitorWidget(QWidget):
 
     def _build_ui(self) -> None:
         root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(4, 4, 4, 4)
-        root_layout.setSpacing(4)
+        root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.setSpacing(7)
 
         title = QLabel("屏幕五子棋监控")
-        title.setFont(QFont("Arial", 11, QFont.Bold))
+        title.setFont(QFont("Microsoft YaHei", 12, QFont.Bold))
+        title.setStyleSheet("QLabel { color: #1f2d3d; padding: 2px 0 4px 0; }")
         root_layout.addWidget(title)
 
         self.mode_group = QButtonGroup(self)
@@ -775,7 +798,7 @@ class ScreenMonitorWidget(QWidget):
         self.btn_manual.clicked.connect(lambda: self.apply_mode(RunMode.MANUAL))
         self.btn_manual.setMinimumHeight(30)
         self.btn_manual.setStyleSheet(
-            "QPushButton {font-size: 12px; font-weight: 600;}"
+            "QPushButton {font-size: 12px; font-weight: 600; border-radius: 6px; padding: 5px;}"
             "QPushButton:checked {background: #6c757d; color: white;}"
         )
         self.mode_group.addButton(self.btn_manual)
@@ -786,7 +809,7 @@ class ScreenMonitorWidget(QWidget):
         self.btn_auto_infer.clicked.connect(lambda: self.apply_mode(RunMode.AUTO_INFER))
         self.btn_auto_infer.setMinimumHeight(30)
         self.btn_auto_infer.setStyleSheet(
-            "QPushButton {font-size: 12px; font-weight: 600;}"
+            "QPushButton {font-size: 12px; font-weight: 600; border-radius: 6px; padding: 5px;}"
             "QPushButton:checked {background: #2471a3; color: white;}"
         )
         self.mode_group.addButton(self.btn_auto_infer)
@@ -797,7 +820,7 @@ class ScreenMonitorWidget(QWidget):
         self.btn_auto_play.clicked.connect(lambda: self.apply_mode(RunMode.AUTO_PLAY))
         self.btn_auto_play.setMinimumHeight(30)
         self.btn_auto_play.setStyleSheet(
-            "QPushButton {font-size: 12px; font-weight: 600;}"
+            "QPushButton {font-size: 12px; font-weight: 600; border-radius: 6px; padding: 5px;}"
             "QPushButton:checked {background: #c0392b; color: white;}"
         )
         self.mode_group.addButton(self.btn_auto_play)
@@ -808,19 +831,21 @@ class ScreenMonitorWidget(QWidget):
         manual_layout.setContentsMargins(0, 0, 0, 0)
         manual_layout.setSpacing(4)
         manual_label = QLabel("手动模式操作")
-        manual_label.setFont(QFont("Arial", 9))
+        manual_label.setFont(QFont("Microsoft YaHei", 9))
         manual_layout.addWidget(manual_label)
         self.btn_manual_infer = QPushButton("立即推理")
         self.btn_manual_infer.clicked.connect(self.request_manual_infer)
         self.btn_manual_infer.setMinimumHeight(28)
-        self.btn_manual_infer.setStyleSheet("QPushButton {font-size: 11px; font-weight: 600; background: #ecf0f1;}")
+        self.btn_manual_infer.setStyleSheet(
+            "QPushButton {font-size: 11px; font-weight: 600; background: #ecf0f1; border-radius: 6px;}"
+        )
         manual_layout.addWidget(self.btn_manual_infer)
         root_layout.addWidget(self.manual_action_box)
 
         self.btn_start_game = QPushButton("开始对局")
         self.btn_start_game.setMinimumHeight(30)
         self.btn_start_game.setStyleSheet(
-            "QPushButton {font-size: 12px; font-weight: 600; background: #1e8449; color: white;}"
+            "QPushButton {font-size: 12px; font-weight: 600; background: #1e8449; color: white; border-radius: 6px;}"
         )
         self.btn_start_game.clicked.connect(self.start_game)
         root_layout.addWidget(self.btn_start_game)
@@ -828,7 +853,7 @@ class ScreenMonitorWidget(QWidget):
         self.btn_end_game = QPushButton("结束对局")
         self.btn_end_game.setMinimumHeight(30)
         self.btn_end_game.setStyleSheet(
-            "QPushButton {font-size: 12px; font-weight: 600; background: #7f8c8d; color: white;}"
+            "QPushButton {font-size: 12px; font-weight: 600; background: #7f8c8d; color: white; border-radius: 6px;}"
         )
         self.btn_end_game.clicked.connect(self.end_game)
         root_layout.addWidget(self.btn_end_game)
@@ -844,7 +869,7 @@ class ScreenMonitorWidget(QWidget):
         root_layout.addWidget(self.btn_select_corners)
 
         color_label = QLabel("我方：")
-        color_label.setFont(QFont("Arial", 9))
+        color_label.setFont(QFont("Microsoft YaHei", 9))
         root_layout.addWidget(color_label)
 
         self.color_combo = QComboBox()
@@ -868,22 +893,40 @@ class ScreenMonitorWidget(QWidget):
 
         self.status_label = QLabel("状态：等待设置")
         self.status_label.setWordWrap(True)
-        self.status_label.setMinimumHeight(34)
+        self.status_label.setMinimumHeight(38)
+        self.status_label.setStyleSheet(
+            "QLabel {background: #fffdf5; border: 1px solid #f0d98c; border-radius: 6px; padding: 6px; color: #4d4030;}"
+        )
         root_layout.addWidget(self.status_label)
 
         self.model_label = QLabel("模型建议：-")
         self.model_label.setWordWrap(True)
-        self.model_label.setMinimumHeight(40)
+        self.model_label.setMinimumHeight(118)
+        self.model_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.model_label.setStyleSheet(
+            """
+            QLabel {
+                background: #f8fbff;
+                border: 1px solid #b7d8ff;
+                border-left: 5px solid #2d8cff;
+                border-radius: 8px;
+                padding: 8px 10px;
+                color: #1f2d3d;
+                font-family: "Microsoft YaHei";
+                font-size: 12px;
+            }
+            """
+        )
         root_layout.addWidget(self.model_label)
 
         preview_title = QLabel("识别预览")
-        preview_title.setFont(QFont("Arial", 10))
+        preview_title.setFont(QFont("Microsoft YaHei", 10))
         root_layout.addWidget(preview_title)
 
         self.preview_label = QLabel()
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setMinimumSize(220, 220)
-        self.preview_label.setStyleSheet("background: #202020;")
+        self.preview_label.setStyleSheet("background: #202020; border-radius: 6px;")
         root_layout.addWidget(self.preview_label, stretch=1)
 
     def runtime_payload(self) -> dict:
@@ -912,7 +955,6 @@ class ScreenMonitorWidget(QWidget):
         self.roi = payload.get("roi")
         corners = payload.get("corners_in_roi")
         self.corners_in_roi = np.array(corners, dtype=np.float32) if corners else None
-
         if payload.get("my_color") in {"black", "white"}:
             self.color_combo.setCurrentIndex(0 if payload["my_color"] == "black" else 1)
 
@@ -978,7 +1020,7 @@ class ScreenMonitorWidget(QWidget):
         self.refresh_controls()
         self.set_status(f"已切换到{self.current_mode_text()}模式")
         if self.mode == RunMode.MANUAL and self.suggested_move is None:
-            self.model_label.setText("模型建议：-")
+            self.set_model_message()
         self.update_overlay()
 
     def poll_global_keys(self) -> None:
@@ -989,7 +1031,6 @@ class ScreenMonitorWidget(QWidget):
             is_down = bool(state & 0x8000)
         except Exception:
             return
-
         if is_down and not self._esc_was_down:
             self.handle_escape()
         self._esc_was_down = is_down
@@ -998,6 +1039,34 @@ class ScreenMonitorWidget(QWidget):
         if self.game_active:
             self.end_game(set_status_text="Esc：已结束当前对局。")
 
+    @staticmethod
+    def format_model_message(raw_msg: str = "") -> str:
+        msg = (raw_msg or "").strip()
+        if not msg or msg == "-":
+            return "模型建议：-"
+
+        normalized = msg.replace("\r\n", "\n").replace("\r", "\n")
+        for sep in ("；", ";", "|", "｜"):
+            normalized = normalized.replace(sep, "\n")
+
+        parts: list[str] = []
+        for line in normalized.split("\n"):
+            item = line.strip().strip("，,。")
+            if not item:
+                continue
+            if item.startswith("模型建议："):
+                item = item.removeprefix("模型建议：").strip()
+            if item.startswith("模型建议:"):
+                item = item.removeprefix("模型建议:").strip()
+            parts.append(item)
+
+        if not parts:
+            return "模型建议：-"
+        return "模型建议：\n" + "\n".join(f"  · {part}" for part in parts)
+
+    def set_model_message(self, raw_msg: str = "") -> None:
+        self.model_label.setText(self.format_model_message(raw_msg))
+
     def set_status(self, text: str) -> None:
         self.status_label.setText(f"状态：{text}")
 
@@ -1005,21 +1074,22 @@ class ScreenMonitorWidget(QWidget):
         self.phase_label.setText(f"对局状态：{'进行中' if self.game_active else '未开始 / 已结束'}")
 
     def update_overlay(self) -> None:
-        turn_text = '未知' if self.last_turn is None else ('黑方' if self.last_turn == Piece.BLACK else '白方')
+        turn_text = "未知" if self.last_turn is None else ("黑方" if self.last_turn == Piece.BLACK else "白方")
         if self.latest_move is None:
-            latest_text = '最近一手：-'
+            latest_text = "最近一手：-"
         else:
             r, c = self.latest_move
-            latest_text = f"最近一手：({r + 1}, {c + 1})"
+            latest_text = f"最近一手：第 {r + 1} 行，第 {c + 1} 列"
+
         if self.suggested_move is None:
-            suggest_text = '建议：-'
+            suggest_text = "建议落点：-"
         else:
             r, c = self.suggested_move
-            suggest_text = f"建议：({r + 1}, {c + 1})"
+            suggest_text = f"建议落点：第 {r + 1} 行，第 {c + 1} 列"
 
         lines = [
-            '正在监控此区域',
-            '请勿遮挡',
+            "正在监控此区域",
+            "请勿遮挡",
             f"模式：{self.current_mode_text()}",
             f"对局：{'进行中' if self.game_active else '未开始/已结束'}",
             f"我方：{'黑方' if self.my_color == Piece.BLACK else '白方'}",
@@ -1032,21 +1102,26 @@ class ScreenMonitorWidget(QWidget):
     def reset_game_runtime(self) -> None:
         self.latest_move = None
         self.latest_move_board_hash = None
-        self.recent_moves = []
+        self.recent_moves.clear()
         self.lastmove_reference_board = None
         self.lastmove_reference_hash = None
         self.suggested_move = None
         self.last_turn = None
         self.last_board_hash = None
         self.last_suggested_hash = None
+        self.last_infer_request_hash = None
         self.perspective_matrix = None
         self.pending_fast_refresh = False
         self.pending_manual_request = False
         self.pending_click_reference_board = None
         self.pending_click_move = None
+        self.run_generation += 1
         if hasattr(self, "last_move_label"):
             self.last_move_label.setText("最近一手：None")
-        self.run_generation += 1
+        if hasattr(self, "turn_label"):
+            self.turn_label.setText("当前轮次：未知")
+        if hasattr(self, "model_label"):
+            self.set_model_message()
         if hasattr(self.model_manager, "reset_search_tree"):
             try:
                 self.model_manager.reset_search_tree()
@@ -1054,115 +1129,138 @@ class ScreenMonitorWidget(QWidget):
                 logging.exception("reset_search_tree failed")
 
     def start_game(self) -> None:
-        self.stop_event.set()
-        self.stop_event = threading.Event()
+        if self.roi is None or self.corners_in_roi is None:
+            self.set_status("请先选择棋盘区域并标记四角交点。")
+            return
+        self.stop_event.clear()
         self.game_active = True
         self.reset_game_runtime()
-        self.set_window_topmost(True)
+        self.game_active = True
         self.update_phase_label()
         self.refresh_controls()
-        self.last_move_label.setText("最近一手：None")
-        self.model_label.setText("模型建议：-")
-        if self.mode == RunMode.MANUAL:
-            self.set_status("对局已开始。手动模式等待你手动触发推理。")
-        else:
-            self.set_status("对局已开始。窗口保持置顶，Esc 可直接结束对局。")
-            self.submit_frame_job(request_manual_infer=False)
+        self.set_model_message()
+        self.set_status("对局已开始。")
         self.update_overlay()
+        self.submit_frame_job(request_manual_infer=False)
 
-    def end_game(self, set_status_text: Optional[str] = None) -> None:
+    def end_game(self, set_status_text: str = "已结束当前对局。") -> None:
         self.stop_event.set()
         self.game_active = False
-        self.reset_game_runtime()
-        self.set_window_topmost(True)
+        self.detect_busy = False
+        self.infer_busy = False
+        self.pending_manual_request = False
+        self.pending_fast_refresh = False
+        self.current_future = None
+        self.infer_future = None
+        self.pending_click_reference_board = None
+        self.pending_click_move = None
+        self.suggested_move = None
+        self.last_suggested_hash = None
+        self.last_infer_request_hash = None
+        self.set_model_message()
         self.update_phase_label()
         self.refresh_controls()
-        self.model_label.setText("模型建议：-")
-        self.turn_label.setText("当前轮次：未知")
-        self.last_move_label.setText("最近一手：None")
-        self.suggested_move = None
-        self.last_turn = None
-        self.render_preview()
-        self.set_status(set_status_text or "对局已结束。窗口保持置顶。")
+        self.set_status(set_status_text)
         self.update_overlay()
 
-    def on_color_changed(self, _index: int) -> None:
+    def on_color_changed(self) -> None:
+        if hasattr(self, "model_manager") and hasattr(self.model_manager, "reset_search_tree"):
+            try:
+                self.model_manager.reset_search_tree()
+            except Exception:
+                logging.exception("reset_search_tree failed")
         self.save_runtime_config()
+        self.set_status(f"我方已切换为{'黑方' if self.my_color == Piece.BLACK else '白方'}。")
         self.update_overlay()
 
     def select_roi(self) -> None:
-        self.set_status("正在截屏，请框选整个棋盘区域。")
+        was_active = self.game_active
         self.set_window_topmost(False)
-        screen = grab_screen_bgr()
-        cv2.namedWindow("Select ROI", cv2.WINDOW_NORMAL)
-        roi = cv2.selectROI("Select ROI", screen, showCrosshair=True, fromCenter=False)
-        cv2.destroyWindow("Select ROI")
-
-        x, y, w, h = roi
-        if w == 0 or h == 0:
-            self.set_status("没有选中 ROI。")
-            self.set_window_topmost(True)
-            return
-
-        self.roi = [int(x), int(y), int(w), int(h)]
-        self.save_runtime_config()
-        self.update_overlay()
-        self.set_window_topmost(True)
+        self.overlay.hide()
+        try:
+            screen = grab_screen_bgr()
+            roi = cv2.selectROI("Select Board ROI", screen, showCrosshair=True, fromCenter=False)
+            cv2.destroyWindow("Select Board ROI")
+            x, y, w, h = map(int, roi)
+            if w <= 0 or h <= 0:
+                self.set_status("已取消棋盘区域选择。")
+                return
+            self.roi = [x, y, w, h]
+            self.corners_in_roi = None
+            self.save_runtime_config()
+            self.set_status(f"已选择棋盘区域：{self.roi}。请继续标记四角交点。")
+        except Exception as exc:
+            logging.exception("select_roi failed")
+            self.set_status(f"选择棋盘区域失败：{exc}")
+        finally:
+            if was_active:
+                self.set_window_topmost(True)
+            self.update_overlay()
 
     def select_corners(self) -> None:
         if self.roi is None:
-            QMessageBox.warning(self, "提示", "请先选择棋盘区域。")
+            self.set_status("请先选择棋盘区域。")
             return
 
+        was_active = self.game_active
         self.set_window_topmost(False)
-        roi_img = crop_roi_from_screen(self.roi)
-        if roi_img is None:
-            QMessageBox.critical(self, "错误", "当前 ROI 超出屏幕范围，请重新选择。")
-            self.set_window_topmost(True)
-            return
-
-        clone = roi_img.copy()
-        points: list[tuple[int, int]] = []
-
-        def mouse_callback(event, px, py, flags, param):
-            nonlocal clone, points
-            if event == cv2.EVENT_LBUTTONDOWN and len(points) < 4:
-                points.append((px, py))
-                cv2.circle(clone, (px, py), 5, (0, 0, 255), -1)
-                cv2.putText(
-                    clone,
-                    str(len(points)),
-                    (px + 8, py - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 0, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-
-        self.set_status("请点击四个角上的最外侧交点，Enter 确认，r 重置。")
-        cv2.namedWindow("Pick 4 Corners", cv2.WINDOW_NORMAL)
-        cv2.setMouseCallback("Pick 4 Corners", mouse_callback)
-
-        while True:
-            cv2.imshow("Pick 4 Corners", clone)
-            key = cv2.waitKey(20) & 0xFF
-            if key == ord("r"):
-                clone = roi_img.copy()
-                points = []
-            elif key == 13 and len(points) == 4:
-                break
-            elif key == 27:
-                cv2.destroyWindow("Pick 4 Corners")
-                self.set_status("已取消四角交点设置。")
-                self.set_window_topmost(True)
+        self.overlay.hide()
+        try:
+            roi_img = crop_roi_from_screen(self.roi)
+            if roi_img is None:
+                self.set_status("当前 ROI 超出屏幕范围，请重新选择。")
                 return
 
-        cv2.destroyWindow("Pick 4 Corners")
-        self.corners_in_roi = order_points(np.array(points, dtype=np.float32))
-        self.save_runtime_config()
-        self.update_overlay()
-        self.set_window_topmost(True)
+            clone = roi_img.copy()
+            points: list[tuple[int, int]] = []
+
+            def mouse_callback(event, px, py, flags, param):
+                nonlocal clone, points
+                if event == cv2.EVENT_LBUTTONDOWN and len(points) < 4:
+                    points.append((px, py))
+                    cv2.circle(clone, (px, py), 5, (0, 0, 255), -1)
+                    cv2.putText(
+                        clone,
+                        str(len(points)),
+                        (px + 8, py - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 0, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+
+            self.set_status("请点击四个角上的最外侧交点，Enter 确认，r 重置，Esc 取消。")
+            cv2.namedWindow("Pick 4 Corners", cv2.WINDOW_NORMAL)
+            cv2.setMouseCallback("Pick 4 Corners", mouse_callback)
+            while True:
+                cv2.imshow("Pick 4 Corners", clone)
+                key = cv2.waitKey(20) & 0xFF
+                if key == ord("r"):
+                    clone = roi_img.copy()
+                    points = []
+                elif key == 13 and len(points) == 4:
+                    break
+                elif key == 27:
+                    cv2.destroyWindow("Pick 4 Corners")
+                    self.set_status("已取消四角交点设置。")
+                    return
+
+            cv2.destroyWindow("Pick 4 Corners")
+            self.corners_in_roi = order_points(np.array(points, dtype=np.float32))
+            self.save_runtime_config()
+            self.set_status("四角交点已保存。")
+        except Exception as exc:
+            logging.exception("select_corners failed")
+            self.set_status(f"标记四角交点失败：{exc}")
+        finally:
+            try:
+                cv2.destroyWindow("Pick 4 Corners")
+            except Exception:
+                pass
+            if was_active:
+                self.set_window_topmost(True)
+            self.update_overlay()
 
     def current_vis(self) -> np.ndarray:
         if self.latest_warped is None or self.latest_board is None:
@@ -1170,9 +1268,9 @@ class ScreenMonitorWidget(QWidget):
         return draw_result(
             warped=self.latest_warped,
             board=self.latest_board,
-            board_size=self.cfg.board_size,
-            cell=self.cfg.cell,
-            margin=self.cfg.margin,
+            board_size=int(self.cfg.board_size),
+            cell=int(self.cfg.cell),
+            margin=int(self.cfg.margin),
             latest_move=self.latest_move,
             suggested_move=self.suggested_move,
         )
@@ -1207,6 +1305,47 @@ class ScreenMonitorWidget(QWidget):
         self.pending_manual_request = True
         self.submit_frame_job(request_manual_infer=True)
 
+    def maybe_submit_infer_job(self, request_manual_infer: bool) -> None:
+        if self.infer_busy:
+            if request_manual_infer:
+                self.pending_manual_request = True
+            return
+        if not self.game_active or self.stop_event.is_set():
+            return
+        if self.latest_board is None or self.perspective_matrix is None or self.roi is None:
+            return
+        if self.last_board_hash is None:
+            return
+        if self.last_turn != self.my_color:
+            return
+        if self.mode == RunMode.MANUAL and not request_manual_infer:
+            return
+        if self.mode != RunMode.MANUAL and self.last_infer_request_hash == self.last_board_hash:
+            return
+        if self.last_suggested_hash == self.last_board_hash and self.suggested_move is not None:
+            return
+
+        self.infer_busy = True
+        self.pending_manual_request = False
+        self.last_infer_request_hash = self.last_board_hash
+        job = InferJob(
+            generation=self.run_generation,
+            board=self.latest_board.copy(),
+            latest_move=self.latest_move,
+            recent_moves=tuple(self.recent_moves),
+            current_turn=self.last_turn,
+            board_hash_value=self.last_board_hash,
+            perspective_matrix=np.array(self.perspective_matrix, dtype=np.float32),
+            roi=list(self.roi),
+            cell=int(self.cfg.cell),
+            margin=int(self.cfg.margin),
+            my_color=self.my_color,
+            mode=self.mode,
+            game_active=self.game_active,
+            stop_event=self.stop_event,
+        )
+        self.infer_future = self.infer_executor.submit(run_infer_job, job, self.model_manager)
+
     def on_poll_tick(self) -> None:
         self.submit_frame_job(request_manual_infer=False)
 
@@ -1217,11 +1356,12 @@ class ScreenMonitorWidget(QWidget):
             return
         if self.roi is None or self.corners_in_roi is None:
             return
+        if not self.game_active or self.stop_event.is_set():
+            return
 
         self.detect_busy = True
         if request_manual_infer:
             self.pending_manual_request = False
-
         job = FrameJob(
             generation=self.run_generation,
             roi=None if self.roi is None else list(self.roi),
@@ -1292,63 +1432,18 @@ class ScreenMonitorWidget(QWidget):
             self.set_status(f"自动点击线程异常：{exc}")
             return
 
-        self.set_status(msg)
-        if clicked and self.game_active and self.mode == RunMode.AUTO_PLAY:
+        if clicked:
             if self.pending_click_reference_board is not None:
                 self.lastmove_reference_board = self.pending_click_reference_board.copy()
                 self.lastmove_reference_hash = board_hash(self.pending_click_reference_board)
+                self.last_board_hash = self.lastmove_reference_hash
             if self.pending_click_move is not None:
-                self.push_recent_move(self.pending_click_move)
-                self.latest_move_board_hash = self.lastmove_reference_hash
-                self.sync_latest_move_label()
-                self.update_overlay()
-            self.schedule_fast_refresh(30)
+                self.suggested_move = self.pending_click_move
+            self.schedule_fast_refresh()
         self.pending_click_reference_board = None
         self.pending_click_move = None
-
-
-    def maybe_submit_infer_job(self, request_manual_infer: bool = False) -> None:
-        if self.infer_busy:
-            if request_manual_infer:
-                self.pending_manual_request = True
-            return
-        if not self.game_active:
-            return
-        if self.latest_board is None or self.latest_warped is None or self.perspective_matrix is None or self.last_board_hash is None:
-            return
-        if self.roi is None:
-            return
-
-        if request_manual_infer:
-            should_infer = True
-        elif self.mode in {RunMode.AUTO_INFER, RunMode.AUTO_PLAY}:
-            should_infer = self.last_turn == self.my_color and self.last_infer_request_hash != self.last_board_hash
-        else:
-            should_infer = False
-
-        if not should_infer:
-            return
-
-        self.infer_busy = True
-        self.pending_manual_request = False
-        self.last_infer_request_hash = self.last_board_hash
-        job = InferJob(
-            generation=self.run_generation,
-            board=self.latest_board.copy(),
-            latest_move=self.latest_move,
-            recent_moves=tuple(self.recent_moves),
-            current_turn=self.last_turn,
-            board_hash_value=self.last_board_hash,
-            perspective_matrix=self.perspective_matrix.copy(),
-            roi=list(self.roi),
-            cell=int(self.cfg.cell),
-            margin=int(self.cfg.margin),
-            my_color=self.my_color,
-            mode=self.mode,
-            game_active=self.game_active,
-            stop_event=self.stop_event,
-        )
-        self.infer_future = self.infer_executor.submit(run_infer_job, job, self.model_manager)
+        self.set_status(msg)
+        self.update_overlay()
 
     def consume_worker_result(self) -> None:
         if self.current_future is None or not self.current_future.done():
@@ -1357,7 +1452,6 @@ class ScreenMonitorWidget(QWidget):
         future = self.current_future
         self.current_future = None
         self.detect_busy = False
-
         try:
             result: FrameResult = future.result()
         except Exception as exc:
@@ -1371,16 +1465,16 @@ class ScreenMonitorWidget(QWidget):
             if self.pending_manual_request:
                 self.maybe_submit_infer_job(request_manual_infer=True)
             return
-
         if not result.ok:
             if result.error:
                 self.set_status(result.error)
             if self.pending_manual_request:
                 self.maybe_submit_infer_job(request_manual_infer=True)
             return
+        if result.board is None or result.board_hash_value is None:
+            return
 
         prev_board = None if self.latest_board is None else self.latest_board.copy()
-
         self.last_turn = result.current_turn
         self.perspective_matrix = result.perspective_matrix
         self.latest_warped = result.warped
@@ -1388,34 +1482,31 @@ class ScreenMonitorWidget(QWidget):
         self.last_board_hash = result.board_hash_value
 
         candidate_move: Optional[tuple[int, int]] = None
-        if result.board is not None and result.board_hash_value is not None:
-            if result.current_turn == self.my_color:
-                expected_stone = opponent_piece_value(self.my_color)
-                candidate_move = derive_opponent_last_move(
-                    self.lastmove_reference_board,
-                    result.board,
-                    expected_stone,
-                )
+        if result.current_turn == self.my_color:
+            expected_stone = opponent_piece_value(self.my_color)
+            candidate_move = derive_opponent_last_move(
+                self.lastmove_reference_board,
+                result.board,
+                expected_stone,
+            )
+        if candidate_move is None and result.board_changed:
+            candidate_move = derive_single_added_move(prev_board, result.board)
 
-            if candidate_move is None and result.board_changed:
-                candidate_move = derive_single_added_move(prev_board, result.board)
+        if candidate_move is not None:
+            self.push_recent_move(candidate_move)
+            self.latest_move_board_hash = result.board_hash_value
+        elif self.recent_moves:
+            self.latest_move = self.recent_moves[0]
+            self.latest_move_board_hash = result.board_hash_value
+        else:
+            self.latest_move = None
+            self.latest_move_board_hash = result.board_hash_value
 
-            if candidate_move is not None:
-                self.push_recent_move(candidate_move)
-                self.latest_move_board_hash = result.board_hash_value
-            elif self.recent_moves:
-                self.latest_move = self.recent_moves[0]
-                self.latest_move_board_hash = result.board_hash_value
-            else:
-                self.latest_move = None
-                self.latest_move_board_hash = result.board_hash_value
-
-            if result.current_turn != self.my_color:
-                self.lastmove_reference_board = result.board.copy()
-                self.lastmove_reference_hash = result.board_hash_value
+        if result.current_turn != self.my_color:
+            self.lastmove_reference_board = result.board.copy()
+            self.lastmove_reference_hash = result.board_hash_value
 
         self.sync_latest_move_label()
-
         if result.current_turn is None:
             self.turn_label.setText("当前轮次：无法判断")
         else:
@@ -1431,7 +1522,6 @@ class ScreenMonitorWidget(QWidget):
         self.update_phase_label()
         self.refresh_controls()
         self.update_overlay()
-
         if self.pending_manual_request:
             self.maybe_submit_infer_job(request_manual_infer=True)
         else:
@@ -1444,7 +1534,6 @@ class ScreenMonitorWidget(QWidget):
         future = self.infer_future
         self.infer_future = None
         self.infer_busy = False
-
         try:
             result: InferResult = future.result()
         except Exception as exc:
@@ -1462,7 +1551,7 @@ class ScreenMonitorWidget(QWidget):
         if result.predicted:
             self.suggested_move = result.move
             self.last_suggested_hash = result.board_hash_value
-            self.model_label.setText(f"模型建议：{result.model_msg or '-'}")
+            self.set_model_message(result.model_msg)
             self.render_preview()
             self.update_overlay()
 
@@ -1493,7 +1582,7 @@ def main(cfg: DictConfig) -> None:
     widget = ScreenMonitorWidget(cfg=cfg, model_manager=model_manager)
 
     window = QMainWindow()
-    window.setWindowTitle("screen_monitor_v12")
+    window.setWindowTitle("screen_monitor_mcts")
     window.resize(410, 760)
     window.setFixedWidth(410)
     window.setWindowFlag(Qt.WindowStaysOnTopHint, True)
@@ -1501,7 +1590,56 @@ def main(cfg: DictConfig) -> None:
     status_bar = QStatusBar(window)
     window.setStatusBar(status_bar)
 
-    
+    menu = window.menuBar().addMenu("&Menu")
+
+    def load_single_checkpoint() -> None:
+        path = QFileDialog.getOpenFileName(window, "Open Checkpoint", filter="*.pt")[0]
+        if not path:
+            return
+        try:
+            model_manager.load_single(path)
+            if hasattr(model_manager, "reset_search_tree"):
+                model_manager.reset_search_tree()
+            status_bar.showMessage(f"Single checkpoint: {path}")
+        except Exception as exc:
+            QMessageBox.critical(window, "错误", f"加载模型失败：{exc}")
+
+    def load_black_checkpoint() -> None:
+        path = QFileDialog.getOpenFileName(window, "Open Black Checkpoint", filter="*.pt")[0]
+        if not path:
+            return
+        try:
+            model_manager.load_black(path)
+            if hasattr(model_manager, "reset_search_tree"):
+                model_manager.reset_search_tree()
+            status_bar.showMessage(f"Black checkpoint: {path}")
+        except Exception as exc:
+            QMessageBox.critical(window, "错误", f"加载黑棋模型失败：{exc}")
+
+    def load_white_checkpoint() -> None:
+        path = QFileDialog.getOpenFileName(window, "Open White Checkpoint", filter="*.pt")[0]
+        if not path:
+            return
+        try:
+            model_manager.load_white(path)
+            if hasattr(model_manager, "reset_search_tree"):
+                model_manager.reset_search_tree()
+            status_bar.showMessage(f"White checkpoint: {path}")
+        except Exception as exc:
+            QMessageBox.critical(window, "错误", f"加载白棋模型失败：{exc}")
+
+    load_single_action = QAction("Load Single Checkpoint", window)
+    load_single_action.triggered.connect(load_single_checkpoint)
+    menu.addAction(load_single_action)
+
+    load_black_action = QAction("Load Black Checkpoint", window)
+    load_black_action.triggered.connect(load_black_checkpoint)
+    menu.addAction(load_black_action)
+
+    load_white_action = QAction("Load White Checkpoint", window)
+    load_white_action.triggered.connect(load_white_checkpoint)
+    menu.addAction(load_white_action)
+
     window.show()
     sys.exit(app.exec_())
 

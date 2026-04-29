@@ -24,19 +24,24 @@ It evaluates the real rectangular payoff matrix:
     black_vs_white_payoff[i, j] = score of black_model_i as black
                                  against white_model_j as white
 
-Then it computes role-separated Elo:
+Then it computes role-separated Elo by joint maximum likelihood with a shared
+black-first-move alpha term.
 
-    black Elo: compare black models through their performance against the same white pool
-    white Elo: compare white models through their performance against the same black pool
+Joint role-separated MLE:
+    P(black_i scores against white_j) = sigmoid(alpha + black_skill_i - white_skill_j)
+
+The reported black skills and white skills are centered separately, so each
+role-specific Elo pool has mean 1200. Alpha is reported separately as the
+fitted global black advantage in Elo points. Black Elo and white Elo are two
+role-specific scales; predictions use black_elo - white_elo + black_advantage_elo.
 
 For reporting, it also writes synthetic square model-vs-model payoff matrices:
 
     black_model_payoff_for_elo.csv
     white_model_payoff_for_elo.csv
 
-Those square matrices are derived from common-opponent logit strengths, not from
-illegal black-vs-black or white-vs-white games. They are useful for Elo curves and
-for explaining black-model-vs-black-model / white-model-vs-white-model ordering.
+Those square matrices are derived from MLE role-specific skills, not from
+illegal black-vs-black or white-vs-white games.
 """
 
 from __future__ import annotations
@@ -48,6 +53,7 @@ import math
 import os
 import re
 import sys
+import warnings
 from collections import OrderedDict, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -113,6 +119,11 @@ class EvalConfig:
     step_max: int | None
     step_mod: int | None
     limit_per_temporal: int | None
+    elo_l2: float
+    elo_max_iter: int
+    elo_patience: int
+    elo_lr: float
+    elo_min_delta: float
 
 
 # -----------------------------------------------------------------------------
@@ -500,37 +511,78 @@ def eval_black_score(
     return float(np.mean(scores))
 
 
-def _logit(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    x = np.clip(np.asarray(x, dtype=np.float64), eps, 1.0 - eps)
-    return np.log(x / (1.0 - x))
-
-
 def _sigmoid(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=np.float64)
-    return 1.0 / (1.0 + np.exp(-x))
+    out = np.empty_like(x, dtype=np.float64)
+    pos = x >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
+    exp_x = np.exp(x[~pos])
+    out[~pos] = exp_x / (1.0 + exp_x)
+    return out
 
 
-def strength_to_elo(strength_logit: np.ndarray, average_rating: float = 1200.0) -> np.ndarray:
-    """Convert centered logit strengths to Elo ratings."""
-    strength = np.asarray(strength_logit, dtype=np.float64)
-    centered = strength - np.mean(strength)
-    return centered * (400.0 / math.log(10.0)) + float(average_rating)
+def _skill_to_elo_from_centered_skill(
+    centered_skill_logit: np.ndarray,
+    average_rating: float = 1200.0,
+) -> np.ndarray:
+    """
+    Convert centered logit-scale skills to Elo.
+
+    Standard Elo:
+        p = 1 / (1 + 10^(-(R_A - R_B) / 400))
+
+    Therefore:
+        R_A - R_B = logit(p) * 400 / ln(10)
+    """
+    centered_skill = np.asarray(centered_skill_logit, dtype=np.float64)
+    return centered_skill * (400.0 / math.log(10.0)) + float(average_rating)
 
 
-def role_elos_from_black_vs_white_payoff(
+def fit_role_mle_with_alpha(
     black_vs_white_payoff: np.ndarray,
     average_rating: float = 1200.0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    games_per_pair: int = 1024,
+    l2: float = 1e-4,
+    max_iter: int = 5000,
+    patience: int = 100,
+    lr: float = 0.05,
+    min_delta: float = 1e-10,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    dict,
+]:
     """
-    Compute role-separated Elo from the real rectangular matrix.
+    Fit one joint role-separated Bradley-Terry / logistic Elo model with alpha.
 
-    Returns:
-        black_elo: shape [num_black]
-        white_elo: shape [num_white]
-        black_model_payoff: synthetic square matrix among black models
-        white_model_payoff: synthetic square matrix among white models
-        black_strength: centered common-opponent logit strengths before Elo scale
-        white_strength: centered common-opponent logit strengths before Elo scale
+    Input:
+        raw[i, j] = black_model_i's score as BLACK against white_model_j as WHITE
+
+    Model:
+        P(black_i scores against white_j) = sigmoid(alpha + black_skill_i - white_skill_j)
+
+    Identifiability:
+        black_skill is centered to mean 0.
+        white_skill is centered to mean 0.
+
+    Interpretation:
+        black_elo_i = average_rating + black_skill_i * 400 / ln(10)
+        white_elo_j = average_rating + white_skill_j * 400 / ln(10)
+        black_advantage_elo = alpha * 400 / ln(10)
+
+        Predicted black score:
+            sigmoid((black_elo_i - white_elo_j + black_advantage_elo) * ln(10) / 400)
+
+    Optimization:
+        Adam minimizes the binomial negative log-likelihood.
+        Early stopping triggers when the best training loss has not improved for
+        `patience` consecutive iterations.
     """
     raw = np.asarray(black_vs_white_payoff, dtype=np.float64)
     if raw.ndim != 2:
@@ -539,25 +591,198 @@ def role_elos_from_black_vs_white_payoff(
         raise ValueError("empty payoff matrix")
     if np.isnan(raw).any():
         raise ValueError("black_vs_white_payoff still contains NaN values; finish evaluation first.")
+    if np.any(raw < 0.0) or np.any(raw > 1.0):
+        raise ValueError("black_vs_white_payoff values must be in [0, 1].")
 
-    # Black model i's strength: average log-odds of black_i beating the same white pool.
-    black_strength = _logit(raw).mean(axis=1)
+    num_black, num_white = raw.shape
+    games_np = np.full_like(raw, float(games_per_pair), dtype=np.float64)
 
-    # White model j's strength: average log-odds of white_j beating the same black pool.
-    white_scores = 1.0 - raw
-    white_strength = _logit(white_scores).mean(axis=0)
+    y = torch.tensor(raw, dtype=torch.float64)
+    n = torch.tensor(games_np, dtype=torch.float64)
 
-    black_elo = strength_to_elo(black_strength, average_rating=average_rating)
-    white_elo = strength_to_elo(white_strength, average_rating=average_rating)
+    black_raw = torch.zeros(num_black, dtype=torch.float64, requires_grad=True)
+    white_raw = torch.zeros(num_white, dtype=torch.float64, requires_grad=True)
+    alpha = torch.zeros((), dtype=torch.float64, requires_grad=True)
 
-    # Derived square payoff matrices inside each role pool.
-    # P(i beats k) = sigmoid(strength_i - strength_k).
-    black_model_payoff = _sigmoid(black_strength[:, None] - black_strength[None, :])
-    white_model_payoff = _sigmoid(white_strength[:, None] - white_strength[None, :])
+    optimizer = torch.optim.Adam([black_raw, white_raw, alpha], lr=float(lr))
+
+    def objective() -> torch.Tensor:
+        black_skill = black_raw - black_raw.mean()
+        white_skill = white_raw - white_raw.mean()
+        logits = alpha + black_skill[:, None] - white_skill[None, :]
+
+        bce = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits,
+            y,
+            reduction="none",
+        )
+        loss = (bce * n).sum() / n.sum().clamp_min(1.0)
+
+        if l2 > 0:
+            loss = loss + float(l2) * (
+                black_skill.square().mean()
+                + white_skill.square().mean()
+                + alpha.square()
+            )
+        return loss
+
+    best_loss = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
+    best_iter = 0
+    bad_count = 0
+    last_loss = float("inf")
+    loss_history: list[float] = []
+
+    for iteration in range(1, int(max_iter) + 1):
+        optimizer.zero_grad()
+        loss = objective()
+        loss.backward()
+        optimizer.step()
+
+        last_loss = float(loss.detach().cpu().item())
+        loss_history.append(last_loss)
+
+        if last_loss < best_loss - float(min_delta):
+            best_loss = last_loss
+            best_iter = iteration
+            bad_count = 0
+            with torch.no_grad():
+                best_state = {
+                    "black_raw": black_raw.detach().clone(),
+                    "white_raw": white_raw.detach().clone(),
+                    "alpha": alpha.detach().clone(),
+                }
+        else:
+            bad_count += 1
+
+        if bad_count >= int(patience):
+            break
+
+    if best_state is not None:
+        with torch.no_grad():
+            black_raw.copy_(best_state["black_raw"])
+            white_raw.copy_(best_state["white_raw"])
+            alpha.copy_(best_state["alpha"])
+
+    with torch.no_grad():
+        black_skill = (black_raw - black_raw.mean()).detach().cpu().numpy()
+        white_skill = (white_raw - white_raw.mean()).detach().cpu().numpy()
+        alpha_logit = float(alpha.detach().cpu().item())
+
+    pred_black_score = _sigmoid(alpha_logit + black_skill[:, None] - white_skill[None, :])
+    pred_white_score = 1.0 - pred_black_score.T
+
+    black_elo = _skill_to_elo_from_centered_skill(black_skill, average_rating=average_rating)
+    white_elo = _skill_to_elo_from_centered_skill(white_skill, average_rating=average_rating)
+    black_advantage_elo = alpha_logit * (400.0 / math.log(10.0))
+
+    # Derived square payoff inside each same-role pool. These are not real games;
+    # they are a visualization of fitted relative skills within the same role.
+    black_model_payoff = _sigmoid(black_skill[:, None] - black_skill[None, :])
+    white_model_payoff = _sigmoid(white_skill[:, None] - white_skill[None, :])
     np.fill_diagonal(black_model_payoff, 0.5)
     np.fill_diagonal(white_model_payoff, 0.5)
 
-    return black_elo, white_elo, black_model_payoff, white_model_payoff, black_strength, white_strength
+    eps = 1e-12
+    pred_clip = np.clip(pred_black_score, eps, 1.0 - eps)
+    nll = -np.sum(
+        games_np
+        * (
+            raw * np.log(pred_clip)
+            + (1.0 - raw) * np.log(1.0 - pred_clip)
+        )
+    )
+    nll_per_game = float(nll / max(np.sum(games_np), 1.0))
+    rmse = float(np.sqrt(np.mean((pred_black_score - raw) ** 2)))
+
+    diagnostics = {
+        "model": "sigmoid(alpha + black_skill_i - white_skill_j)",
+        "average_rating": float(average_rating),
+        "games_per_pair": int(games_per_pair),
+        "l2": float(l2),
+        "max_iter": int(max_iter),
+        "patience": int(patience),
+        "lr": float(lr),
+        "min_delta": float(min_delta),
+        "iterations_run": int(len(loss_history)),
+        "best_iter": int(best_iter),
+        "stopped_early": bool(len(loss_history) < int(max_iter)),
+        "best_training_loss_with_l2": float(best_loss),
+        "last_training_loss_with_l2": float(last_loss),
+        "nll_per_game_without_l2": nll_per_game,
+        "rmse": rmse,
+        "alpha_logit": float(alpha_logit),
+        "black_advantage_elo": float(black_advantage_elo),
+        "black_skill_mean": float(np.mean(black_skill)),
+        "white_skill_mean": float(np.mean(white_skill)),
+        "black_skill_std": float(np.std(black_skill)),
+        "white_skill_std": float(np.std(white_skill)),
+        "loss_history_head": [float(x) for x in loss_history[:20]],
+        "loss_history_tail": [float(x) for x in loss_history[-20:]],
+        "note": (
+            "Black and white skills are fitted jointly with one shared alpha. "
+            "black_elo and white_elo are centered separately to average_rating. "
+            "Predicted black score uses black_elo - white_elo + black_advantage_elo."
+        ),
+    }
+
+    return (
+        black_elo,
+        white_elo,
+        black_model_payoff,
+        white_model_payoff,
+        black_skill,
+        white_skill,
+        pred_black_score,
+        pred_white_score,
+        diagnostics,
+    )
+
+
+def role_elos_from_black_vs_white_payoff_mle_with_alpha(
+    black_vs_white_payoff: np.ndarray,
+    average_rating: float = 1200.0,
+    games_per_pair: int = 1024,
+    l2: float = 1e-4,
+    max_iter: int = 5000,
+    patience: int = 100,
+    lr: float = 0.05,
+    min_delta: float = 1e-10,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    dict,
+]:
+    """
+    Compute role-separated MLE Elo from the real rectangular black-vs-white matrix.
+
+    Input:
+        raw[i, j] = black_model_i's score as black against white_model_j as white
+
+    Joint model:
+        P(black_i scores against white_j) = sigmoid(alpha + black_skill_i - white_skill_j)
+
+    This is the alpha-based method:
+        - black_skill_i compares black models inside the black role pool.
+        - white_skill_j compares white models inside the white role pool.
+        - alpha captures the global black first-move advantage.
+    """
+    return fit_role_mle_with_alpha(
+        black_vs_white_payoff=black_vs_white_payoff,
+        average_rating=average_rating,
+        games_per_pair=games_per_pair,
+        l2=l2,
+        max_iter=max_iter,
+        patience=patience,
+        lr=lr,
+        min_delta=min_delta,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -617,7 +842,7 @@ def save_role_elo_csv(
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["name", "color", "temporal_steps", "step", "elo", "common_opponent_logit_strength", "path"])
+        writer.writerow(["name", "color", "temporal_steps", "step", "elo", "mle_skill_logit", "path"])
         for model, rating, strength in zip(models, elo, role_strength):
             writer.writerow(
                 [
@@ -644,7 +869,7 @@ def save_combined_elo_csv(
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["name", "color", "temporal_steps", "step", "elo", "common_opponent_logit_strength", "path"])
+        writer.writerow(["name", "color", "temporal_steps", "step", "elo", "mle_skill_logit", "path"])
         for model, rating, strength in zip(black_models, black_elo, black_strength):
             writer.writerow([model.name, model.color, model.temporal_steps, model.step, f"{float(rating):.6f}", f"{float(strength):.8f}", model.path])
         for model, rating, strength in zip(white_models, white_elo, white_strength):
@@ -658,10 +883,11 @@ def save_meta_json(path: Path, config: EvalConfig, black_models: list[RoleModel]
         "white_models": [asdict(v) for v in white_models],
         "meaning": {
             "black_vs_white_payoff": "row black model's score as black against column white model as white",
-            "black_elo": "role-separated black-model Elo computed from common white-opponent pool",
-            "white_elo": "role-separated white-model Elo computed from common black-opponent pool",
-            "black_model_payoff_for_elo": "derived square payoff among black models from common-opponent logit strengths",
-            "white_model_payoff_for_elo": "derived square payoff among white models from common-opponent logit strengths",
+            "black_elo": "role-separated black-model MLE Elo from joint alpha model; mean centered to 1200",
+            "white_elo": "role-separated white-model MLE Elo from joint alpha model; mean centered to 1200",
+            "black_advantage_elo": "fitted global first-move advantage for black, used as black_elo - white_elo + black_advantage_elo",
+            "black_model_payoff_for_elo": "derived square payoff among black models from MLE black skills",
+            "white_model_payoff_for_elo": "derived square payoff among white models from MLE white skills",
         },
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -770,6 +996,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=str, default="elo_eval_outputs")
     parser.add_argument("--average-rating", type=float, default=1200.0)
+    parser.add_argument("--elo-l2", type=float, default=1e-4, help="L2 regularization for MLE Elo fitting.")
+    parser.add_argument("--elo-max-iter", type=int, default=5000, help="Maximum Adam iterations for MLE Elo fitting.")
+    parser.add_argument("--elo-patience", type=int, default=100, help="Early stop after this many iterations without best-loss improvement.")
+    parser.add_argument("--elo-lr", type=float, default=0.05, help="Adam learning rate for MLE Elo fitting.")
+    parser.add_argument("--elo-min-delta", type=float, default=1e-10, help="Minimum best-loss improvement required to reset patience.")
     parser.add_argument("--cache-size", type=int, default=4)
     parser.add_argument(
         "--interaction",
@@ -829,6 +1060,11 @@ def main() -> None:
         step_max=args.step_max,
         step_mod=args.step_mod,
         limit_per_temporal=args.limit_per_temporal,
+        elo_l2=float(args.elo_l2),
+        elo_max_iter=int(args.elo_max_iter),
+        elo_patience=int(args.elo_patience),
+        elo_lr=float(args.elo_lr),
+        elo_min_delta=float(args.elo_min_delta),
     )
 
     black_models, white_models = discover_role_models(
@@ -927,11 +1163,33 @@ def main() -> None:
         white_model_payoff,
         black_strength,
         white_strength,
-    ) = role_elos_from_black_vs_white_payoff(payoff, average_rating=args.average_rating)
+        pred_black_score,
+        pred_white_score,
+        mle_diagnostics,
+    ) = role_elos_from_black_vs_white_payoff_mle_with_alpha(
+        payoff,
+        average_rating=args.average_rating,
+        games_per_pair=int(args.num_envs) * int(args.num_repeats),
+        l2=args.elo_l2,
+        max_iter=args.elo_max_iter,
+        patience=args.elo_patience,
+        lr=args.elo_lr,
+        min_delta=args.elo_min_delta,
+    )
 
     save_matrix_csv(payoff_path, payoff, black_labels, white_labels, row_header="black_model")
     save_matrix_csv(output_dir / "black_model_payoff_for_elo.csv", black_model_payoff, black_labels, black_labels, row_header="black_model")
     save_matrix_csv(output_dir / "white_model_payoff_for_elo.csv", white_model_payoff, white_labels, white_labels, row_header="white_model")
+
+    # MLE predictions:
+    #   pred_black_score rows = black models, columns = white models.
+    #   pred_white_score rows = white models, columns = black models.
+    save_matrix_csv(output_dir / "mle_predicted_black_score.csv", pred_black_score, black_labels, white_labels, row_header="black_model")
+    save_matrix_csv(output_dir / "mle_predicted_white_score.csv", pred_white_score, white_labels, black_labels, row_header="white_model")
+    (output_dir / "mle_with_alpha_diagnostics.json").write_text(
+        json.dumps(mle_diagnostics, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     save_role_elo_csv(output_dir / "black_elo_ratings.csv", black_models, black_elo, black_strength)
     save_role_elo_csv(output_dir / "white_elo_ratings.csv", white_models, white_elo, white_strength)
@@ -945,8 +1203,8 @@ def main() -> None:
         white_strength,
     )
 
-    plot_role_curve(output_dir / "black_elo_curve.png", black_models, black_elo, "Black-model Elo curve")
-    plot_role_curve(output_dir / "white_elo_curve.png", white_models, white_elo, "White-model Elo curve")
+    plot_role_curve(output_dir / "black_elo_curve.png", black_models, black_elo, "Black-model MLE Elo curve")
+    plot_role_curve(output_dir / "white_elo_curve.png", white_models, white_elo, "White-model MLE Elo curve")
     plot_combined_role_curve(output_dir / "role_elo_curve.png", black_models, black_elo, white_models, white_elo)
 
     print("\n[RESULT] Black-model Elo ratings:")
@@ -957,10 +1215,16 @@ def main() -> None:
     for model, rating in sorted(zip(white_models, white_elo), key=lambda x: (x[0].temporal_steps, x[0].step)):
         print(f"  {model.name:>20s}  Elo={rating:8.2f}")
 
+    print("\n[RESULT] Fitted global black advantage:")
+    print(f"  alpha_logit={mle_diagnostics['alpha_logit']:.8f}")
+    print(f"  black_advantage_elo={mle_diagnostics['black_advantage_elo']:.2f}")
+    print(f"  MLE iterations={mle_diagnostics['iterations_run']}  best_iter={mle_diagnostics['best_iter']}  stopped_early={mle_diagnostics['stopped_early']}")
+
     print(f"\n[DONE] real payoff:       {payoff_path}")
     print(f"[DONE] black Elo csv:    {output_dir / 'black_elo_ratings.csv'}")
     print(f"[DONE] white Elo csv:    {output_dir / 'white_elo_ratings.csv'}")
     print(f"[DONE] combined Elo csv: {output_dir / 'role_elo_ratings.csv'}")
+    print(f"[DONE] diagnostics:      {output_dir / 'mle_with_alpha_diagnostics.json'}")
     print(f"[DONE] combined figure:  {output_dir / 'role_elo_curve.png'}")
 
 

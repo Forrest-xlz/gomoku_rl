@@ -6,7 +6,7 @@
       6
     ],
     "board_size": 15,
-    "num_envs": 1024,
+    "num_envs": 2048,
     "num_repeats": 1,
     "device": "cuda",
     "algo_cfg": "C:\\Users\\Liuluotu\\Desktop\\gomoku_rl\\cfg\\algo\\ppo.yaml",
@@ -18,16 +18,14 @@
     "step_min": null,
     "step_max": null,
     "step_mod": null,
-    "limit_per_temporal": null
+    "limit_per_temporal": null,
+    "elo_l2": 0.0001,
+    "elo_max_iter": 5000,
+    "elo_patience": 100,
+    "elo_lr": 0.05,
+    "elo_min_delta": 1e-10
   },
   "black_models": [
-    {
-      "name": "black_t1_s00000",
-      "color": "black",
-      "temporal_steps": 1,
-      "step": 0,
-      "path": "C:\\Users\\Liuluotu\\Desktop\\gomoku_rl\\elo_models\\temporal_features_1\\black\\black_00000.pt"
-    },
     {
       "name": "black_t1_s00300",
       "color": "black",
@@ -349,13 +347,6 @@
       "temporal_steps": 1,
       "step": 12800,
       "path": "C:\\Users\\Liuluotu\\Desktop\\gomoku_rl\\elo_models\\temporal_features_1\\black\\black_12800.pt"
-    },
-    {
-      "name": "black_t6_s00000",
-      "color": "black",
-      "temporal_steps": 6,
-      "step": 0,
-      "path": "C:\\Users\\Liuluotu\\Desktop\\gomoku_rl\\elo_models\\temporal_feaures_6\\black\\black_00000.pt"
     },
     {
       "name": "black_t6_s00300",
@@ -801,13 +792,6 @@
   ],
   "white_models": [
     {
-      "name": "white_t1_s00000",
-      "color": "white",
-      "temporal_steps": 1,
-      "step": 0,
-      "path": "C:\\Users\\Liuluotu\\Desktop\\gomoku_rl\\elo_models\\temporal_features_1\\white\\white_00000.pt"
-    },
-    {
       "name": "white_t1_s00300",
       "color": "white",
       "temporal_steps": 1,
@@ -1128,13 +1112,6 @@
       "temporal_steps": 1,
       "step": 12800,
       "path": "C:\\Users\\Liuluotu\\Desktop\\gomoku_rl\\elo_models\\temporal_features_1\\white\\white_12800.pt"
-    },
-    {
-      "name": "white_t6_s00000",
-      "color": "white",
-      "temporal_steps": 6,
-      "step": 0,
-      "path": "C:\\Users\\Liuluotu\\Desktop\\gomoku_rl\\elo_models\\temporal_feaures_6\\white\\white_00000.pt"
     },
     {
       "name": "white_t6_s00300",
@@ -1580,9 +1557,10 @@
   ],
   "meaning": {
     "black_vs_white_payoff": "row black model's score as black against column white model as white",
-    "black_elo": "role-separated black-model Elo computed from common white-opponent pool",
-    "white_elo": "role-separated white-model Elo computed from common black-opponent pool",
-    "black_model_payoff_for_elo": "derived square payoff among black models from common-opponent logit strengths",
-    "white_model_payoff_for_elo": "derived square payoff among white models from common-opponent logit strengths"
+    "black_elo": "role-separated black-model MLE Elo from joint alpha model; mean centered to 1200",
+    "white_elo": "role-separated white-model MLE Elo from joint alpha model; mean centered to 1200",
+    "black_advantage_elo": "fitted global first-move advantage for black, used as black_elo - white_elo + black_advantage_elo",
+    "black_model_payoff_for_elo": "derived square payoff among black models from MLE black skills",
+    "white_model_payoff_for_elo": "derived square payoff among white models from MLE white skills"
   }
 }
