@@ -1,0 +1,88 @@
+seed: 0
+num_envs: 512 # 512
+board_size: 15
+device: cuda
+out_device: cpu
+run_dir:
+version_name: psro-dota-style-global-role-elo-temporal-6
+augment: false
+
+epochs: 20000
+steps: 128
+save_interval: 300
+log_interval: 5
+
+black_checkpoint: wandb/run-20260430_075302-h1d1f876/files/black_0900.pt
+white_checkpoint: wandb/run-20260430_075302-h1d1f876/files/white_0900.pt
+
+# ---------------- Dota/OpenAI-Five-style model-pool self-play ----------------
+# f: 训练用模型池权重文件夹。内部按 black/white 分开保存角色池模型。
+f: model_pool
+
+# e: 训练用模型池元信息 JSON。为空时默认使用 ${f}/pool_meta.json。
+# 继续训练时指向旧 e，可以恢复 quality score 和历史权重路径。
+e: wandb/run-20260430_075302-h1d1f876/files/pool_meta_0900.json
+
+# p: 使用 current_black vs current_white 自博弈的概率。
+# 1-p: 从训练模型池按角色分别 softmax(quality)：当前黑抽历史白，当前白抽历史黑。
+p: 0.8
+
+# l: 训练模型池 quality score 学习率，对应 OpenAI Five 里的 eta。
+l: 0.15
+
+# m: 每 m 个 epoch，把当前 black 权重加入 black_pool，把当前 white 权重加入 white_pool。
+# m <= 0 表示不自动加入训练池。
+m: 10
+
+# ---------------- Global Elo evaluation pool --------------------------------
+# elo_models: 全局测评池文件夹。只用于测评，不参与训练采样。
+elo_models: elo_models
+
+# 每隔多少 epoch 把当前 black/white 权重加入 elo_models，并补全 payoff 矩阵缺失项。
+# 例如 100 表示 epoch=100,200,300,... 时评估一次。
+elo_interval: 200
+
+# 每个 black_i vs white_j 调用 eval_win_rate 的重复次数。
+# 实际局数约为 eval_env.num_envs * elo_eval_repeats；Runner 默认 eval_env.num_envs=512。
+elo_eval_repeats: 1
+
+# Elo MLE 参数。这里拟合 role-separated Elo + alpha：
+# P(black_i scores against white_j)=sigmoid(alpha + black_skill_i - white_skill_j)。
+# black_elo 和 white_elo 分别以均值 elo_base 为中心；alpha 单独表示黑棋先手优势。
+elo_base: 1200.0
+elo_scale: 400.0
+elo_l2: 0.0001
+elo_mle_iters: 5000
+elo_mle_lr: 0.05
+elo_mle_patience: 100
+
+# action pruning settings
+action_pruning:
+  enabled: true
+
+# observation settings
+use_temporal_feature: true
+temporal_num_steps: 6
+
+# 已删除 baseline eval；这里保留为空，避免 Runner 基类构建固定 baseline pool。
+eval_baseline_pool:
+  black_pool: []
+  white_pool: []
+
+# 黑白平衡控制：仍然用 current_black vs current_white 做 EMA，不再用 baseline。
+balance:
+  enabled: false
+  lower: 0.3
+  upper: 0.7
+  ema_alpha: 0.33
+
+wandb:
+  name: ${version_name}
+  group: ${board_size}_${board_size}_${algo.name}_PSRO_DotaStyle_GlobalRoleElo
+  project: gomoku_rl
+  mode: online
+
+defaults:
+  - _self_
+  - algo: ppo
+  - baseline: ppo
