@@ -3,10 +3,8 @@ num_envs: 512
 board_size: 15
 device: cuda
 out_device: cpu
-
 run_dir:
 version_name: inrl-temporal-6
-
 augment: false
 
 epochs: 10000
@@ -14,45 +12,41 @@ steps: 128
 save_interval: 300
 log_interval: 5
 
-black_checkpoint: 
-white_checkpoint: 
+# If training resumes from pretrained checkpoints, set this to the global epoch
+# represented by those checkpoints. Example: checkpoint is black_01000.pt and
+# white_01000.pt -> pretrain_epoch_offset: 1000. After another 100 epochs,
+# the saved checkpoint becomes black_01100.pt / white_01100.pt.
+pretrain_epoch_offset: 0
+black_checkpoint:
+white_checkpoint:
 
-# action pruning settings
+# Action pruning settings.
 action_pruning:
   enabled: true
 
-# 新增：是否启用“当前局面 + 前 n 手 one-hot 落点图”
+# Observation settings.
+# temporal_move_history total channels = 2 + temporal_num_steps.
 use_temporal_feature: true
-# n 的含义：保留最近 n 手落点，每手一个 one-hot 平面
-# 开启后总通道数 = 2 + temporal_num_steps
-# 其中前 2 层是 [当前执子方棋子平面, 对手棋子平面]
 temporal_num_steps: 6
 
-# eval baseline 池：
-# - black_pool 里的模型会作为黑方 baseline，去和当前 white 对打；
-# - white_pool 里的模型会作为白方 baseline，去和当前 black 对打；
-# - 日志命名为 baseline1、baseline2...（按列表顺序，1-based）。
-#
-# 例子：
-# eval_baseline_pool:
-#   black_pool:
-#     - D:\gomoku_ckpts\black_a.pt
-#     - D:\gomoku_ckpts\black_b.pt
-#   white_pool:
-#     - D:\gomoku_ckpts\white_a.pt
-#     - D:\gomoku_ckpts\white_b.pt
-eval_baseline_pool:
-  black_pool: [pretrained_models\15_15\ppo\0.pt, wandb\run-20260411_070144-l2znhhtp\files\black_final.pt]
-  white_pool: [pretrained_models\15_15\ppo\0.pt, wandb\run-20260411_070144-l2znhhtp\files\white_final.pt]
 
-# 新的双网络平衡控制。
-# 语义：
-# - 保留每 log_interval 个 epoch 做一次 black vs white 评估；
-# - raw eval/black_vs_white 保持原样；
-# - 对 raw 值做 EMA，得到 eval/black_vs_white_ema；
-# - 若 EMA > upper，则“下一次 rollout 只更新 white”；
-# - 若 EMA < lower，则“下一次 rollout 只更新 black”；
-# - 该单边更新只持续 1 个 rollout，之后自动恢复双边同时更新。
+# Training-time Elo model pool. Same mechanism as PSRO.
+# - elo_models stores checkpoint files.
+# - elo_e / elo_meta stores model entries + payoff matrix.
+# - If metadata is empty, the starting current model is registered once.
+# - If metadata is non-empty, the starting checkpoint is not auto-added.
+elo_models: elo_models
+elo_e:
+elo_interval: 300
+elo_eval_repeats: 1
+elo_base: 1200.0
+elo_scale: 400.0
+elo_mle_iters: 1000
+elo_mle_lr: 0.05
+elo_mle_patience: 100
+elo_l2: 0.0001
+
+# Black/white balance control.
 balance:
   enabled: true
   lower: 0.3
@@ -63,9 +57,8 @@ wandb:
   name: ${version_name}
   group: ${board_size}_${board_size}_${algo.name}_InRL
   project: gomoku_rl
-  mode: online # set to 'disabled' when debugging locally
+  mode: online
 
 defaults:
   - _self_
   - algo: ppo
-  - baseline: ppo

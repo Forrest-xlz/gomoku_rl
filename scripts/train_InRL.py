@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import hydra
 from omegaconf import DictConfig, OmegaConf
+
 from gomoku_rl import CONFIG_PATH
-from gomoku_rl.utils.wandb import init_wandb
 from gomoku_rl.runner import IndependentRLRunner
+from gomoku_rl.utils.wandb import init_wandb
 
 
 @hydra.main(version_base=None, config_path=CONFIG_PATH, config_name="train_InRL")
