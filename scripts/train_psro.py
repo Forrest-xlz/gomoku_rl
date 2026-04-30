@@ -1,37 +1,17 @@
 """
 Dota-style self-play / PSRO training entry for Forrest-xlz/gomoku_rl.
 
-This script keeps the original Independent-RL two-network style:
-    current black policy + current white policy
-
-Training:
-- With probability p, collect current_black vs current_white self-play data.
-- With probability 1-p, use role-separated historical pools:
-    * sample a historical white policy to train current_black;
-    * sample a historical black policy to train current_white.
-- The training model pool keeps weights in folder f and metadata in JSON e.
-- Black and white pools maintain independent quality scores. When current_black
-  beats a sampled historical white, only that white entry is lowered; when
-  current_white beats a sampled historical black, only that black entry is lowered.
-
-Evaluation:
-- Baseline evaluation is removed.
-- Every elo_interval epochs, current black/white weights are added to a global
-  elo_models folder.
-- A single global black-vs-white payoff matrix is maintained in elo_models/payoff.json.
-- Only missing black_i-vs-white_j entries are evaluated.
-- Role-separated Elo is fitted by maximum likelihood with one shared alpha:
-      P(black_i scores against white_j) = sigmoid(alpha + black_skill_i - white_skill_j)
-  The MLE uses early stopping and logs role-separated black/white Elo plus alpha.
-
-Put this file at:
-    scripts/train_psro.py
-
-Run example:
-    python scripts/train_psro.py \
-        p=0.8 l=0.01 m=10 \
-        f=model_pool e=model_pool/pool_meta.json \
-        elo_models=elo_models elo_interval=100
+Key changes in this version:
+1. The Elo evaluation pool is metadata-driven like the training model pool.
+   - `elo_models` only stores checkpoint files.
+   - `elo_e` / `elo_meta` points to the JSON metadata file.
+   - The JSON metadata stores both Elo entries and payoff matrix.
+   - If the Elo metadata is empty at training start, the current pretrained model
+     is registered once; otherwise no initial Elo model is added.
+2. Checkpoint naming uses 5 digits: black_01000.pt, white_01000.pt, etc.
+3. `pretrain_epoch_offset` controls the global epoch number for resumed training.
+   Example: pretrain_epoch_offset=1000 and after 100 local epochs -> black_01100.pt.
+4. Training-pool and Elo-pool metadata snapshots are saved into the wandb run dir.
 """
 
 from __future__ import annotations
@@ -44,6 +24,7 @@ import os
 import random
 import re
 import time
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -57,11 +38,17 @@ from tqdm import tqdm
 
 from gomoku_rl import CONFIG_PATH
 from gomoku_rl.collector import BlackPlayCollector, VersusPlayCollector, WhitePlayCollector
-from gomoku_rl.runner.base import Runner
 from gomoku_rl.policy import get_policy
+from gomoku_rl.policy.common import make_critic, make_ppo_ac, make_ppo_actor
+from gomoku_rl.runner.base import Runner
 from gomoku_rl.utils.eval import eval_win_rate
 from gomoku_rl.utils.misc import add_prefix
 from gomoku_rl.utils.wandb import init_wandb
+
+
+# Defensive only. The root fix is that fixed pool/Elo opponents below no longer
+# construct TorchRL PPO loss modules.
+sys.setrecursionlimit(max(10000, sys.getrecursionlimit()))
 
 
 # -----------------------------------------------------------------------------
@@ -94,6 +81,115 @@ def _atomic_json_dump(obj: Any, path: str | os.PathLike[str]) -> None:
     os.replace(tmp_path, out_path)
 
 
+def _wandb_save_file(path: str | os.PathLike[str], *, base_path: str | os.PathLike[str] | None = None) -> None:
+    """Best-effort wandb.save; local/offline/no-wandb runs should never fail because of this."""
+    if wandb.run is None:
+        return
+    try:
+        kwargs = {}
+        if base_path is not None:
+            kwargs["base_path"] = str(base_path)
+        wandb.save(str(path), **kwargs)
+    except Exception as exc:  # pragma: no cover - logging only
+        logging.warning("wandb.save failed for %s: %s", path, exc)
+
+
+
+# -----------------------------------------------------------------------------
+# Inference-only policy helpers
+# -----------------------------------------------------------------------------
+
+
+class PPOInferencePolicy:
+    """Lightweight PPO policy for fixed historical/Elo opponents.
+
+    The normal PPO class constructs ClipPPOLoss and an optimizer in __init__ and
+    again in load_state_dict(). That is correct for trainable current policies,
+    but wasteful and fragile for fixed opponents that are used only for rollout
+    and Elo evaluation. In long self-play runs, repeatedly creating thousands of
+    TorchRL loss modules can accumulate very deep TensorDict decorator stacks and
+    eventually crash with RecursionError during the current policy's PPO update.
+
+    This wrapper builds only actor + critic, loads only actor/critic weights, and
+    deliberately never constructs ClipPPOLoss or optimizer state.
+    """
+
+    def __init__(self, cfg: DictConfig, action_spec, observation_spec, device: Any = "cuda") -> None:
+        self.cfg = cfg
+        self.device = device
+        if bool(cfg.get("share_network")):
+            actor_value_operator = make_ppo_ac(
+                cfg,
+                action_spec=action_spec,
+                observation_spec=observation_spec,
+                device=self.device,
+            )
+            self.actor = actor_value_operator.get_policy_operator()
+            self.critic = actor_value_operator.get_value_head()
+        else:
+            self.actor = make_ppo_actor(
+                cfg=cfg,
+                action_spec=action_spec,
+                observation_spec=observation_spec,
+                device=self.device,
+            )
+            self.critic = make_critic(
+                cfg=cfg,
+                observation_spec=observation_spec,
+                device=self.device,
+            )
+
+        fake_input = observation_spec.zero()
+        try:
+            fake_input = fake_input.to(self.device)
+        except Exception:
+            pass
+        if "action_mask" in fake_input.keys():
+            fake_input["action_mask"] = ~fake_input["action_mask"]
+        with torch.no_grad():
+            self.actor(fake_input.clone())
+            self.critic(fake_input.clone())
+        self.eval()
+        self.requires_grad_(False)
+
+    def requires_grad_(self, requires_grad: bool = False):
+        for module in (self.actor, self.critic):
+            for param in module.parameters():
+                param.requires_grad_(requires_grad)
+        return self
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        if "actor" not in state_dict or "critic" not in state_dict:
+            raise KeyError("checkpoint must contain 'actor' and 'critic' keys")
+        self.critic.load_state_dict(state_dict["critic"], strict=False)
+        self.actor.load_state_dict(state_dict["actor"])
+        self.eval()
+        self.requires_grad_(False)
+
+    def train(self):
+        # Historical/Elo policies must remain fixed. Keep this method for API
+        # compatibility, but never enable gradients or training-mode BN updates.
+        self.eval()
+        return self
+
+    def eval(self):
+        self.actor.eval()
+        self.critic.eval()
+        return self
+
+    @torch.no_grad()
+    def __call__(self, tensordict):
+        tensordict = tensordict.to(self.device)
+        actor_input = tensordict.select("observation", "action_mask", strict=False)
+        actor_output = self.actor(actor_input)
+        actor_output = actor_output.exclude("probs")
+        tensordict.update(actor_output)
+        critic_input = tensordict.select("hidden", "observation", strict=False)
+        critic_output = self.critic(critic_input)
+        tensordict.update(critic_output)
+        return tensordict
+
+
 # -----------------------------------------------------------------------------
 # Training model pool: role-separated OpenAI-Five-style historical opponents
 # -----------------------------------------------------------------------------
@@ -103,9 +199,8 @@ def _atomic_json_dump(obj: Any, path: str | os.PathLike[str]) -> None:
 class RolePoolEntry:
     """One historical checkpoint for one role in the training pool.
 
-    role="black" entries are historical black policies used as opponents for
-    current_white. role="white" entries are historical white policies used as
-    opponents for current_black.
+    role="black" entries are historical black policies used as opponents for current_white.
+    role="white" entries are historical white policies used as opponents for current_black.
     """
 
     id: str
@@ -124,18 +219,6 @@ class RoleSeparatedDiskPolicyPool:
     Metadata is kept in one JSON file, but black and white pools have independent
     entries and independent quality scores. This is important for Gomoku because
     black and white are not interchangeable roles.
-
-    JSON layout:
-        {
-          "schema_version": 3,
-          "black_entries": [...],
-          "white_entries": [...]
-        }
-
-    Backward compatibility:
-        If an older pair-level JSON contains "entries" with black_path and
-        white_path, it is converted on load into one black entry and one white
-        entry with the old pair quality copied to both roles.
     """
 
     SCHEMA_VERSION = 3
@@ -185,7 +268,6 @@ class RoleSeparatedDiskPolicyPool:
         p = Path(path).expanduser()
         if p.is_absolute():
             return str(p.resolve())
-
         p_meta = (self.meta_path.parent / p).resolve()
         if p_meta.exists():
             return str(p_meta)
@@ -314,7 +396,7 @@ class RoleSeparatedDiskPolicyPool:
         if role not in self.ROLES:
             raise ValueError(f"unknown role: {role}")
         safe_prefix = _sanitize_id(prefix)
-        entry_id = f"{role}_{safe_prefix}_{self.run_id}_e{epoch:06d}"
+        entry_id = f"{role}_{safe_prefix}_{self.run_id}_e{epoch:05d}"
         role_dir = self.pool_dir / role
         role_dir.mkdir(parents=True, exist_ok=True)
         ckpt_path = role_dir / f"{entry_id}.pt"
@@ -372,13 +454,14 @@ class RoleSeparatedDiskPolicyPool:
         *,
         black_state_dict: dict[str, Any],
         white_state_dict: dict[str, Any],
+        epoch: int = 0,
     ) -> list[RolePoolEntry]:
         added: list[RolePoolEntry] = []
         if len(self.black_entries) == 0:
             added.append(
                 self.add_current_role(
                     role="black",
-                    epoch=0,
+                    epoch=epoch,
                     state_dict=black_state_dict,
                     prefix="initial",
                     source="initial_current",
@@ -388,7 +471,7 @@ class RoleSeparatedDiskPolicyPool:
             added.append(
                 self.add_current_role(
                     role="white",
-                    epoch=0,
+                    epoch=epoch,
                     state_dict=white_state_dict,
                     prefix="initial",
                     source="initial_current",
@@ -411,11 +494,9 @@ class RoleSeparatedDiskPolicyPool:
             raise IndexError(f"{role} pool index out of range: {index}")
         if pool_lr <= 0.0:
             return 0.0
-
         win_rate = max(0.0, min(1.0, float(current_win_rate)))
         if win_rate <= 0.0:
             return 0.0
-
         n = max(1, len(entries))
         p_i = max(float(sample_prob), min_prob)
         delta = float(pool_lr) * win_rate / (n * p_i)
@@ -425,13 +506,13 @@ class RoleSeparatedDiskPolicyPool:
 
 
 # -----------------------------------------------------------------------------
-# Global Elo league: one payoff matrix, no fixed baselines
+# Metadata-driven Elo evaluation pool
 # -----------------------------------------------------------------------------
 
 
 @dataclass
 class EloEntry:
-    """One black/white checkpoint pair used only for global Elo evaluation."""
+    """One black/white checkpoint pair used only for Elo evaluation."""
 
     id: str
     epoch: int
@@ -445,41 +526,40 @@ class EloEntry:
 
 
 class GlobalEloLeague:
-    """
-    Global checkpoint league.
+    """Global checkpoint league with metadata-driven entries and payoff matrix.
 
-    Payoff convention:
-        payoff[black_id][white_id] = black win rate when black_id.black plays
-                                      against white_id.white.
-
-    Elo convention:
-        The real rectangular black-vs-white payoff matrix is fitted directly:
-            P(black_i scores against white_j)
-                = sigmoid(alpha + black_skill_i - white_skill_j)
-        This yields role-separated black Elo, role-separated white Elo, and one
-        shared black-first-move advantage alpha.
+    `elo_dir` stores checkpoint files. `meta_path` stores entries + payoff matrix,
+    so resuming evaluation is controlled by metadata just like the training pool.
+    A legacy payoff.json is still written for compatibility with old tooling.
     """
 
-    META_SCHEMA_VERSION = 1
+    META_SCHEMA_VERSION = 2
     PAYOFF_SCHEMA_VERSION = 1
 
     def __init__(
         self,
         elo_dir: str | os.PathLike[str],
+        meta_path: str | os.PathLike[str] | None,
         *,
         run_id: str,
         prevent_overwrite: bool = True,
     ) -> None:
         self.elo_dir = Path(elo_dir).expanduser().resolve()
         self.elo_dir.mkdir(parents=True, exist_ok=True)
-        self.meta_path = self.elo_dir / "elo_meta.json"
-        self.payoff_path = self.elo_dir / "payoff.json"
+        self.meta_path = (
+            Path(meta_path).expanduser().resolve()
+            if meta_path is not None and str(meta_path).strip()
+            else self.elo_dir / "elo_meta.json"
+        )
+        self.meta_path.parent.mkdir(parents=True, exist_ok=True)
+        self.payoff_path = self.elo_dir / "payoff.json"  # legacy/standalone compatibility
         self.ratings_csv_path = self.elo_dir / "elo_ratings.csv"
         self.ratings_json_path = self.elo_dir / "elo_ratings.json"
         self.run_id = _sanitize_id(run_id)
         self.prevent_overwrite = bool(prevent_overwrite)
         self.entries: list[EloEntry] = []
         self.payoff: dict[str, dict[str, dict[str, Any]]] = {}
+        self.extra: dict[str, Any] = {}
         self.load()
 
     def __len__(self) -> int:
@@ -492,50 +572,70 @@ class GlobalEloLeague:
         p_meta = (self.meta_path.parent / p).resolve()
         if p_meta.exists():
             return str(p_meta)
+        p_elo = (self.elo_dir / p).resolve()
+        if p_elo.exists():
+            return str(p_elo)
         return str(Path(to_absolute_path(str(p))).expanduser().resolve())
 
     def load(self) -> None:
+        raw: dict[str, Any] = {}
         if self.meta_path.is_file():
             with self.meta_path.open("r", encoding="utf-8") as f:
                 raw = json.load(f)
-            entries: list[EloEntry] = []
-            for item in raw.get("entries", []):
-                entries.append(
-                    EloEntry(
-                        id=str(item["id"]),
-                        epoch=int(item.get("epoch", -1)),
-                        black_path=self._resolve_path(str(item["black_path"])),
-                        white_path=self._resolve_path(str(item["white_path"])),
-                        created_at=float(item.get("created_at", 0.0)),
-                        source=str(item.get("source", "loaded")),
-                        run_id=str(item.get("run_id", "")),
-                        parent_black_checkpoint=str(item.get("parent_black_checkpoint", "")),
-                        parent_white_checkpoint=str(item.get("parent_white_checkpoint", "")),
-                    )
-                )
-            self.entries = entries
-        else:
-            self.entries = []
 
-        if self.payoff_path.is_file():
+        self.extra = {
+            k: v
+            for k, v in raw.items()
+            if k not in {"schema_version", "elo_dir", "meta_path", "payoff_path", "updated_at", "entries", "payoff"}
+        }
+
+        entries: list[EloEntry] = []
+        for item in raw.get("entries", []):
+            entries.append(
+                EloEntry(
+                    id=str(item["id"]),
+                    epoch=int(item.get("epoch", -1)),
+                    black_path=self._resolve_path(str(item["black_path"])),
+                    white_path=self._resolve_path(str(item["white_path"])),
+                    created_at=float(item.get("created_at", 0.0)),
+                    source=str(item.get("source", "loaded")),
+                    run_id=str(item.get("run_id", "")),
+                    parent_black_checkpoint=str(item.get("parent_black_checkpoint", "")),
+                    parent_white_checkpoint=str(item.get("parent_white_checkpoint", "")),
+                )
+            )
+        self.entries = entries
+
+        # New schema: payoff is inside elo_meta.json.
+        self.payoff = raw.get("payoff", {}) if isinstance(raw.get("payoff", {}), dict) else {}
+
+        # Backward compatibility: older train_psro used a separate payoff.json.
+        if not self.payoff and self.payoff_path.is_file():
             with self.payoff_path.open("r", encoding="utf-8") as f:
                 raw_payoff = json.load(f)
             self.payoff = raw_payoff.get("payoff", {})
-        else:
-            self.payoff = {}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.META_SCHEMA_VERSION,
+            "elo_dir": str(self.elo_dir),
+            "meta_path": str(self.meta_path),
+            "payoff_path": str(self.payoff_path),
+            "updated_at": _now(),
+            "entries": [asdict(entry) for entry in self.entries],
+            "payoff": self.payoff,
+            **self.extra,
+        }
+
+    def save(self, path: str | os.PathLike[str] | None = None) -> None:
+        out_path = Path(path).expanduser().resolve() if path is not None else self.meta_path
+        _atomic_json_dump(self.to_dict(), out_path)
 
     def save_meta(self) -> None:
-        _atomic_json_dump(
-            {
-                "schema_version": self.META_SCHEMA_VERSION,
-                "elo_dir": str(self.elo_dir),
-                "updated_at": _now(),
-                "entries": [asdict(entry) for entry in self.entries],
-            },
-            self.meta_path,
-        )
+        self.save(self.meta_path)
 
     def save_payoff(self) -> None:
+        # Keep a legacy payoff.json file as well, but the source of truth is elo_meta.json.
         _atomic_json_dump(
             {
                 "schema_version": self.PAYOFF_SCHEMA_VERSION,
@@ -545,10 +645,11 @@ class GlobalEloLeague:
             },
             self.payoff_path,
         )
+        self.save_meta()
 
     def _target_paths(self, *, epoch: int, prefix: str) -> tuple[str, Path, Path]:
         safe_prefix = _sanitize_id(prefix)
-        entry_id = f"{safe_prefix}_{self.run_id}_e{epoch:06d}"
+        entry_id = f"{safe_prefix}_{self.run_id}_e{epoch:05d}"
         black_path = self.elo_dir / f"black_{entry_id}.pt"
         white_path = self.elo_dir / f"white_{entry_id}.pt"
         return entry_id, black_path, white_path
@@ -569,18 +670,14 @@ class GlobalEloLeague:
     ) -> EloEntry:
         entry_id, black_path, white_path = self._target_paths(epoch=epoch, prefix=prefix)
         if self.has_entry(entry_id):
-            # Idempotent behavior when the same epoch is retried in the same run.
             for entry in self.entries:
                 if entry.id == entry_id:
                     return entry
         if self.prevent_overwrite and (black_path.exists() or white_path.exists()):
-            raise FileExistsError(
-                f"Refusing to overwrite Elo checkpoints: {black_path}, {white_path}"
-            )
+            raise FileExistsError(f"Refusing to overwrite Elo checkpoints: {black_path}, {white_path}")
 
         torch.save(black_state_dict, black_path)
         torch.save(white_state_dict, white_path)
-
         entry = EloEntry(
             id=entry_id,
             epoch=int(epoch),
@@ -602,14 +699,7 @@ class GlobalEloLeague:
             return None
         return float(item["black_win_rate"])
 
-    def set_score(
-        self,
-        *,
-        black_id: str,
-        white_id: str,
-        black_win_rate: float,
-        eval_repeats: int,
-    ) -> None:
+    def set_score(self, *, black_id: str, white_id: str, black_win_rate: float, eval_repeats: int) -> None:
         self.payoff.setdefault(black_id, {})[white_id] = {
             "black_win_rate": float(black_win_rate),
             "eval_repeats": int(eval_repeats),
@@ -652,29 +742,6 @@ class GlobalEloLeague:
         min_delta: float = 1e-10,
         games_per_pair: int = 1,
     ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, float]]:
-        """
-        Fit role-separated Elo with one shared black-first-move advantage alpha.
-
-        Payoff convention:
-            payoff[black_id][white_id] = black_id.black's score as black
-                                      against white_id.white as white.
-
-        MLE model:
-            P(black_i scores against white_j)
-                = sigmoid(alpha + black_skill_i - white_skill_j)
-
-        Identifiability:
-            black_skill is centered to mean 0.
-            white_skill is centered to mean 0.
-
-        Reported ratings:
-            black_elo_i = base_elo + black_skill_i * elo_scale / ln(10)
-            white_elo_j = base_elo + white_skill_j * elo_scale / ln(10)
-            black_advantage_elo = alpha * elo_scale / ln(10)
-
-        This matches the alpha-based payoff-matrix MLE style used by the
-        standalone role-separated Elo script.
-        """
         n = len(self.entries)
         if n == 0:
             empty_summary = {
@@ -689,7 +756,6 @@ class GlobalEloLeague:
         obs_white_idx: list[int] = []
         obs_score: list[float] = []
         obs_weight: list[float] = []
-
         for i, black_entry in enumerate(self.entries):
             for j, white_entry in enumerate(self.entries):
                 score = self.get_score(black_entry.id, white_entry.id)
@@ -736,7 +802,6 @@ class GlobalEloLeague:
         idx_w = torch.tensor(obs_white_idx, dtype=torch.long, device=device)
         y = torch.tensor(obs_score, dtype=torch.float64, device=device)
         weights = torch.tensor(obs_weight, dtype=torch.float64, device=device)
-
         black_raw = torch.zeros(n, dtype=torch.float64, requires_grad=True, device=device)
         white_raw = torch.zeros(n, dtype=torch.float64, requires_grad=True, device=device)
         alpha = torch.zeros((), dtype=torch.float64, requires_grad=True, device=device)
@@ -746,17 +811,11 @@ class GlobalEloLeague:
             black_skill = black_raw - black_raw.mean()
             white_skill = white_raw - white_raw.mean()
             logits = alpha + black_skill[idx_b] - white_skill[idx_w]
-            bce = torch.nn.functional.binary_cross_entropy_with_logits(
-                logits,
-                y,
-                reduction="none",
-            )
+            bce = torch.nn.functional.binary_cross_entropy_with_logits(logits, y, reduction="none")
             loss = (bce * weights).sum() / weights.sum().clamp_min(1.0)
             if l2 > 0:
                 loss = loss + float(l2) * (
-                    black_skill.square().mean()
-                    + white_skill.square().mean()
-                    + alpha.square()
+                    black_skill.square().mean() + white_skill.square().mean() + alpha.square()
                 )
             return loss
 
@@ -768,13 +827,12 @@ class GlobalEloLeague:
         max_iter = max(1, int(iters))
         patience_i = max(1, int(patience))
         min_delta_f = float(min_delta)
-
+        iteration = 0
         for iteration in range(1, max_iter + 1):
             optimizer.zero_grad(set_to_none=True)
             loss = objective()
             loss.backward()
             optimizer.step()
-
             last_loss = float(loss.detach().cpu().item())
             if last_loss < best_loss - min_delta_f:
                 best_loss = last_loss
@@ -788,7 +846,6 @@ class GlobalEloLeague:
                     }
             else:
                 bad_count += 1
-
             if bad_count >= patience_i:
                 break
 
@@ -879,15 +936,7 @@ class GlobalEloLeague:
         self._save_role_ratings(black_rows, white_rows, combined_rows, summary)
         return {"black": black_rows, "white": white_rows, "combined": combined_rows}, summary
 
-    def _rating_row(
-        self,
-        entry: EloEntry,
-        *,
-        role: str,
-        rating: float,
-        skill: float,
-        rank: int,
-    ) -> dict[str, Any]:
+    def _rating_row(self, entry: EloEntry, *, role: str, rating: float, skill: float, rank: int) -> dict[str, Any]:
         return {
             "rank": int(rank),
             "id": entry.id,
@@ -957,36 +1006,12 @@ class GlobalEloLeague:
         write_csv(
             self.elo_dir / "black_elo_ratings.csv",
             black_rows,
-            [
-                "rank",
-                "id",
-                "role",
-                "run_id",
-                "epoch",
-                "elo",
-                "mle_skill_logit",
-                "source",
-                "path",
-                "black_path",
-                "white_path",
-            ],
+            ["rank", "id", "role", "run_id", "epoch", "elo", "mle_skill_logit", "source", "path", "black_path", "white_path"],
         )
         write_csv(
             self.elo_dir / "white_elo_ratings.csv",
             white_rows,
-            [
-                "rank",
-                "id",
-                "role",
-                "run_id",
-                "epoch",
-                "elo",
-                "mle_skill_logit",
-                "source",
-                "path",
-                "black_path",
-                "white_path",
-            ],
+            ["rank", "id", "role", "run_id", "epoch", "elo", "mle_skill_logit", "source", "path", "black_path", "white_path"],
         )
         write_csv(
             self.ratings_csv_path,
@@ -1021,29 +1046,25 @@ class DotaStylePSRORunner(Runner):
     _MODE_WHITE_ONLY = "white_only"
 
     def __init__(self, cfg: DictConfig) -> None:
-        # Runner.__init__ in the original project eagerly builds eval_baseline_pool.
-        # train_psro does not use the old fixed-baseline evaluation, so force this
-        # field to be empty before calling super().__init__(cfg). This makes the
-        # script robust even if the active Hydra config inherited old baseline
-        # paths such as pretrained_models/15_15/ppo/0.pt.
+        # train_psro does not use old fixed-baseline evaluation.
         with open_dict(cfg):
             cfg.eval_baseline_pool = {"black_pool": [], "white_pool": []}
-
         super().__init__(cfg)
 
         self.log_interval = int(self.cfg.get("log_interval", 5))
+        self.pretrain_epoch_offset = int(self.cfg.get("pretrain_epoch_offset", 0))
+        if self.pretrain_epoch_offset < 0:
+            raise ValueError(f"pretrain_epoch_offset must be >= 0, got {self.pretrain_epoch_offset}")
+
         seed = self.cfg.get("seed", None)
         self._rng = random.Random(None if seed is None else int(seed))
         self.run_id = _sanitize_id(_get_run_id())
-
         self.self_play_prob = float(self.cfg.get("p", self.cfg.get("self_play_prob", 0.8)))
         self.pool_lr = float(self.cfg.get("l", self.cfg.get("pool_lr", 0.01)))
-        self.add_to_pool_interval = int(
-            self.cfg.get("m", self.cfg.get("add_to_pool_interval", 10))
-        )
+        self.add_to_pool_interval = int(self.cfg.get("m", self.cfg.get("add_to_pool_interval", 10)))
+
         pool_dir = self.cfg.get("f", self.cfg.get("model_pool_dir", "model_pool"))
         meta_path = self.cfg.get("e", self.cfg.get("model_pool_meta", None))
-
         if not (0.0 <= self.self_play_prob <= 1.0):
             raise ValueError(f"p/self_play_prob must be in [0, 1], got {self.self_play_prob}")
         if self.pool_lr < 0.0:
@@ -1051,11 +1072,7 @@ class DotaStylePSRORunner(Runner):
 
         self.pool = RoleSeparatedDiskPolicyPool(
             pool_dir=to_absolute_path(str(pool_dir)),
-            meta_path=(
-                to_absolute_path(str(meta_path))
-                if meta_path is not None and str(meta_path).strip()
-                else None
-            ),
+            meta_path=(to_absolute_path(str(meta_path)) if meta_path is not None and str(meta_path).strip() else None),
             run_id=self.run_id,
             prevent_overwrite=True,
         )
@@ -1068,9 +1085,7 @@ class DotaStylePSRORunner(Runner):
             self.pool.meta_path,
         )
 
-        self.elo_interval = int(
-            self.cfg.get("elo_interval", self.cfg.get("add_to_elo_interval", 100))
-        )
+        self.elo_interval = int(self.cfg.get("elo_interval", self.cfg.get("add_to_elo_interval", 100)))
         self.elo_eval_repeats = int(self.cfg.get("elo_eval_repeats", 1))
         self.elo_include_self = True
         self.elo_base = float(self.cfg.get("elo_base", 1200.0))
@@ -1079,16 +1094,20 @@ class DotaStylePSRORunner(Runner):
         self.elo_mle_lr = float(self.cfg.get("elo_mle_lr", 0.05))
         self.elo_mle_patience = int(self.cfg.get("elo_mle_patience", 100))
         self.elo_l2 = float(self.cfg.get("elo_l2", 1e-4))
+
         elo_dir = self.cfg.get("elo_models", self.cfg.get("elo_models_dir", "elo_models"))
+        elo_meta = self.cfg.get("elo_e", self.cfg.get("elo_meta", self.cfg.get("elo_models_meta", None)))
         self.elo_league = GlobalEloLeague(
             elo_dir=to_absolute_path(str(elo_dir)),
+            meta_path=(to_absolute_path(str(elo_meta)) if elo_meta is not None and str(elo_meta).strip() else None),
             run_id=self.run_id,
             prevent_overwrite=True,
         )
         logging.info(
-            "Global Elo league loaded: size=%d, dir=%s",
+            "Global Elo league loaded: size=%d, dir=%s, meta=%s",
             len(self.elo_league),
             self.elo_league.elo_dir,
+            self.elo_league.meta_path,
         )
 
         self._self_collector = VersusPlayCollector(
@@ -1102,6 +1121,7 @@ class DotaStylePSRORunner(Runner):
         added_pool_entries = self.pool.ensure_non_empty(
             black_state_dict=self.policy_black.state_dict(),
             white_state_dict=self.policy_white.state_dict(),
+            epoch=self.pretrain_epoch_offset,
         )
         if added_pool_entries:
             logging.info(
@@ -1109,9 +1129,11 @@ class DotaStylePSRORunner(Runner):
                 ", ".join(entry.id for entry in added_pool_entries),
             )
 
+        # Important: only add the starting current model if the Elo metadata is empty.
+        # If `elo_e` points to an existing metadata file, that file fully controls the Elo pool.
         if len(self.elo_league) == 0:
             entry = self.elo_league.add_current_pair(
-                epoch=0,
+                epoch=self.pretrain_epoch_offset,
                 black_state_dict=self.policy_black.state_dict(),
                 white_state_dict=self.policy_white.state_dict(),
                 prefix="elo_init",
@@ -1119,7 +1141,9 @@ class DotaStylePSRORunner(Runner):
                 parent_black_checkpoint=str(self.cfg.get("black_checkpoint", "") or ""),
                 parent_white_checkpoint=str(self.cfg.get("white_checkpoint", "") or ""),
             )
-            logging.info("Added initial current policies to Elo league: %s", entry.id)
+            logging.info("Added initial current policies to empty Elo league: %s", entry.id)
+        else:
+            logging.info("Elo metadata is non-empty; current start checkpoint is not auto-added.")
 
         balance_cfg = self.cfg.get("balance", {})
         self.balance_enabled = bool(balance_cfg.get("enabled", True))
@@ -1127,18 +1151,27 @@ class DotaStylePSRORunner(Runner):
         self.balance_upper = float(balance_cfg.get("upper", 0.60))
         self.balance_ema_alpha = float(balance_cfg.get("ema_alpha", 0.20))
         if not (0.0 <= self.balance_lower < self.balance_upper <= 1.0):
-            raise ValueError(
-                f"invalid balance bounds: lower={self.balance_lower}, upper={self.balance_upper}"
-            )
+            raise ValueError(f"invalid balance bounds: lower={self.balance_lower}, upper={self.balance_upper}")
         if not (0.0 < self.balance_ema_alpha <= 1.0):
-            raise ValueError(
-                f"invalid balance ema_alpha: {self.balance_ema_alpha}, expected in (0, 1]"
-            )
+            raise ValueError(f"invalid balance ema_alpha: {self.balance_ema_alpha}, expected in (0, 1]")
+
         self.black_vs_white_ema: float | None = None
         self.current_bias_mode = self._MODE_BOTH
         self.bias_turn_next = False
 
+    # ---------------------------- epoch helpers ----------------------------
+
+    def _completed_epoch(self, local_epoch: int) -> int:
+        return int(self.pretrain_epoch_offset + local_epoch + 1)
+
+    def _checkpoint_epoch(self, local_epoch: int) -> int:
+        return int(self.pretrain_epoch_offset + local_epoch + 1)
+
+    def _epoch_label(self, epoch_value: int) -> str:
+        return f"{int(epoch_value):05d}"
+
     # ---------------------------- balance helpers ----------------------------
+
     def _applied_mode_to_flags(self, mode: str) -> dict[str, float]:
         return {
             "balance/applied_both": float(mode == self._MODE_BOTH),
@@ -1155,11 +1188,7 @@ class DotaStylePSRORunner(Runner):
 
     def _phase_flags(self) -> dict[str, float]:
         if self.current_bias_mode == self._MODE_BOTH:
-            return {
-                "balance/bias_active": 0.0,
-                "balance/next_turn_biased": 0.0,
-                "balance/next_turn_both": 1.0,
-            }
+            return {"balance/bias_active": 0.0, "balance/next_turn_biased": 0.0, "balance/next_turn_both": 1.0}
         return {
             "balance/bias_active": 1.0,
             "balance/next_turn_biased": float(self.bias_turn_next),
@@ -1178,10 +1207,7 @@ class DotaStylePSRORunner(Runner):
         if self.black_vs_white_ema is None:
             ema = black_vs_white_raw
         else:
-            ema = (
-                self.balance_ema_alpha * black_vs_white_raw
-                + (1.0 - self.balance_ema_alpha) * self.black_vs_white_ema
-            )
+            ema = self.balance_ema_alpha * black_vs_white_raw + (1.0 - self.balance_ema_alpha) * self.black_vs_white_ema
         self.black_vs_white_ema = float(ema)
         return self.black_vs_white_ema
 
@@ -1215,6 +1241,7 @@ class DotaStylePSRORunner(Runner):
         return applied_mode
 
     # ------------------------------ learn helpers -----------------------------
+
     def _learn_black(self, data_black, info: dict[str, Any]) -> None:
         if data_black is None:
             info["policy_black/update_skipped_empty_data"] = 1.0
@@ -1227,13 +1254,7 @@ class DotaStylePSRORunner(Runner):
             return
         info.update(add_prefix(self.policy_white.learn(data_white.to_tensordict()), "policy_white/"))
 
-    def _apply_learning(
-        self,
-        applied_mode: str,
-        data_black,
-        data_white,
-        info: dict[str, Any],
-    ) -> None:
+    def _apply_learning(self, applied_mode: str, data_black, data_white, info: dict[str, Any]) -> None:
         info.update(self._applied_mode_to_flags(applied_mode))
         info["balance/black_update_skipped"] = float(applied_mode == self._MODE_WHITE_ONLY)
         info["balance/white_update_skipped"] = float(applied_mode == self._MODE_BLACK_ONLY)
@@ -1242,19 +1263,31 @@ class DotaStylePSRORunner(Runner):
         if applied_mode in (self._MODE_BOTH, self._MODE_WHITE_ONLY):
             self._learn_white(data_white, info)
 
+    def _build_inference_policy_from_checkpoint(self, checkpoint_path: str, *, tag: str):
+        """Build a fixed inference-only policy from a checkpoint.
 
-    def _build_current_algo_policy_from_checkpoint(self, checkpoint_path: str, *, tag: str):
-        """Build a policy with the current training algo/env specs and load a checkpoint.
-
-        This is intentionally different from Runner._build_baseline_policy_from_checkpoint(),
-        which uses cfg.baseline and may create a legacy 3-channel baseline model.
-        The PSRO pool and global Elo league store checkpoints produced by the current
-        train_psro run, so they must be loaded with cfg.algo and self.env.observation_spec
-        to preserve temporal-feature channel count, e.g. 2 + temporal_num_steps.
+        Pool and Elo policies are never trained inside this runner. Loading them
+        through the full PPO class would also construct ClipPPOLoss + optimizer
+        every time, which is unnecessary and can trigger TensorDict/TorchRL
+        recursion growth in long runs.
         """
         checkpoint_path = str(checkpoint_path)
         if not Path(checkpoint_path).is_file():
             raise FileNotFoundError(f"{tag} not found: {checkpoint_path}")
+
+        if str(self.cfg.algo.name).lower() == "ppo":
+            policy = PPOInferencePolicy(
+                cfg=self.cfg.algo,
+                action_spec=self.env.action_spec,
+                observation_spec=self.env.observation_spec,
+                device=self.env.device,
+            )
+            state = torch.load(checkpoint_path, map_location=self.env.device)
+            policy.load_state_dict(state)
+            logging.info("%s:%s", tag, checkpoint_path)
+            return policy
+
+        # Fallback for non-PPO algorithms.
         policy = get_policy(
             name=self.cfg.algo.name,
             cfg=self.cfg.algo,
@@ -1264,9 +1297,16 @@ class DotaStylePSRORunner(Runner):
         )
         self._load_policy_checkpoint(policy, checkpoint_path, tag)
         policy.eval()
+        for attr in ("loss_module", "optim", "optimizer"):
+            if hasattr(policy, attr):
+                try:
+                    delattr(policy, attr)
+                except Exception:
+                    pass
         return policy
 
     # ------------------------------ rollout modes -----------------------------
+
     def _rollout_current_self_play(self, applied_mode: str) -> dict[str, Any]:
         data_black, data_white, raw_info = self._self_collector.rollout(self.steps)
         info: dict[str, Any] = add_prefix(raw_info, "self_play/")
@@ -1279,18 +1319,14 @@ class DotaStylePSRORunner(Runner):
     def _load_role_pool_policy(self, entry: RolePoolEntry):
         if not Path(entry.path).is_file():
             raise FileNotFoundError(f"pool {entry.role} checkpoint not found: {entry.path}")
-        return self._build_current_algo_policy_from_checkpoint(
-            entry.path, tag=f"pool_{entry.role}/{entry.id}"
-        )
+        return self._build_inference_policy_from_checkpoint(entry.path, tag=f"pool_{entry.role}/{entry.id}")
 
     def _rollout_against_pool(self, applied_mode: str, epoch: int) -> dict[str, Any]:
-        # Role-separated pool:
-        #   white pool entries are historical WHITE opponents for current_black.
-        #   black pool entries are historical BLACK opponents for current_white.
         if self.pool.role_size("black") == 0 or self.pool.role_size("white") == 0:
             self.pool.ensure_non_empty(
                 black_state_dict=self.policy_black.state_dict(),
                 white_state_dict=self.policy_white.state_dict(),
+                epoch=self.pretrain_epoch_offset,
             )
 
         info: dict[str, Any] = {"train/source_self_play": 0.0}
@@ -1298,22 +1334,21 @@ class DotaStylePSRORunner(Runner):
         data_black = None
         data_white = None
         sampled_policies: list[Any] = []
+        global_epoch = self._completed_epoch(epoch)
 
         # Train current black against a sampled historical white.
         if applied_mode in (self._MODE_BOTH, self._MODE_BLACK_ONLY):
             white_idx, white_entry, white_sample_prob = self.pool.sample("white", self._rng)
             hist_white = self._load_role_pool_policy(white_entry)
             sampled_policies.append(hist_white)
-
             info.update(
                 {
                     "pool_white/sampled_index": float(white_idx),
                     "pool_white/sampled_epoch": float(white_entry.epoch),
-                    "pool_white/sampled_relative_epoch_ratio": float((white_entry.epoch - (epoch + 1)) / max(epoch + 1, 1)),
+                    "pool_white/sampled_relative_epoch_ratio": float((white_entry.epoch - global_epoch) / max(global_epoch, 1)),
                     "pool_white/sampled_prob": float(white_sample_prob),
                 }
             )
-
             black_collector = BlackPlayCollector(
                 self.env,
                 policy_black=self.policy_black,
@@ -1326,7 +1361,6 @@ class DotaStylePSRORunner(Runner):
             black_prefixed_info.pop("pool_black_train/white_win", None)
             info.update(black_prefixed_info)
             fps_parts.append(float(black_info.get("fps", 0.0)))
-
             current_black_win = float(black_info.get("black_win", 0.0))
             info["pool_white/current_black_win_rate"] = current_black_win
             white_delta = self.pool.update_after_current_win_rate(
@@ -1343,16 +1377,14 @@ class DotaStylePSRORunner(Runner):
             black_idx, black_entry, black_sample_prob = self.pool.sample("black", self._rng)
             hist_black = self._load_role_pool_policy(black_entry)
             sampled_policies.append(hist_black)
-
             info.update(
                 {
                     "pool_black/sampled_index": float(black_idx),
                     "pool_black/sampled_epoch": float(black_entry.epoch),
-                    "pool_black/sampled_relative_epoch_ratio": float((black_entry.epoch - (epoch + 1)) / max(epoch + 1, 1)),
+                    "pool_black/sampled_relative_epoch_ratio": float((black_entry.epoch - global_epoch) / max(global_epoch, 1)),
                     "pool_black/sampled_prob": float(black_sample_prob),
                 }
             )
-
             white_collector = WhitePlayCollector(
                 self.env,
                 policy_black=hist_black,
@@ -1365,7 +1397,6 @@ class DotaStylePSRORunner(Runner):
             white_prefixed_info.pop("pool_white_train/black_win", None)
             info.update(white_prefixed_info)
             fps_parts.append(float(white_info.get("fps", 0.0)))
-
             current_white_win = float(white_info.get("white_win", 0.0))
             info["pool_black/current_white_win_rate"] = current_white_win
             black_delta = self.pool.update_after_current_win_rate(
@@ -1384,10 +1415,6 @@ class DotaStylePSRORunner(Runner):
             del policy
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-        # Temporary role-pool collectors share self.env with the persistent
-        # self-play collector, so reset self-play collector state after any pool
-        # rollout to avoid stale action masks and illegal moves.
         self._self_collector.reset()
         return info
 
@@ -1396,23 +1423,19 @@ class DotaStylePSRORunner(Runner):
             return
         if (epoch + 1) % self.add_to_pool_interval != 0:
             return
-
+        global_epoch = self._completed_epoch(epoch)
         black_entry, white_entry = self.pool.add_current_pair(
-            epoch=epoch + 1,
+            epoch=global_epoch,
             black_state_dict=self.policy_black.state_dict(),
             white_state_dict=self.policy_white.state_dict(),
             prefix="epoch",
         )
-        logging.info(
-            "Added current policies to role-separated training pool: black=%s white=%s",
-            black_entry.id,
-            white_entry.id,
-        )
+        info["pool/added_epoch"] = float(global_epoch)
+        logging.info("Added current policies to role-separated training pool: black=%s white=%s", black_entry.id, white_entry.id)
 
     def _epoch(self, epoch: int) -> dict[str, Any]:
         applied_mode = self._get_applied_mode_for_current_epoch()
         use_self_play = (self._rng.random() < self.self_play_prob) or len(self.pool) == 0
-
         if use_self_play:
             info = self._rollout_current_self_play(applied_mode)
         else:
@@ -1423,15 +1446,16 @@ class DotaStylePSRORunner(Runner):
                 "psro/self_play_prob": self.self_play_prob,
                 "psro/pool_lr": self.pool_lr,
                 "psro/add_to_pool_interval": float(self.add_to_pool_interval),
+                "time/local_epoch_completed": float(epoch + 1),
+                "time/global_epoch_completed": float(self._completed_epoch(epoch)),
+                "time/pretrain_epoch_offset": float(self.pretrain_epoch_offset),
                 "pool_black/size": float(self.pool.role_size("black")),
                 "pool_black/prob_variance": self.pool.prob_variance("black"),
                 "pool_white/size": float(self.pool.role_size("white")),
                 "pool_white/prob_variance": self.pool.prob_variance("white"),
                 "elo_eval/interval": float(self.elo_interval),
                 "elo_eval/num_models": float(len(self.elo_league)),
-                "elo_eval/payoff_coverage": self.elo_league.payoff_coverage(
-                    include_self=True
-                ),
+                "elo_eval/payoff_coverage": self.elo_league.payoff_coverage(include_self=True),
                 "balance/enabled": float(self.balance_enabled),
                 "balance/lower": self.balance_lower,
                 "balance/upper": self.balance_upper,
@@ -1445,40 +1469,28 @@ class DotaStylePSRORunner(Runner):
             info["eval/black_vs_white_ema"] = self.black_vs_white_ema
 
         self._maybe_add_current_to_pool(epoch, info)
-
         if epoch % 50 == 0 and epoch != 0 and torch.cuda.is_available():
             torch.cuda.empty_cache()
         return info
 
     # ------------------------------ global Elo eval ---------------------------
+
     def _load_elo_policy_pair(self, entry: EloEntry, *, load_black: bool, load_white: bool):
         black_policy = None
         white_policy = None
         if load_black:
             if not Path(entry.black_path).is_file():
                 raise FileNotFoundError(f"Elo black checkpoint not found: {entry.black_path}")
-            black_policy = self._build_current_algo_policy_from_checkpoint(
-                entry.black_path, tag=f"elo_black/{entry.id}"
-            )
+            black_policy = self._build_inference_policy_from_checkpoint(entry.black_path, tag=f"elo_black/{entry.id}")
         if load_white:
             if not Path(entry.white_path).is_file():
                 raise FileNotFoundError(f"Elo white checkpoint not found: {entry.white_path}")
-            white_policy = self._build_current_algo_policy_from_checkpoint(
-                entry.white_path, tag=f"elo_white/{entry.id}"
-            )
+            white_policy = self._build_inference_policy_from_checkpoint(entry.white_path, tag=f"elo_white/{entry.id}")
         return black_policy, white_policy
 
-    def _evaluate_one_payoff_pair(
-        self,
-        black_entry: EloEntry,
-        white_entry: EloEntry,
-    ) -> float:
-        black_policy, _ = self._load_elo_policy_pair(
-            black_entry, load_black=True, load_white=False
-        )
-        _, white_policy = self._load_elo_policy_pair(
-            white_entry, load_black=False, load_white=True
-        )
+    def _evaluate_one_payoff_pair(self, black_entry: EloEntry, white_entry: EloEntry) -> float:
+        black_policy, _ = self._load_elo_policy_pair(black_entry, load_black=True, load_white=False)
+        _, white_policy = self._load_elo_policy_pair(white_entry, load_black=False, load_white=True)
         assert black_policy is not None
         assert white_policy is not None
         try:
@@ -1502,8 +1514,9 @@ class DotaStylePSRORunner(Runner):
         if (epoch + 1) % self.elo_interval != 0:
             return
 
+        global_epoch = self._completed_epoch(epoch)
         entry = self.elo_league.add_current_pair(
-            epoch=epoch + 1,
+            epoch=global_epoch,
             black_state_dict=self.policy_black.state_dict(),
             white_state_dict=self.policy_white.state_dict(),
             prefix="elo",
@@ -1515,7 +1528,6 @@ class DotaStylePSRORunner(Runner):
         info["elo_eval/num_models"] = float(len(self.elo_league))
 
         missing = self.elo_league.missing_pairs(include_self=True)
-
         evaluated = 0
         start = time.perf_counter()
         for black_entry, white_entry in missing:
@@ -1536,10 +1548,7 @@ class DotaStylePSRORunner(Runner):
             lr=self.elo_mle_lr,
             patience=self.elo_mle_patience,
             min_delta=0.0,
-            games_per_pair=max(
-                1,
-                int(getattr(self.eval_env, "num_envs", 1)) * max(1, self.elo_eval_repeats),
-            ),
+            games_per_pair=max(1, int(getattr(self.eval_env, "num_envs", 1)) * max(1, self.elo_eval_repeats)),
         )
         elapsed = time.perf_counter() - start
 
@@ -1550,24 +1559,12 @@ class DotaStylePSRORunner(Runner):
         best_black_row = black_rows[0] if black_rows else None
         best_white_row = white_rows[0] if white_rows else None
 
-        current_black_elo = (
-            float(current_black_row["elo"]) if current_black_row is not None else float(self.elo_base)
-        )
-        current_white_elo = (
-            float(current_white_row["elo"]) if current_white_row is not None else float(self.elo_base)
-        )
-        current_black_rank = (
-            float(current_black_row["rank"]) if current_black_row is not None else 1.0
-        )
-        current_white_rank = (
-            float(current_white_row["rank"]) if current_white_row is not None else 1.0
-        )
-        best_black_elo = (
-            float(best_black_row["elo"]) if best_black_row is not None else current_black_elo
-        )
-        best_white_elo = (
-            float(best_white_row["elo"]) if best_white_row is not None else current_white_elo
-        )
+        current_black_elo = float(current_black_row["elo"]) if current_black_row is not None else float(self.elo_base)
+        current_white_elo = float(current_white_row["elo"]) if current_white_row is not None else float(self.elo_base)
+        current_black_rank = float(current_black_row["rank"]) if current_black_row is not None else 1.0
+        current_white_rank = float(current_white_row["rank"]) if current_white_row is not None else 1.0
+        best_black_elo = float(best_black_row["elo"]) if best_black_row is not None else current_black_elo
+        best_white_elo = float(best_white_row["elo"]) if best_white_row is not None else current_white_elo
 
         info.update(
             {
@@ -1593,7 +1590,7 @@ class DotaStylePSRORunner(Runner):
         )
         logging.info(
             "Global role Elo updated at epoch=%d: current=%s black=%.2f white=%.2f black_rank=%s white_rank=%s alpha=%.2f models=%d evaluated_pairs=%d",
-            epoch + 1,
+            global_epoch,
             entry.id,
             current_black_elo,
             current_white_elo,
@@ -1605,6 +1602,7 @@ class DotaStylePSRORunner(Runner):
         )
 
     # ------------------------------- logging ---------------------------------
+
     def _format_eval_summary(self, info: dict[str, Any]) -> str:
         parts = [
             f"Black vs White:{info['eval/black_vs_white'] * 100.0:.2f}%",
@@ -1614,9 +1612,7 @@ class DotaStylePSRORunner(Runner):
             f"p_self:{self.self_play_prob:.3f}",
             f"bias_mode:{self.current_bias_mode}",
             "next_turn:{}".format(
-                "biased"
-                if (self.current_bias_mode != self._MODE_BOTH and self.bias_turn_next)
-                else "both"
+                "biased" if (self.current_bias_mode != self._MODE_BOTH and self.bias_turn_next) else "both"
             ),
         ]
         if "elo_eval/current_black" in info:
@@ -1628,13 +1624,7 @@ class DotaStylePSRORunner(Runner):
 
     def _log(self, info: dict[str, Any], epoch: int):
         if epoch % self.log_interval == 0:
-            black_vs_white_raw = float(
-                eval_win_rate(
-                    self.eval_env,
-                    player_black=self.policy_black,
-                    player_white=self.policy_white,
-                )
-            )
+            black_vs_white_raw = float(eval_win_rate(self.eval_env, player_black=self.policy_black, player_white=self.policy_white))
             black_vs_white_ema = self._update_black_vs_white_ema(black_vs_white_raw)
             self._update_bias_state_after_eval()
             info.update(
@@ -1646,9 +1636,7 @@ class DotaStylePSRORunner(Runner):
                     "pool_white/size": float(self.pool.role_size("white")),
                     "pool_white/prob_variance": self.pool.prob_variance("white"),
                     "elo_eval/num_models": float(len(self.elo_league)),
-                    "elo_eval/payoff_coverage": self.elo_league.payoff_coverage(
-                        include_self=True
-                    ),
+                    "elo_eval/payoff_coverage": self.elo_league.payoff_coverage(include_self=True),
                 }
             )
             info.update(self._ema_trigger_flags())
@@ -1659,14 +1647,7 @@ class DotaStylePSRORunner(Runner):
 
         if epoch % self.log_interval == 0 or "elo_eval/current_black" in info:
             if "eval/black_vs_white" not in info:
-                # Minimal eval if this epoch is an Elo epoch but not a log_interval epoch.
-                black_vs_white_raw = float(
-                    eval_win_rate(
-                        self.eval_env,
-                        player_black=self.policy_black,
-                        player_white=self.policy_white,
-                    )
-                )
+                black_vs_white_raw = float(eval_win_rate(self.eval_env, player_black=self.policy_black, player_white=self.policy_white))
                 black_vs_white_ema = self._update_black_vs_white_ema(black_vs_white_raw)
                 self._update_bias_state_after_eval()
                 info["eval/black_vs_white"] = black_vs_white_raw
@@ -1682,26 +1663,35 @@ class DotaStylePSRORunner(Runner):
         return super()._log(info, epoch)
 
     # ---------------------------- metadata snapshots --------------------------
+
     def _save_pool_meta_snapshot(self, epoch_label: str) -> None:
         self.pool.save()
         snapshot_path = Path(self.run_dir) / f"pool_meta_{epoch_label}.json"
         self.pool.save(snapshot_path)
+        _wandb_save_file(snapshot_path, base_path=self.run_dir)
 
     def _save_elo_snapshot(self, epoch_label: str) -> None:
         self.elo_league.save_meta()
         self.elo_league.save_payoff()
         snapshot_dir = Path(self.run_dir)
         snapshot_dir.mkdir(parents=True, exist_ok=True)
+        meta_snapshot_path = snapshot_dir / f"elo_meta_{epoch_label}.json"
+        self.elo_league.save(meta_snapshot_path)
+        _wandb_save_file(meta_snapshot_path, base_path=self.run_dir)
+
+        summary_path = snapshot_dir / f"elo_snapshot_{epoch_label}.json"
         _atomic_json_dump(
             {
                 "elo_meta_path": str(self.elo_league.meta_path),
                 "payoff_path": str(self.elo_league.payoff_path),
                 "ratings_csv_path": str(self.elo_league.ratings_csv_path),
                 "ratings_json_path": str(self.elo_league.ratings_json_path),
+                "snapshot_meta_path": str(meta_snapshot_path),
                 "updated_at": _now(),
             },
-            snapshot_dir / f"elo_snapshot_{epoch_label}.json",
+            summary_path,
         )
+        _wandb_save_file(summary_path, base_path=self.run_dir)
 
     def run(self, disable_tqdm: bool = False):
         pbar = tqdm(range(self.epochs), disable=disable_tqdm)
@@ -1710,17 +1700,19 @@ class DotaStylePSRORunner(Runner):
             info.update(self._epoch(epoch=i))
             self._log(info=info, epoch=i)
 
-            if i % self.save_interval == 0 and self.save_interval > 0:
-                torch.save(
-                    self.policy_black.state_dict(),
-                    os.path.join(self.run_dir, f"black_{i:04d}.pt"),
-                )
-                torch.save(
-                    self.policy_white.state_dict(),
-                    os.path.join(self.run_dir, f"white_{i:04d}.pt"),
-                )
-                self._save_pool_meta_snapshot(f"{i:04d}")
-                self._save_elo_snapshot(f"{i:04d}")
+            # Save after completed local epochs. With offset=1000 and save_interval=100,
+            # the first periodic checkpoint is black_01100.pt / white_01100.pt.
+            if self.save_interval > 0 and (i + 1) % self.save_interval == 0:
+                ckpt_epoch = self._checkpoint_epoch(i)
+                epoch_label = self._epoch_label(ckpt_epoch)
+                black_path = os.path.join(self.run_dir, f"black_{epoch_label}.pt")
+                white_path = os.path.join(self.run_dir, f"white_{epoch_label}.pt")
+                torch.save(self.policy_black.state_dict(), black_path)
+                torch.save(self.policy_white.state_dict(), white_path)
+                _wandb_save_file(black_path, base_path=self.run_dir)
+                _wandb_save_file(white_path, base_path=self.run_dir)
+                self._save_pool_meta_snapshot(epoch_label)
+                self._save_elo_snapshot(epoch_label)
 
             pbar.set_postfix(
                 {
@@ -1728,6 +1720,7 @@ class DotaStylePSRORunner(Runner):
                     "poolB": self.pool.role_size("black"),
                     "poolW": self.pool.role_size("white"),
                     "eloN": len(self.elo_league),
+                    "epoch": self._completed_epoch(i),
                     "eloB": info.get("elo_eval/current_black", float("nan")),
                     "eloW": info.get("elo_eval/current_white", float("nan")),
                 }
@@ -1735,6 +1728,8 @@ class DotaStylePSRORunner(Runner):
 
         torch.save(self.policy_black.state_dict(), os.path.join(self.run_dir, "black_final.pt"))
         torch.save(self.policy_white.state_dict(), os.path.join(self.run_dir, "white_final.pt"))
+        _wandb_save_file(os.path.join(self.run_dir, "black_final.pt"), base_path=self.run_dir)
+        _wandb_save_file(os.path.join(self.run_dir, "white_final.pt"), base_path=self.run_dir)
         self._save_pool_meta_snapshot("final")
         self._save_elo_snapshot("final")
         self._post_run()

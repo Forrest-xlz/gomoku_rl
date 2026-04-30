@@ -1,9 +1,11 @@
 seed: 0
-num_envs: 512 # 512
+
+num_envs: 512
 board_size: 15
 device: cuda
 out_device: cpu
 run_dir:
+
 version_name: psro-dota-style-global-role-elo-temporal-6
 augment: false
 
@@ -12,16 +14,22 @@ steps: 128
 save_interval: 300
 log_interval: 5
 
-black_checkpoint: wandb/run-20260430_075302-h1d1f876/files/black_0900.pt
-white_checkpoint: wandb/run-20260430_075302-h1d1f876/files/white_0900.pt
+# 继续训练时填写当前预训练 checkpoint 对应的全局训练迭代数。
+# 例如 black_checkpoint=black_01000.pt / white_checkpoint=white_01000.pt 时，填 1000。
+# 之后本轮训练完成 100 个 epoch，保存名就是 black_01100.pt / white_01100.pt。
+pretrain_epoch_offset: 1000
+
+black_checkpoint: wandb/run-20260430_075302-h1d1f876/files/black_01000.pt
+white_checkpoint: wandb/run-20260430_075302-h1d1f876/files/white_01000.pt
 
 # ---------------- Dota/OpenAI-Five-style model-pool self-play ----------------
+
 # f: 训练用模型池权重文件夹。内部按 black/white 分开保存角色池模型。
 f: model_pool
 
 # e: 训练用模型池元信息 JSON。为空时默认使用 ${f}/pool_meta.json。
 # 继续训练时指向旧 e，可以恢复 quality score 和历史权重路径。
-e: wandb/run-20260430_075302-h1d1f876/files/pool_meta_0900.json
+e: wandb/run-20260430_075302-h1d1f876/files/pool_meta_01000.json
 
 # p: 使用 current_black vs current_white 自博弈的概率。
 # 1-p: 从训练模型池按角色分别 softmax(quality)：当前黑抽历史白，当前白抽历史黑。
@@ -34,12 +42,19 @@ l: 0.15
 # m <= 0 表示不自动加入训练池。
 m: 10
 
-# ---------------- Global Elo evaluation pool --------------------------------
-# elo_models: 全局测评池文件夹。只用于测评，不参与训练采样。
-elo_models: elo_models
+# ---------------- Metadata-driven Global Elo evaluation pool -----------------
+
+# elo_models: Elo 测评池权重文件夹。只用于测评，不参与训练采样。
+elo_models: elo_model_pool
+
+# elo_e / elo_meta: Elo 测评池元信息 JSON，类似训练池 e。
+# 为空时默认使用 ${elo_models}/elo_meta.json。
+# 继续训练/预训练时指向旧 elo_meta_XXXXX.json，即可恢复 entries + payoff。
+# 注意：只要这个元数据非空，训练启动时就不会把当前 checkpoint 自动加入 Elo 池。
+elo_e: 
 
 # 每隔多少 epoch 把当前 black/white 权重加入 elo_models，并补全 payoff 矩阵缺失项。
-# 例如 100 表示 epoch=100,200,300,... 时评估一次。
+# 例如 100 表示完成 100,200,300,... 个本轮 epoch 时评估一次。
 elo_interval: 200
 
 # 每个 black_i vs white_j 调用 eval_win_rate 的重复次数。
