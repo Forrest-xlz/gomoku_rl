@@ -169,5 +169,5 @@ wandb
 dist/
 build/
 *.rar
-/elo_models/
-/elo_eval_outputs/
+/train_model_pool/
+/elo_eval_model_pool/

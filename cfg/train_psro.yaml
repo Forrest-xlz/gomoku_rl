@@ -32,21 +32,21 @@ temporal_num_steps: 6
 # l: quality-score learning rate for sampled historical opponents.
 # m: add current black/white to training pool every m epochs.
 p: 0.8
-l: 0.05
-m: 100
+l: 0.2
+m: 10
 
 # Training model pool.
 # f stores checkpoint files. e stores metadata. If e is empty/missing, a new
 # pool_meta.json is created under f.
-f: model_pool
-e:
+f: train_model_pool
+e: 
 
 # Training-time Elo model pool.
 # elo_models stores checkpoint files. elo_e stores entries + payoff.
 # If elo_e points to existing metadata, current start checkpoint is not added.
-elo_models: elo_models
+elo_models: elo_eval_model_pool
 elo_e:
-elo_interval: 300
+elo_interval: 200
 elo_eval_repeats: 1
 elo_base: 1200.0
 elo_scale: 400.0

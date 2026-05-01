@@ -1,0 +1,33 @@
+board_size: 15
+num_envs: 512
+num_repeats: 1
+device: cuda
+algo_cfg: ppo
+output_dir: elo_eval_outputs
+interaction: random
+resume: true  # 是否断点续评
+
+step_min: null  # 评测的最小步数，null表示不限制
+step_max: null  # 评测的最大步数，null表示不限制
+step_mod: null  # 评测步数的模数，null表示不限制
+limit_per_h: null # 每个h的评测数量限制，null表示不限制
+
+f: /root/autodl-tmp/eval_models
+
+h:
+  - folder: temporal1_c64_r4
+    temporal: 1
+    num_channels: 64
+    num_residual_blocks: 4
+
+  - folder: temporal6_c64_r4
+    temporal: 6
+    num_channels: 64
+    num_residual_blocks: 4
+
+elo_l2: 1.0e-4
+elo_max_iter: 5000
+elo_patience: 100
+elo_lr: 0.05
+elo_min_delta: 0
+average_rating: 1200

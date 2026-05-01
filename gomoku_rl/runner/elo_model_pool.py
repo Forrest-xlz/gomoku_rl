@@ -106,6 +106,16 @@ class PPOInferencePolicy:
                 device=self.device,
             )
 
+        # Materialize lazy modules before loading checkpoint weights.
+        #
+        # Important: when cfg.share_network=True, make_ppo_ac() returns an
+        # ActorValueOperator whose policy operator writes the shared
+        # representation to the TensorDict key ``hidden``. The value head then
+        # consumes that same ``hidden`` key. Therefore actor and critic must be
+        # initialized on the SAME TensorDict object. Calling
+        # ``self.critic(fake_input.clone())`` would create a fresh TensorDict
+        # without ``hidden`` and crash with:
+        #   KeyError: inputs are None: {'hidden'}
         fake_input = observation_spec.zero()
         try:
             fake_input = fake_input.to(self.device)
@@ -114,8 +124,9 @@ class PPOInferencePolicy:
         if "action_mask" in fake_input.keys():
             fake_input["action_mask"] = ~fake_input["action_mask"]
         with torch.no_grad():
-            self.actor(fake_input.clone())
-            self.critic(fake_input.clone())
+            fake_td = fake_input.clone()
+            fake_td = self.actor(fake_td)
+            self.critic(fake_td)
         self.eval()
         self.requires_grad_(False)
 

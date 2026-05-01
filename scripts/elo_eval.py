@@ -1,47 +1,86 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Role-separated Elo evaluation for Gomoku temporal-feature model pools.
+Role-separated Elo evaluation for manually organized Gomoku model folders.
 
-Expected local model layout, with minor typo tolerance:
+This script is meant for offline evaluation of model checkpoints that you choose
+explicitly. It does not use the training-time PSRO/InRL model pool metadata.
 
-    elo_models/                         # or eval_models/
-        temporal_features_1/            # also supports temporal_feature_1 / temporal_feaure_1
-            black/black_00000.pt        # also supports balck_00000.pt typo
-            white/white_00000.pt
-        temporal_features_6/
-            black/black_00000.pt
-            white/white_00000.pt
+Expected new layout:
 
-This script DOES NOT bind black_xxxxx.pt and white_xxxxx.pt into one agent.
-Instead it builds two role-specific model pools:
+    <f>/
+      black/                         # also tolerates: balck/
+        <h_folder>/
+          black_00000.pt             # also tolerates: balck_00000.pt
+          black_00100.pt
+      white/
+        <h_folder>/
+          white_00000.pt
+          white_00100.pt
 
-    black pool = all temporal=1 black models + all temporal=6 black models
-    white pool = all temporal=1 white models + all temporal=6 white models
+The folders listed in config.h define both where to find checkpoints and which
+network architecture must be used to load them.
 
-It evaluates the real rectangular payoff matrix:
+Example config:
 
-    black_vs_white_payoff[i, j] = score of black_model_i as black
-                                 against white_model_j as white
+    f: /root/autodl-tmp/eval_models
+    h:
+      - folder: temporal1_c64_r4
+        temporal: 1
+        num_channels: 64
+        num_residual_blocks: 4
+      - folder: temporal6_c64_r4
+        temporal: 6
+        num_channels: 64
+        num_residual_blocks: 4
 
-Then it computes role-separated Elo by joint maximum likelihood with a shared
-black-first-move alpha term.
+    board_size: 15
+    num_envs: 512
+    num_repeats: 1
+    device: cuda
+    algo_cfg: ppo
+    output_dir: elo_eval_outputs
+    interaction: random             # random or mode
+    resume: true
+    average_rating: 1200
 
-Joint role-separated MLE:
-    P(black_i scores against white_j) = sigmoid(alpha + black_skill_i - white_skill_j)
+    # Optional checkpoint filters.
+    step_min: null
+    step_max: null
+    step_mod: null
+    limit_per_h: null
 
-The reported black skills and white skills are centered separately, so each
-role-specific Elo pool has mean 1200. Alpha is reported separately as the
-fitted global black advantage in Elo points. Black Elo and white Elo are two
-role-specific scales; predictions use black_elo - white_elo + black_advantage_elo.
+    # Optional MLE optimizer settings.
+    elo_l2: 1.0e-4
+    elo_max_iter: 5000
+    elo_patience: 100
+    elo_lr: 0.05
+    elo_min_delta: 1.0e-10
 
-For reporting, it also writes synthetic square model-vs-model payoff matrices:
+CLI examples:
 
-    black_model_payoff_for_elo.csv
-    white_model_payoff_for_elo.csv
+    python scripts/elo_eval.py --config cfg/elo_eval.yaml
 
-Those square matrices are derived from MLE role-specific skills, not from
-illegal black-vs-black or white-vs-white games.
+    python scripts/elo_eval.py \
+      --f /root/autodl-tmp/eval_models \
+      --h '[{"folder":"temporal1_c64_r4","temporal":1,"num_channels":64,"num_residual_blocks":4}]'
+
+Outputs:
+
+    output_dir/
+      black_models.csv
+      white_models.csv
+      black_vs_white_payoff.csv
+      predicted_black_scores.csv
+      black_elo_ratings.csv
+      white_elo_ratings.csv
+      black_model_payoff_for_elo.csv
+      white_model_payoff_for_elo.csv
+      elo_diagnostics.json
+      black_elo_curve.png
+      white_elo_curve.png
+      black_vs_white_payoff_heatmap.png
+      payoff_cache.npz
 """
 
 from __future__ import annotations
@@ -57,20 +96,17 @@ import warnings
 from collections import OrderedDict, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
-
-import numpy as np
-import torch
+from typing import Any, Iterable, Sequence
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
+import numpy as np
+import torch
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from tensordict.nn import InteractionType, set_interaction_type
-
 
 # -----------------------------------------------------------------------------
 # Make the script runnable both from project root and from scripts/.
@@ -86,122 +122,281 @@ from gomoku_rl import CONFIG_PATH  # noqa: E402
 from gomoku_rl.env import GomokuEnv  # noqa: E402
 from gomoku_rl.policy import get_pretrained_policy  # noqa: E402
 
-
 # -----------------------------------------------------------------------------
 # Data structures
 # -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class HSpec:
+    """One manually configured architecture/folder spec."""
+
+    folder: str
+    temporal: int
+    num_channels: int
+    num_residual_blocks: int
+    label: str = ""
+
+    @property
+    def display_label(self) -> str:
+        if self.label:
+            return self.label
+        return (
+            f"{self.folder}"
+            f"|t{int(self.temporal)}"
+            f"|c{int(self.num_channels)}"
+            f"|r{int(self.num_residual_blocks)}"
+        )
+
+
 @dataclass(frozen=True)
 class RoleModel:
     """One checkpoint in either the black role pool or white role pool."""
 
     name: str
     color: str
-    temporal_steps: int
+    h_folder: str
+    h_label: str
+    temporal: int
+    num_channels: int
+    num_residual_blocks: int
     step: int
     path: str
 
 
 @dataclass
 class EvalConfig:
-    model_root: str
-    temporal_steps: list[int]
-    board_size: int
-    num_envs: int
-    num_repeats: int
-    device: str
-    algo_cfg: str
-    output_dir: str
-    average_rating: float
-    cache_size: int
-    interaction: str
-    resume: bool
-    step_min: int | None
-    step_max: int | None
-    step_mod: int | None
-    limit_per_temporal: int | None
-    elo_l2: float
-    elo_max_iter: int
-    elo_patience: int
-    elo_lr: float
-    elo_min_delta: float
+    f: str
+    h: list[HSpec]
+    board_size: int = 15
+    num_envs: int = 512
+    num_repeats: int = 1
+    device: str = "cuda"
+    algo_cfg: str = "ppo"
+    output_dir: str = "elo_eval_outputs"
+    average_rating: float = 1200.0
+    cache_size: int = 4
+    interaction: str = "random"
+    resume: bool = True
+    step_min: int | None = None
+    step_max: int | None = None
+    step_mod: int | None = None
+    limit_per_h: int | None = None
+    elo_l2: float = 1e-4
+    elo_max_iter: int = 5000
+    elo_patience: int = 100
+    elo_lr: float = 0.05
+    elo_min_delta: float = 1e-10
+
+
+# -----------------------------------------------------------------------------
+# Config loading
+# -----------------------------------------------------------------------------
+
+
+def _none_if_string_null(value: Any) -> Any:
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+        return None
+    return value
+
+
+def _parse_h_specs(raw_h: Any) -> list[HSpec]:
+    if raw_h is None:
+        return []
+    if isinstance(raw_h, str):
+        text = raw_h.strip()
+        if not text:
+            return []
+        try:
+            raw_h = json.loads(text)
+        except json.JSONDecodeError:
+            raw_h = OmegaConf.to_container(OmegaConf.create(text), resolve=True)
+    if isinstance(raw_h, DictConfig):
+        raw_h = OmegaConf.to_container(raw_h, resolve=True)
+    if not isinstance(raw_h, list):
+        raise TypeError("config.h must be a list of dictionaries.")
+
+    out: list[HSpec] = []
+    for idx, item in enumerate(raw_h):
+        if isinstance(item, DictConfig):
+            item = OmegaConf.to_container(item, resolve=True)
+        if not isinstance(item, dict):
+            raise TypeError(f"config.h[{idx}] must be a dictionary, got {type(item)}")
+
+        folder = item.get("folder", item.get("name", item.get("folder_name", None)))
+        if folder is None:
+            raise ValueError(f"config.h[{idx}] is missing 'folder' or 'name'.")
+
+        temporal = item.get("temporal", item.get("temporal_steps", None))
+        if temporal is None:
+            raise ValueError(f"config.h[{idx}] is missing 'temporal'.")
+
+        num_channels = item.get("num_channels", None)
+        if num_channels is None:
+            raise ValueError(f"config.h[{idx}] is missing 'num_channels'.")
+
+        num_residual_blocks = item.get("num_residual_blocks", None)
+        if num_residual_blocks is None:
+            raise ValueError(f"config.h[{idx}] is missing 'num_residual_blocks'.")
+
+        out.append(
+            HSpec(
+                folder=str(folder),
+                temporal=int(temporal),
+                num_channels=int(num_channels),
+                num_residual_blocks=int(num_residual_blocks),
+                label=str(item.get("label", "")),
+            )
+        )
+    return out
+
+
+def _load_config(args: argparse.Namespace) -> EvalConfig:
+    base: dict[str, Any] = {
+        "f": None,
+        "h": [],
+        "board_size": 15,
+        "num_envs": 512,
+        "num_repeats": 1,
+        "device": "cuda",
+        "algo_cfg": "ppo",
+        "output_dir": "elo_eval_outputs",
+        "average_rating": 1200.0,
+        "cache_size": 4,
+        "interaction": "random",
+        "resume": True,
+        "step_min": None,
+        "step_max": None,
+        "step_mod": None,
+        "limit_per_h": None,
+        "elo_l2": 1e-4,
+        "elo_max_iter": 5000,
+        "elo_patience": 100,
+        "elo_lr": 0.05,
+        "elo_min_delta": 1e-10,
+    }
+
+    if args.config is not None:
+        cfg_path = Path(args.config).expanduser().resolve()
+        if not cfg_path.exists():
+            raise FileNotFoundError(f"config file not found: {cfg_path}")
+        loaded = OmegaConf.to_container(OmegaConf.load(cfg_path), resolve=True)
+        if not isinstance(loaded, dict):
+            raise TypeError(f"config file must contain a dictionary: {cfg_path}")
+        base.update(loaded)
+
+    # CLI overrides. Use None as "not provided".
+    cli_overrides = {
+        "f": args.f,
+        "h": args.h,
+        "board_size": args.board_size,
+        "num_envs": args.num_envs,
+        "num_repeats": args.num_repeats,
+        "device": args.device,
+        "algo_cfg": args.algo_cfg,
+        "output_dir": args.output_dir,
+        "average_rating": args.average_rating,
+        "cache_size": args.cache_size,
+        "interaction": args.interaction,
+        "resume": args.resume,
+        "step_min": args.step_min,
+        "step_max": args.step_max,
+        "step_mod": args.step_mod,
+        "limit_per_h": args.limit_per_h,
+        "elo_l2": args.elo_l2,
+        "elo_max_iter": args.elo_max_iter,
+        "elo_patience": args.elo_patience,
+        "elo_lr": args.elo_lr,
+        "elo_min_delta": args.elo_min_delta,
+    }
+    for key, value in cli_overrides.items():
+        value = _none_if_string_null(value)
+        if value is not None:
+            base[key] = value
+
+    model_root = base.get("f", base.get("model_root", None))
+    if model_root is None:
+        raise ValueError("Missing model root. Set config.f or pass --f.")
+
+    h_specs = _parse_h_specs(base.get("h"))
+    if not h_specs:
+        raise ValueError("Missing architecture folder list. Set config.h or pass --h.")
+
+    return EvalConfig(
+        f=str(model_root),
+        h=h_specs,
+        board_size=int(base["board_size"]),
+        num_envs=int(base["num_envs"]),
+        num_repeats=int(base["num_repeats"]),
+        device=str(base["device"]),
+        algo_cfg=str(base["algo_cfg"]),
+        output_dir=str(base["output_dir"]),
+        average_rating=float(base["average_rating"]),
+        cache_size=int(base["cache_size"]),
+        interaction=str(base["interaction"]),
+        resume=bool(base["resume"]),
+        step_min=None if base.get("step_min") is None else int(base["step_min"]),
+        step_max=None if base.get("step_max") is None else int(base["step_max"]),
+        step_mod=None if base.get("step_mod") is None else int(base["step_mod"]),
+        limit_per_h=None if base.get("limit_per_h") is None else int(base["limit_per_h"]),
+        elo_l2=float(base["elo_l2"]),
+        elo_max_iter=int(base["elo_max_iter"]),
+        elo_patience=int(base["elo_patience"]),
+        elo_lr=float(base["elo_lr"]),
+        elo_min_delta=float(base["elo_min_delta"]),
+    )
 
 
 # -----------------------------------------------------------------------------
 # Model discovery
 # -----------------------------------------------------------------------------
+
+
 _CKPT_RE = re.compile(r"^(?P<color>black|balck|white)_(?P<step>\d+)\.pt$", re.IGNORECASE)
-_TEMPORAL_DIR_RE = re.compile(
-    r"^temporal_(?:features?|feaure|feaures)_(?P<n>\d+)$",
-    re.IGNORECASE,
-)
 
 
-def resolve_model_root(model_root_arg: str | None) -> Path:
-    """Resolve model root. Supports both ./elo_models and ./eval_models by default."""
-    if model_root_arg:
-        root = Path(model_root_arg).expanduser().resolve()
-        if not root.exists():
-            raise FileNotFoundError(f"model root does not exist: {root}")
-        return root
-
-    for p in [Path("elo_models"), Path("eval_models")]:
-        if p.exists():
-            return p.resolve()
-
-    raise FileNotFoundError(
-        "Cannot find model root. Expected ./elo_models or ./eval_models. "
-        "Use --model-root to specify it explicitly."
-    )
-
-
-def find_temporal_dir(model_root: Path, temporal_steps: int) -> Path | None:
-    """Find temporal directory and tolerate common spelling mistakes."""
-    n = int(temporal_steps)
-    candidates = [
-        model_root / f"temporal_features_{n}",
-        model_root / f"temporal_feature_{n}",
-        model_root / f"temporal_feaure_{n}",
-        model_root / f"temporal_feaures_{n}",
-    ]
+def _resolve_existing_dir(candidates: Sequence[Path]) -> Path | None:
     for p in candidates:
-        if p.exists():
+        if p.exists() and p.is_dir():
             return p.resolve()
-
-    for child in model_root.iterdir():
-        if not child.is_dir():
-            continue
-        match = _TEMPORAL_DIR_RE.match(child.name)
-        if match and int(match.group("n")) == n:
-            return child.resolve()
-
     return None
 
 
-def scan_temporal_steps(model_root: Path) -> list[int]:
-    """Auto-detect temporal steps from folder names."""
-    out: set[int] = set()
-    for child in model_root.iterdir():
-        if not child.is_dir():
-            continue
-        match = _TEMPORAL_DIR_RE.match(child.name)
-        if match:
-            out.add(int(match.group("n")))
-    return sorted(out)
+def _role_h_folder(model_root: Path, role: str, h_folder: str) -> Path | None:
+    """Find one configured h folder for black/white checkpoints.
 
+    New preferred layout:
+        root/black/h_folder
+        root/white/h_folder
 
-def _color_dir(temporal_dir: Path, color: str) -> Path:
-    if color == "black":
-        candidates = [temporal_dir / "black", temporal_dir / "balck"]
+    Backward-compatible layouts tolerated:
+        root/balck/h_folder
+        root/h_folder/black
+        root/h_folder/balck
+        root/h_folder/white
+    """
+
+    role = role.lower()
+    if role == "black":
+        candidates = [
+            model_root / "black" / h_folder,
+            model_root / "balck" / h_folder,
+            model_root / h_folder / "black",
+            model_root / h_folder / "balck",
+        ]
+    elif role == "white":
+        candidates = [
+            model_root / "white" / h_folder,
+            model_root / h_folder / "white",
+        ]
     else:
-        candidates = [temporal_dir / "white"]
-    for p in candidates:
-        if p.exists():
-            return p.resolve()
-    return candidates[0].resolve()
+        raise ValueError(f"unknown role: {role}")
+    return _resolve_existing_dir(candidates)
 
 
 def scan_color_models(folder: Path, expected_color: str) -> dict[int, Path]:
-    """Return {training_step: checkpoint_path} for one color folder."""
+    """Return {training_step: checkpoint_path} for one configured h folder."""
+
     out: dict[int, Path] = {}
     if not folder.exists():
         return out
@@ -210,16 +405,13 @@ def scan_color_models(folder: Path, expected_color: str) -> dict[int, Path]:
         match = _CKPT_RE.match(path.name)
         if match is None:
             continue
-
         color = match.group("color").lower()
         if color == "balck":
             color = "black"
         if color != expected_color:
             continue
-
         step = int(match.group("step"))
         out[step] = path.resolve()
-
     return dict(sorted(out.items(), key=lambda kv: kv[0]))
 
 
@@ -228,7 +420,7 @@ def _filter_steps(
     step_min: int | None,
     step_max: int | None,
     step_mod: int | None,
-    limit_per_temporal: int | None,
+    limit_per_h: int | None,
 ) -> list[int]:
     filtered: list[int] = []
     for step in steps:
@@ -240,69 +432,90 @@ def _filter_steps(
             continue
         filtered.append(int(step))
 
-    if limit_per_temporal is not None and limit_per_temporal > 0 and len(filtered) > limit_per_temporal:
-        indices = np.linspace(0, len(filtered) - 1, limit_per_temporal)
+    if limit_per_h is not None and limit_per_h > 0 and len(filtered) > limit_per_h:
+        # Keep a roughly uniform sample, including endpoints.
+        indices = np.linspace(0, len(filtered) - 1, limit_per_h)
         keep = sorted({int(round(x)) for x in indices})
         filtered = [filtered[i] for i in keep]
     return filtered
 
 
+def _safe_name(text: str) -> str:
+    text = str(text).strip()
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text)
+    return text.strip("_") or "unnamed"
+
+
 def discover_role_models(
     model_root: Path,
-    temporal_steps: Iterable[int],
+    h_specs: Sequence[HSpec],
     step_min: int | None = None,
     step_max: int | None = None,
     step_mod: int | None = None,
-    limit_per_temporal: int | None = None,
+    limit_per_h: int | None = None,
 ) -> tuple[list[RoleModel], list[RoleModel]]:
-    """Discover black and white model pools separately."""
     black_pool: list[RoleModel] = []
     white_pool: list[RoleModel] = []
 
-    for temporal_n in temporal_steps:
-        temporal_dir = find_temporal_dir(model_root, int(temporal_n))
-        if temporal_dir is None:
-            print(f"[WARN] temporal={temporal_n}: directory not found under {model_root}")
-            continue
+    for spec in h_specs:
+        black_dir = _role_h_folder(model_root, "black", spec.folder)
+        white_dir = _role_h_folder(model_root, "white", spec.folder)
 
-        black_dir = _color_dir(temporal_dir, "black")
-        white_dir = _color_dir(temporal_dir, "white")
-        black_models = scan_color_models(black_dir, "black")
-        white_models = scan_color_models(white_dir, "white")
+        if black_dir is None:
+            print(f"[WARN] h={spec.folder}: black folder not found under {model_root}")
+            black_models: dict[int, Path] = {}
+        else:
+            black_models = scan_color_models(black_dir, "black")
+
+        if white_dir is None:
+            print(f"[WARN] h={spec.folder}: white folder not found under {model_root}")
+            white_models: dict[int, Path] = {}
+        else:
+            white_models = scan_color_models(white_dir, "white")
 
         if not black_models:
-            print(f"[WARN] temporal={temporal_n}: no black checkpoints found in {black_dir}")
+            print(f"[WARN] h={spec.folder}: no black checkpoints found in {black_dir}")
         if not white_models:
-            print(f"[WARN] temporal={temporal_n}: no white checkpoints found in {white_dir}")
+            print(f"[WARN] h={spec.folder}: no white checkpoints found in {white_dir}")
 
         black_steps = _filter_steps(
             sorted(black_models.keys()),
             step_min=step_min,
             step_max=step_max,
             step_mod=step_mod,
-            limit_per_temporal=limit_per_temporal,
+            limit_per_h=limit_per_h,
         )
         white_steps = _filter_steps(
             sorted(white_models.keys()),
             step_min=step_min,
             step_max=step_max,
             step_mod=step_mod,
-            limit_per_temporal=limit_per_temporal,
+            limit_per_h=limit_per_h,
         )
 
-        if limit_per_temporal is not None:
-            print(
-                f"[INFO] temporal={temporal_n}: use "
-                f"{len(black_steps)} black and {len(white_steps)} white checkpoints "
-                f"after --limit-per-temporal={limit_per_temporal}."
-            )
+        print(
+            f"[DISCOVER] h={spec.folder} temporal={spec.temporal} "
+            f"channels={spec.num_channels} blocks={spec.num_residual_blocks} "
+            f"black={len(black_steps)} white={len(white_steps)}"
+        )
 
+        safe_h = _safe_name(spec.folder)
         for step in black_steps:
             black_pool.append(
                 RoleModel(
-                    name=f"black_t{int(temporal_n)}_s{step:05d}",
+                    name=(
+                        f"black_{safe_h}"
+                        f"_t{int(spec.temporal)}"
+                        f"_c{int(spec.num_channels)}"
+                        f"_r{int(spec.num_residual_blocks)}"
+                        f"_s{int(step):05d}"
+                    ),
                     color="black",
-                    temporal_steps=int(temporal_n),
+                    h_folder=spec.folder,
+                    h_label=spec.display_label,
+                    temporal=int(spec.temporal),
+                    num_channels=int(spec.num_channels),
+                    num_residual_blocks=int(spec.num_residual_blocks),
                     step=int(step),
                     path=str(black_models[step]),
                 )
@@ -310,39 +523,82 @@ def discover_role_models(
         for step in white_steps:
             white_pool.append(
                 RoleModel(
-                    name=f"white_t{int(temporal_n)}_s{step:05d}",
+                    name=(
+                        f"white_{safe_h}"
+                        f"_t{int(spec.temporal)}"
+                        f"_c{int(spec.num_channels)}"
+                        f"_r{int(spec.num_residual_blocks)}"
+                        f"_s{int(step):05d}"
+                    ),
                     color="white",
-                    temporal_steps=int(temporal_n),
+                    h_folder=spec.folder,
+                    h_label=spec.display_label,
+                    temporal=int(spec.temporal),
+                    num_channels=int(spec.num_channels),
+                    num_residual_blocks=int(spec.num_residual_blocks),
                     step=int(step),
                     path=str(white_models[step]),
                 )
             )
 
-    black_pool.sort(key=lambda m: (m.temporal_steps, m.step, m.name))
-    white_pool.sort(key=lambda m: (m.temporal_steps, m.step, m.name))
+    black_pool.sort(key=lambda m: (m.h_folder, m.temporal, m.num_channels, m.num_residual_blocks, m.step, m.name))
+    white_pool.sort(key=lambda m: (m.h_folder, m.temporal, m.num_channels, m.num_residual_blocks, m.step, m.name))
     return black_pool, white_pool
 
 
 # -----------------------------------------------------------------------------
 # Policy adapter and cache
 # -----------------------------------------------------------------------------
+
+
+def _load_base_algo_cfg(algo_cfg: str) -> DictConfig:
+    """Load base algorithm config by name or file path."""
+
+    candidate = Path(algo_cfg).expanduser()
+    if candidate.exists():
+        return OmegaConf.load(candidate)
+
+    config_root = Path(CONFIG_PATH)
+    if not config_root.is_absolute():
+        # CONFIG_PATH is usually a path-like value inside the package. If it is
+        # relative, resolve it from project root.
+        for root in (_THIS_FILE.parent.parent, Path.cwd()):
+            maybe = root / config_root
+            if maybe.exists():
+                config_root = maybe
+                break
+
+    for p in [
+        config_root / "algo" / f"{algo_cfg}.yaml",
+        config_root / f"{algo_cfg}.yaml",
+        Path("cfg") / "algo" / f"{algo_cfg}.yaml",
+    ]:
+        if p.exists():
+            return OmegaConf.load(p)
+
+    raise FileNotFoundError(
+        f"Cannot find algo config '{algo_cfg}'. Pass a real YAML path or use an existing cfg/algo/*.yaml name."
+    )
+
+
+def _algo_cfg_for_model(base_algo_cfg: DictConfig, model: RoleModel) -> DictConfig:
+    cfg = OmegaConf.create(OmegaConf.to_container(base_algo_cfg, resolve=True))
+    cfg.num_channels = int(model.num_channels)
+    cfg.num_residual_blocks = int(model.num_residual_blocks)
+    return cfg
+
+
 class TemporalPolicyAdapter:
-    """
-    Wrap a policy trained with temporal_steps=n.
+    """Wrap a policy trained with temporal=n and slice eval observation channels.
 
-    The evaluation environment is created with max_history_steps, e.g. 6, so its
-    observation is:
-
-        [current_player_board, opponent_board, last_1, ..., last_max]
-
-    A temporal=1 policy only receives:
-
-        [current_player_board, opponent_board, last_1]
+    The evaluation environment is created with max temporal history. A temporal=1
+    checkpoint only receives [current_player_board, opponent_board, last_1],
+    while temporal=6 receives [current_player_board, opponent_board, last_1..last_6].
     """
 
-    def __init__(self, policy, temporal_steps: int):
+    def __init__(self, policy: Any, temporal: int):
         self.policy = policy
-        self.temporal_steps = int(temporal_steps)
+        self.temporal = int(temporal)
         if hasattr(self.policy, "eval"):
             self.policy.eval()
 
@@ -352,23 +608,23 @@ class TemporalPolicyAdapter:
         return self
 
     def train(self):
-        if hasattr(self.policy, "train"):
-            self.policy.train()
+        # These policies are used for evaluation only; keep them in eval mode.
+        if hasattr(self.policy, "eval"):
+            self.policy.eval()
         return self
 
     @torch.no_grad()
     def __call__(self, tensordict: TensorDict) -> TensorDict:
         obs: torch.Tensor = tensordict.get("observation")
         action_mask: torch.Tensor = tensordict.get("action_mask")
-
-        required_channels = 2 + self.temporal_steps
+        required_channels = 2 + self.temporal
         if obs.shape[-3] < required_channels:
             raise RuntimeError(
-                f"Observation has {obs.shape[-3]} channels, but temporal={self.temporal_steps} "
+                f"Observation has {obs.shape[-3]} channels, but temporal={self.temporal} "
                 f"policy needs {required_channels} channels."
             )
 
-        model_obs = obs[:, :required_channels, :, :]
+        model_obs = obs[..., :required_channels, :, :]
         model_td = TensorDict(
             {
                 "observation": model_obs,
@@ -383,53 +639,67 @@ class TemporalPolicyAdapter:
 
 
 class PolicyBank:
-    """LRU cache to avoid keeping every checkpoint in GPU memory."""
+    """LRU cache for checkpoint policies.
+
+    Each architecture folder can have different temporal/channel/block settings,
+    so the cache key includes both the path and the architecture parameters.
+    """
 
     def __init__(
         self,
-        algo_cfg: DictConfig,
+        base_algo_cfg: DictConfig,
         board_size: int,
         num_envs: int,
         device: str,
         cache_size: int,
     ):
-        self.algo_cfg = algo_cfg
+        self.base_algo_cfg = base_algo_cfg
         self.board_size = int(board_size)
         self.num_envs = int(num_envs)
         self.device = device
         self.cache_size = max(1, int(cache_size))
-        self._cache: OrderedDict[tuple[str, int], TemporalPolicyAdapter] = OrderedDict()
-        self._spec_envs: dict[int, GomokuEnv] = {}
+        self._cache: OrderedDict[tuple[str, int, int, int], TemporalPolicyAdapter] = OrderedDict()
+        self._spec_envs: dict[tuple[int, int, int], GomokuEnv] = {}
 
-    def _get_spec_env(self, temporal_steps: int) -> GomokuEnv:
-        temporal_steps = int(temporal_steps)
-        if temporal_steps not in self._spec_envs:
-            self._spec_envs[temporal_steps] = GomokuEnv(
+    def _get_spec_env(self, temporal: int, num_channels: int, num_residual_blocks: int) -> GomokuEnv:
+        key = (int(temporal), int(num_channels), int(num_residual_blocks))
+        if key not in self._spec_envs:
+            self._spec_envs[key] = GomokuEnv(
                 num_envs=self.num_envs,
                 board_size=self.board_size,
                 device=self.device,
                 use_temporal_feature=True,
-                temporal_num_steps=temporal_steps,
+                temporal_num_steps=int(temporal),
                 observation_mode="temporal_move_history",
             )
-        return self._spec_envs[temporal_steps]
+        return self._spec_envs[key]
 
     def get(self, model: RoleModel) -> TemporalPolicyAdapter:
-        key = (str(Path(model.path).resolve()), int(model.temporal_steps))
+        key = (
+            str(Path(model.path).resolve()),
+            int(model.temporal),
+            int(model.num_channels),
+            int(model.num_residual_blocks),
+        )
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
 
-        spec_env = self._get_spec_env(model.temporal_steps)
+        spec_env = self._get_spec_env(
+            temporal=model.temporal,
+            num_channels=model.num_channels,
+            num_residual_blocks=model.num_residual_blocks,
+        )
+        algo_cfg = _algo_cfg_for_model(self.base_algo_cfg, model)
         policy = get_pretrained_policy(
-            name=str(self.algo_cfg.name),
-            cfg=self.algo_cfg,
+            name=str(algo_cfg.name),
+            cfg=algo_cfg,
             action_spec=spec_env.action_spec,
             observation_spec=spec_env.observation_spec,
             checkpoint_path=key[0],
             device=self.device,
         )
-        adapter = TemporalPolicyAdapter(policy=policy, temporal_steps=model.temporal_steps)
+        adapter = TemporalPolicyAdapter(policy=policy, temporal=model.temporal)
         self._cache[key] = adapter
 
         while len(self._cache) > self.cache_size:
@@ -437,21 +707,25 @@ class PolicyBank:
             del old_adapter
             if str(self.device).startswith("cuda"):
                 torch.cuda.empty_cache()
-            print(f"[CACHE] evicted {Path(old_key[0]).name} temporal={old_key[1]}")
-
+            print(
+                f"[CACHE] evicted {Path(old_key[0]).name} "
+                f"t={old_key[1]} c={old_key[2]} r={old_key[3]}"
+            )
         return adapter
 
 
 # -----------------------------------------------------------------------------
-# Evaluation and Elo
+# Evaluation and Elo fitting
 # -----------------------------------------------------------------------------
+
+
 def _interaction_type(name: str) -> InteractionType:
     name = name.lower().strip()
     if name == "random":
         return InteractionType.RANDOM
     if name == "mode":
         return InteractionType.MODE
-    raise ValueError(f"Unknown interaction type: {name}")
+    raise ValueError(f"Unknown interaction type: {name}. Use 'random' or 'mode'.")
 
 
 @torch.no_grad()
@@ -462,19 +736,16 @@ def eval_black_score(
     num_repeats: int,
     interaction: str,
 ) -> float:
-    """
-    Return black's average score.
+    """Return black's average score.
 
     score = 1.0 if black wins, 0.0 if white wins, 0.5 if no winner is produced
     within board_size * board_size moves.
     """
+
     scores: list[float] = []
     interaction_value = _interaction_type(interaction)
-
-    if hasattr(black_policy, "eval"):
-        black_policy.eval()
-    if hasattr(white_policy, "eval"):
-        white_policy.eval()
+    black_policy.eval()
+    white_policy.eval()
 
     with set_interaction_type(type=interaction_value):
         for _ in range(int(num_repeats)):
@@ -494,11 +765,11 @@ def eval_black_score(
                     tensordict = white_policy(tensordict)
 
                 tensordict = env.step_and_maybe_reset(tensordict)
-                done: torch.Tensor = tensordict.get("done")
+                done = tensordict.get("done").reshape(env.num_envs)
                 newly_done = done & (~finished)
 
                 if newly_done.any():
-                    black_win = tensordict["stats", "black_win"].float()
+                    black_win = tensordict["stats", "black_win"].float().reshape(env.num_envs)
                     black_score[newly_done] = black_win[newly_done]
                     finished |= newly_done
 
@@ -507,7 +778,8 @@ def eval_black_score(
 
             scores.append(float(black_score.mean().item()))
 
-    env.reset()
+        env.reset()
+
     return float(np.mean(scores))
 
 
@@ -525,15 +797,8 @@ def _skill_to_elo_from_centered_skill(
     centered_skill_logit: np.ndarray,
     average_rating: float = 1200.0,
 ) -> np.ndarray:
-    """
-    Convert centered logit-scale skills to Elo.
+    """Convert centered logit-scale skill to Elo points."""
 
-    Standard Elo:
-        p = 1 / (1 + 10^(-(R_A - R_B) / 400))
-
-    Therefore:
-        R_A - R_B = logit(p) * 400 / ln(10)
-    """
     centered_skill = np.asarray(centered_skill_logit, dtype=np.float64)
     return centered_skill * (400.0 / math.log(10.0)) + float(average_rating)
 
@@ -556,10 +821,9 @@ def fit_role_mle_with_alpha(
     np.ndarray,
     np.ndarray,
     np.ndarray,
-    dict,
+    dict[str, Any],
 ]:
-    """
-    Fit one joint role-separated Bradley-Terry / logistic Elo model with alpha.
+    """Fit joint role-separated Bradley-Terry / logistic Elo with alpha.
 
     Input:
         raw[i, j] = black_model_i's score as BLACK against white_model_j as WHITE
@@ -570,20 +834,8 @@ def fit_role_mle_with_alpha(
     Identifiability:
         black_skill is centered to mean 0.
         white_skill is centered to mean 0.
-
-    Interpretation:
-        black_elo_i = average_rating + black_skill_i * 400 / ln(10)
-        white_elo_j = average_rating + white_skill_j * 400 / ln(10)
-        black_advantage_elo = alpha * 400 / ln(10)
-
-        Predicted black score:
-            sigmoid((black_elo_i - white_elo_j + black_advantage_elo) * ln(10) / 400)
-
-    Optimization:
-        Adam minimizes the binomial negative log-likelihood.
-        Early stopping triggers when the best training loss has not improved for
-        `patience` consecutive iterations.
     """
+
     raw = np.asarray(black_vs_white_payoff, dtype=np.float64)
     if raw.ndim != 2:
         raise ValueError(f"black_vs_white_payoff must be 2D, got shape={raw.shape}")
@@ -596,33 +848,23 @@ def fit_role_mle_with_alpha(
 
     num_black, num_white = raw.shape
     games_np = np.full_like(raw, float(games_per_pair), dtype=np.float64)
-
     y = torch.tensor(raw, dtype=torch.float64)
     n = torch.tensor(games_np, dtype=torch.float64)
 
     black_raw = torch.zeros(num_black, dtype=torch.float64, requires_grad=True)
     white_raw = torch.zeros(num_white, dtype=torch.float64, requires_grad=True)
     alpha = torch.zeros((), dtype=torch.float64, requires_grad=True)
-
     optimizer = torch.optim.Adam([black_raw, white_raw, alpha], lr=float(lr))
 
     def objective() -> torch.Tensor:
         black_skill = black_raw - black_raw.mean()
         white_skill = white_raw - white_raw.mean()
         logits = alpha + black_skill[:, None] - white_skill[None, :]
-
-        bce = torch.nn.functional.binary_cross_entropy_with_logits(
-            logits,
-            y,
-            reduction="none",
-        )
+        bce = torch.nn.functional.binary_cross_entropy_with_logits(logits, y, reduction="none")
         loss = (bce * n).sum() / n.sum().clamp_min(1.0)
-
         if l2 > 0:
             loss = loss + float(l2) * (
-                black_skill.square().mean()
-                + white_skill.square().mean()
-                + alpha.square()
+                black_skill.square().mean() + white_skill.square().mean() + alpha.square()
             )
         return loss
 
@@ -641,7 +883,6 @@ def fit_role_mle_with_alpha(
 
         last_loss = float(loss.detach().cpu().item())
         loss_history.append(last_loss)
-
         if last_loss < best_loss - float(min_delta):
             best_loss = last_loss
             best_iter = iteration
@@ -654,9 +895,8 @@ def fit_role_mle_with_alpha(
                 }
         else:
             bad_count += 1
-
-        if bad_count >= int(patience):
-            break
+            if bad_count >= int(patience):
+                break
 
     if best_state is not None:
         with torch.no_grad():
@@ -671,13 +911,12 @@ def fit_role_mle_with_alpha(
 
     pred_black_score = _sigmoid(alpha_logit + black_skill[:, None] - white_skill[None, :])
     pred_white_score = 1.0 - pred_black_score.T
-
     black_elo = _skill_to_elo_from_centered_skill(black_skill, average_rating=average_rating)
     white_elo = _skill_to_elo_from_centered_skill(white_skill, average_rating=average_rating)
     black_advantage_elo = alpha_logit * (400.0 / math.log(10.0))
 
     # Derived square payoff inside each same-role pool. These are not real games;
-    # they are a visualization of fitted relative skills within the same role.
+    # they visualize fitted relative skill within each role.
     black_model_payoff = _sigmoid(black_skill[:, None] - black_skill[None, :])
     white_model_payoff = _sigmoid(white_skill[:, None] - white_skill[None, :])
     np.fill_diagonal(black_model_payoff, 0.5)
@@ -685,17 +924,11 @@ def fit_role_mle_with_alpha(
 
     eps = 1e-12
     pred_clip = np.clip(pred_black_score, eps, 1.0 - eps)
-    nll = -np.sum(
-        games_np
-        * (
-            raw * np.log(pred_clip)
-            + (1.0 - raw) * np.log(1.0 - pred_clip)
-        )
-    )
+    nll = -np.sum(games_np * (raw * np.log(pred_clip) + (1.0 - raw) * np.log(1.0 - pred_clip)))
     nll_per_game = float(nll / max(np.sum(games_np), 1.0))
     rmse = float(np.sqrt(np.mean((pred_black_score - raw) ** 2)))
 
-    diagnostics = {
+    diagnostics: dict[str, Any] = {
         "model": "sigmoid(alpha + black_skill_i - white_skill_j)",
         "average_rating": float(average_rating),
         "games_per_pair": int(games_per_pair),
@@ -739,493 +972,365 @@ def fit_role_mle_with_alpha(
     )
 
 
-def role_elos_from_black_vs_white_payoff_mle_with_alpha(
-    black_vs_white_payoff: np.ndarray,
-    average_rating: float = 1200.0,
-    games_per_pair: int = 1024,
-    l2: float = 1e-4,
-    max_iter: int = 5000,
-    patience: int = 100,
-    lr: float = 0.05,
-    min_delta: float = 1e-10,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    dict,
-]:
-    """
-    Compute role-separated MLE Elo from the real rectangular black-vs-white matrix.
-
-    Input:
-        raw[i, j] = black_model_i's score as black against white_model_j as white
-
-    Joint model:
-        P(black_i scores against white_j) = sigmoid(alpha + black_skill_i - white_skill_j)
-
-    This is the alpha-based method:
-        - black_skill_i compares black models inside the black role pool.
-        - white_skill_j compares white models inside the white role pool.
-        - alpha captures the global black first-move advantage.
-    """
-    return fit_role_mle_with_alpha(
-        black_vs_white_payoff=black_vs_white_payoff,
-        average_rating=average_rating,
-        games_per_pair=games_per_pair,
-        l2=l2,
-        max_iter=max_iter,
-        patience=patience,
-        lr=lr,
-        min_delta=min_delta,
-    )
-
-
 # -----------------------------------------------------------------------------
-# Saving / loading
+# IO helpers
 # -----------------------------------------------------------------------------
-def save_matrix_csv(path: Path, matrix: np.ndarray, row_labels: list[str], col_labels: list[str], row_header: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def write_models_csv(path: Path, models: Sequence[RoleModel]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "name",
+                "color",
+                "h_folder",
+                "h_label",
+                "temporal",
+                "num_channels",
+                "num_residual_blocks",
+                "step",
+                "path",
+            ],
+        )
+        writer.writeheader()
+        for m in models:
+            writer.writerow(asdict(m))
+
+
+def write_matrix_csv(path: Path, row_names: Sequence[str], col_names: Sequence[str], matrix: np.ndarray) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow([row_header] + col_labels)
-        for label, row in zip(row_labels, matrix):
-            writer.writerow([label] + [f"{x:.8f}" if np.isfinite(x) else "nan" for x in row])
+        writer.writerow([""] + list(col_names))
+        for name, row in zip(row_names, matrix):
+            writer.writerow([name] + ["" if np.isnan(x) else f"{float(x):.8f}" for x in row])
 
 
-def load_matrix_csv_if_compatible(path: Path, row_labels: list[str], col_labels: list[str]) -> np.ndarray | None:
-    if not path.exists():
+def write_elo_csv(path: Path, models: Sequence[RoleModel], elos: np.ndarray, skills: np.ndarray) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "name",
+                "color",
+                "h_folder",
+                "h_label",
+                "temporal",
+                "num_channels",
+                "num_residual_blocks",
+                "step",
+                "elo",
+                "skill_logit_centered",
+                "path",
+            ],
+        )
+        writer.writeheader()
+        for model, elo, skill in zip(models, elos, skills):
+            row = asdict(model)
+            row["elo"] = f"{float(elo):.6f}"
+            row["skill_logit_centered"] = f"{float(skill):.10f}"
+            writer.writerow(row)
+
+
+def _names(models: Sequence[RoleModel]) -> list[str]:
+    return [m.name for m in models]
+
+
+def _load_payoff_cache(cache_path: Path, black_models: Sequence[RoleModel], white_models: Sequence[RoleModel]) -> np.ndarray | None:
+    if not cache_path.exists():
+        return None
+    try:
+        data = np.load(cache_path, allow_pickle=True)
+        old_black = [str(x) for x in data["black_names"].tolist()]
+        old_white = [str(x) for x in data["white_names"].tolist()]
+        matrix = np.asarray(data["payoff"], dtype=np.float64)
+    except Exception as exc:
+        print(f"[WARN] failed to load payoff cache {cache_path}: {exc}")
         return None
 
-    with path.open("r", newline="", encoding="utf-8") as f:
-        rows = list(csv.reader(f))
-    if not rows or len(rows[0]) < 2:
+    if old_black != _names(black_models) or old_white != _names(white_models):
+        print("[WARN] payoff cache exists but model list changed; ignoring cache.")
         return None
-
-    old_cols = rows[0][1:]
-    old_col_index = {label: i for i, label in enumerate(old_cols)}
-    new_row_index = {label: i for i, label in enumerate(row_labels)}
-
-    matrix = np.full((len(row_labels), len(col_labels)), np.nan, dtype=np.float64)
-    for old_row in rows[1:]:
-        if not old_row:
-            continue
-        row_label = old_row[0]
-        if row_label not in new_row_index:
-            continue
-        new_i = new_row_index[row_label]
-        for new_j, col_label in enumerate(col_labels):
-            old_j = old_col_index.get(col_label)
-            if old_j is None:
-                continue
-            value_text_index = old_j + 1
-            if value_text_index >= len(old_row):
-                continue
-            try:
-                matrix[new_i, new_j] = float(old_row[value_text_index])
-            except ValueError:
-                matrix[new_i, new_j] = np.nan
-
+    if matrix.shape != (len(black_models), len(white_models)):
+        print("[WARN] payoff cache shape mismatch; ignoring cache.")
+        return None
     return matrix
 
 
-def save_role_elo_csv(
-    path: Path,
-    models: list[RoleModel],
-    elo: np.ndarray,
-    role_strength: np.ndarray,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["name", "color", "temporal_steps", "step", "elo", "mle_skill_logit", "path"])
-        for model, rating, strength in zip(models, elo, role_strength):
-            writer.writerow(
-                [
-                    model.name,
-                    model.color,
-                    model.temporal_steps,
-                    model.step,
-                    f"{float(rating):.6f}",
-                    f"{float(strength):.8f}",
-                    model.path,
-                ]
-            )
-
-
-def save_combined_elo_csv(
-    path: Path,
-    black_models: list[RoleModel],
-    black_elo: np.ndarray,
-    black_strength: np.ndarray,
-    white_models: list[RoleModel],
-    white_elo: np.ndarray,
-    white_strength: np.ndarray,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["name", "color", "temporal_steps", "step", "elo", "mle_skill_logit", "path"])
-        for model, rating, strength in zip(black_models, black_elo, black_strength):
-            writer.writerow([model.name, model.color, model.temporal_steps, model.step, f"{float(rating):.6f}", f"{float(strength):.8f}", model.path])
-        for model, rating, strength in zip(white_models, white_elo, white_strength):
-            writer.writerow([model.name, model.color, model.temporal_steps, model.step, f"{float(rating):.6f}", f"{float(strength):.8f}", model.path])
-
-
-def save_meta_json(path: Path, config: EvalConfig, black_models: list[RoleModel], white_models: list[RoleModel]) -> None:
-    payload = {
-        "config": asdict(config),
-        "black_models": [asdict(v) for v in black_models],
-        "white_models": [asdict(v) for v in white_models],
-        "meaning": {
-            "black_vs_white_payoff": "row black model's score as black against column white model as white",
-            "black_elo": "role-separated black-model MLE Elo from joint alpha model; mean centered to 1200",
-            "white_elo": "role-separated white-model MLE Elo from joint alpha model; mean centered to 1200",
-            "black_advantage_elo": "fitted global first-move advantage for black, used as black_elo - white_elo + black_advantage_elo",
-            "black_model_payoff_for_elo": "derived square payoff among black models from MLE black skills",
-            "white_model_payoff_for_elo": "derived square payoff among white models from MLE white skills",
-        },
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+def _save_payoff_cache(cache_path: Path, black_models: Sequence[RoleModel], white_models: Sequence[RoleModel], payoff: np.ndarray) -> None:
+    np.savez_compressed(
+        cache_path,
+        black_names=np.asarray(_names(black_models), dtype=object),
+        white_names=np.asarray(_names(white_models), dtype=object),
+        payoff=np.asarray(payoff, dtype=np.float64),
+    )
 
 
 # -----------------------------------------------------------------------------
 # Plotting
 # -----------------------------------------------------------------------------
-def _group_points(models: list[RoleModel], elo: np.ndarray) -> dict[int, list[tuple[int, float]]]:
-    groups: dict[int, list[tuple[int, float]]] = defaultdict(list)
-    for model, rating in zip(models, elo):
-        groups[int(model.temporal_steps)].append((int(model.step), float(rating)))
-    return groups
 
 
-def plot_role_curve(path: Path, models: list[RoleModel], elo: np.ndarray, title: str) -> None:
-    groups = _group_points(models, elo)
-    plt.figure(figsize=(10, 6))
-    for temporal_steps in sorted(groups.keys()):
-        points = sorted(groups[temporal_steps], key=lambda x: x[0])
-        steps = [p[0] for p in points]
-        ratings = [p[1] for p in points]
-        plt.plot(steps, ratings, marker="o", linewidth=1.8, label=f"temporal={temporal_steps}")
+def plot_role_elo_curve(path: Path, title: str, models: Sequence[RoleModel], elos: np.ndarray) -> None:
+    groups: dict[str, list[tuple[int, float, RoleModel]]] = defaultdict(list)
+    for model, elo in zip(models, elos):
+        groups[model.h_label].append((int(model.step), float(elo), model))
 
-    plt.xlabel("training step")
-    plt.ylabel("Elo rating")
+    plt.figure(figsize=(12, 7))
+    for label, rows in sorted(groups.items(), key=lambda kv: kv[0]):
+        rows = sorted(rows, key=lambda x: x[0])
+        xs = [x[0] for x in rows]
+        ys = [x[1] for x in rows]
+        plt.plot(xs, ys, marker="o", linewidth=1.5, markersize=3, label=label)
+
     plt.title(title)
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(path, dpi=200)
-    plt.close()
-
-
-def plot_combined_role_curve(
-    path: Path,
-    black_models: list[RoleModel],
-    black_elo: np.ndarray,
-    white_models: list[RoleModel],
-    white_elo: np.ndarray,
-) -> None:
-    plt.figure(figsize=(11, 7))
-
-    for role_name, models, ratings in [
-        ("black", black_models, black_elo),
-        ("white", white_models, white_elo),
-    ]:
-        groups = _group_points(models, ratings)
-        for temporal_steps in sorted(groups.keys()):
-            points = sorted(groups[temporal_steps], key=lambda x: x[0])
-            steps = [p[0] for p in points]
-            values = [p[1] for p in points]
-            plt.plot(
-                steps,
-                values,
-                marker="o",
-                linewidth=1.8,
-                label=f"{role_name}, temporal={temporal_steps}",
-            )
-
     plt.xlabel("training step")
-    plt.ylabel("Elo rating")
-    plt.title("Role-separated Gomoku Elo curves")
+    plt.ylabel("Elo")
     plt.grid(True, alpha=0.3)
-    plt.legend()
+    if len(groups) <= 20:
+        plt.legend(fontsize=8)
+    else:
+        plt.legend(fontsize=6, ncol=2)
     plt.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(path, dpi=200)
+    plt.close()
+
+
+def plot_payoff_heatmap(path: Path, matrix: np.ndarray, row_names: Sequence[str], col_names: Sequence[str]) -> None:
+    plt.figure(figsize=(max(8, min(20, len(col_names) * 0.35)), max(6, min(20, len(row_names) * 0.35))))
+    plt.imshow(matrix, aspect="auto", vmin=0.0, vmax=1.0)
+    plt.colorbar(label="black score")
+    plt.title("Black-vs-white payoff matrix")
+    plt.xlabel("white model")
+    plt.ylabel("black model")
+
+    def _tick_positions(n: int, max_ticks: int = 25) -> list[int]:
+        if n <= max_ticks:
+            return list(range(n))
+        return sorted({int(round(x)) for x in np.linspace(0, n - 1, max_ticks)})
+
+    x_ticks = _tick_positions(len(col_names))
+    y_ticks = _tick_positions(len(row_names))
+    plt.xticks(x_ticks, [col_names[i] for i in x_ticks], rotation=90, fontsize=6)
+    plt.yticks(y_ticks, [row_names[i] for i in y_ticks], fontsize=6)
+    plt.tight_layout()
     plt.savefig(path, dpi=200)
     plt.close()
 
 
 # -----------------------------------------------------------------------------
-# Main
+# Main evaluation
 # -----------------------------------------------------------------------------
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate role-separated Gomoku Elo for temporal-feature checkpoint pools.")
-    parser.add_argument(
-        "--model-root",
-        type=str,
-        default=None,
-        help="Model root. If omitted, the script tries ./elo_models then ./eval_models.",
-    )
-    parser.add_argument(
-        "--temporal-steps",
-        type=int,
-        nargs="+",
-        default=[1, 6],
-        help="Temporal feature settings to include in the model pool. Default: 1 6.",
-    )
-    parser.add_argument(
-        "--auto-temporal-steps",
-        action="store_true",
-        help="Ignore --temporal-steps and auto-detect temporal folders under model root.",
-    )
-    parser.add_argument("--board-size", type=int, default=15)
-    parser.add_argument("--num-envs", type=int, default=1024)
-    parser.add_argument("--num-repeats", type=int, default=1)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument(
-        "--algo-cfg",
-        type=str,
-        default=None,
-        help="PPO yaml path. Default: cfg/algo/ppo.yaml from the project.",
-    )
-    parser.add_argument("--output-dir", type=str, default="elo_eval_outputs")
-    parser.add_argument("--average-rating", type=float, default=1200.0)
-    parser.add_argument("--elo-l2", type=float, default=1e-4, help="L2 regularization for MLE Elo fitting.")
-    parser.add_argument("--elo-max-iter", type=int, default=5000, help="Maximum Adam iterations for MLE Elo fitting.")
-    parser.add_argument("--elo-patience", type=int, default=100, help="Early stop after this many iterations without best-loss improvement.")
-    parser.add_argument("--elo-lr", type=float, default=0.05, help="Adam learning rate for MLE Elo fitting.")
-    parser.add_argument("--elo-min-delta", type=float, default=1e-10, help="Minimum best-loss improvement required to reset patience.")
-    parser.add_argument("--cache-size", type=int, default=4)
-    parser.add_argument(
-        "--interaction",
-        type=str,
-        choices=["random", "mode"],
-        default="random",
-        help="random samples from the policy; mode takes the greedy categorical mode.",
-    )
-    parser.add_argument("--no-resume", action="store_true", help="Do not resume from existing black_vs_white_payoff.csv.")
-    parser.add_argument("--step-min", type=int, default=None)
-    parser.add_argument("--step-max", type=int, default=None)
-    parser.add_argument("--step-mod", type=int, default=None, help="Only keep steps divisible by this value.")
-    parser.add_argument(
-        "--limit-per-temporal",
-        type=int,
-        default=None,
-        help="For quick tests: evenly subsample at most this many black and white checkpoints for each temporal setting.",
-    )
-    return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def run_eval(cfg: EvalConfig) -> None:
+    model_root = Path(cfg.f).expanduser().resolve()
+    if not model_root.exists():
+        raise FileNotFoundError(f"model root f does not exist: {model_root}")
 
-    if str(args.device).startswith("cuda") and not torch.cuda.is_available():
-        print("[WARN] CUDA requested but not available; fallback to CPU.")
-        args.device = "cpu"
+    output_dir = Path(cfg.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    torch.manual_seed(0)
-    np.random.seed(0)
-
-    model_root = resolve_model_root(args.model_root)
-    temporal_steps = scan_temporal_steps(model_root) if args.auto_temporal_steps else [int(x) for x in args.temporal_steps]
-    if not temporal_steps:
-        raise RuntimeError(f"No temporal model folders found under {model_root}")
-
-    algo_cfg_path = Path(args.algo_cfg).expanduser().resolve() if args.algo_cfg else Path(CONFIG_PATH) / "algo" / "ppo.yaml"
-    output_dir = Path(args.output_dir).expanduser().resolve()
-
-    algo_cfg = OmegaConf.load(algo_cfg_path)
-    OmegaConf.set_struct(algo_cfg, False)
-
-    eval_cfg = EvalConfig(
-        model_root=str(model_root),
-        temporal_steps=temporal_steps,
-        board_size=int(args.board_size),
-        num_envs=int(args.num_envs),
-        num_repeats=int(args.num_repeats),
-        device=str(args.device),
-        algo_cfg=str(algo_cfg_path),
-        output_dir=str(output_dir),
-        average_rating=float(args.average_rating),
-        cache_size=int(args.cache_size),
-        interaction=str(args.interaction),
-        resume=not bool(args.no_resume),
-        step_min=args.step_min,
-        step_max=args.step_max,
-        step_mod=args.step_mod,
-        limit_per_temporal=args.limit_per_temporal,
-        elo_l2=float(args.elo_l2),
-        elo_max_iter=int(args.elo_max_iter),
-        elo_patience=int(args.elo_patience),
-        elo_lr=float(args.elo_lr),
-        elo_min_delta=float(args.elo_min_delta),
-    )
+    print(f"[CONFIG] f={model_root}")
+    print(f"[CONFIG] output_dir={output_dir}")
+    print("[CONFIG] h=")
+    for spec in cfg.h:
+        print(
+            f"  - folder={spec.folder} temporal={spec.temporal} "
+            f"num_channels={spec.num_channels} num_residual_blocks={spec.num_residual_blocks}"
+        )
 
     black_models, white_models = discover_role_models(
         model_root=model_root,
-        temporal_steps=temporal_steps,
-        step_min=args.step_min,
-        step_max=args.step_max,
-        step_mod=args.step_mod,
-        limit_per_temporal=args.limit_per_temporal,
+        h_specs=cfg.h,
+        step_min=cfg.step_min,
+        step_max=cfg.step_max,
+        step_mod=cfg.step_mod,
+        limit_per_h=cfg.limit_per_h,
     )
-
     if not black_models:
-        raise RuntimeError("No black checkpoints found. Check temporal_xxx/black/black_00000.pt layout.")
+        raise RuntimeError("No black checkpoints discovered.")
     if not white_models:
-        raise RuntimeError("No white checkpoints found. Check temporal_xxx/white/white_00000.pt layout.")
+        raise RuntimeError("No white checkpoints discovered.")
 
-    black_labels = [m.name for m in black_models]
-    white_labels = [m.name for m in white_models]
-    max_history_steps = max([m.temporal_steps for m in black_models + white_models])
+    print(f"[INFO] discovered black models: {len(black_models)}")
+    print(f"[INFO] discovered white models: {len(white_models)}")
 
-    print(f"[INFO] model_root      = {model_root}")
-    print(f"[INFO] algo_cfg        = {algo_cfg_path}")
-    print(f"[INFO] output_dir      = {output_dir}")
-    print(f"[INFO] device          = {args.device}")
-    print(f"[INFO] num_envs        = {args.num_envs}")
-    print(f"[INFO] num_repeats     = {args.num_repeats}")
-    print(f"[INFO] interaction     = {args.interaction}")
-    print(f"[INFO] temporal_steps  = {temporal_steps}")
-    print(f"[INFO] max_history     = {max_history_steps}")
-    print(f"[INFO] black models    = {len(black_models)}")
-    print(f"[INFO] white models    = {len(white_models)}")
+    write_models_csv(output_dir / "black_models.csv", black_models)
+    write_models_csv(output_dir / "white_models.csv", white_models)
 
-    for color, models in [("black", black_models), ("white", white_models)]:
-        for temporal_n in sorted(set(m.temporal_steps for m in models)):
-            count = sum(m.temporal_steps == temporal_n for m in models)
-            print(f"       {color}, temporal={temporal_n}: {count} checkpoints")
-
-    save_meta_json(output_dir / "meta.json", eval_cfg, black_models, white_models)
-
-    payoff_path = output_dir / "black_vs_white_payoff.csv"
-    payoff = None
-    if eval_cfg.resume:
-        payoff = load_matrix_csv_if_compatible(payoff_path, black_labels, white_labels)
-        if payoff is not None:
-            print(f"[INFO] resume from {payoff_path}")
-    if payoff is None:
-        payoff = np.full((len(black_models), len(white_models)), np.nan, dtype=np.float64)
-
+    max_temporal = max([m.temporal for m in black_models] + [m.temporal for m in white_models])
     env = GomokuEnv(
-        num_envs=args.num_envs,
-        board_size=args.board_size,
-        device=args.device,
+        num_envs=int(cfg.num_envs),
+        board_size=int(cfg.board_size),
+        device=str(cfg.device),
         use_temporal_feature=True,
-        temporal_num_steps=max_history_steps,
+        temporal_num_steps=int(max_temporal),
         observation_mode="temporal_move_history",
     )
 
+    base_algo_cfg = _load_base_algo_cfg(cfg.algo_cfg)
     bank = PolicyBank(
-        algo_cfg=algo_cfg,
-        board_size=args.board_size,
-        num_envs=args.num_envs,
-        device=args.device,
-        cache_size=args.cache_size,
+        base_algo_cfg=base_algo_cfg,
+        board_size=int(cfg.board_size),
+        num_envs=int(cfg.num_envs),
+        device=str(cfg.device),
+        cache_size=int(cfg.cache_size),
     )
 
+    cache_path = output_dir / "payoff_cache.npz"
+    payoff = None
+    if cfg.resume:
+        payoff = _load_payoff_cache(cache_path, black_models, white_models)
+        if payoff is not None:
+            finished = int(np.isfinite(payoff).sum())
+            total = payoff.size
+            print(f"[RESUME] loaded payoff cache: {finished}/{total} pairs finished")
+
+    if payoff is None:
+        payoff = np.full((len(black_models), len(white_models)), np.nan, dtype=np.float64)
+
     total_pairs = len(black_models) * len(white_models)
+    pair_index = 0
     for i, black_model in enumerate(black_models):
         for j, white_model in enumerate(white_models):
+            pair_index += 1
             if np.isfinite(payoff[i, j]):
                 continue
-
-            progress = int(np.isfinite(payoff).sum()) + 1
             print(
-                f"[{progress:>5}/{total_pairs}] "
-                f"{black_model.name} as BLACK  vs  {white_model.name} as WHITE"
+                f"[EVAL] {pair_index}/{total_pairs} "
+                f"black={black_model.name} vs white={white_model.name}"
             )
-
             black_policy = bank.get(black_model)
             white_policy = bank.get(white_model)
             score = eval_black_score(
                 env=env,
                 black_policy=black_policy,
                 white_policy=white_policy,
-                num_repeats=args.num_repeats,
-                interaction=args.interaction,
+                num_repeats=int(cfg.num_repeats),
+                interaction=str(cfg.interaction),
             )
-            payoff[i, j] = score
-            print(f"        black_score={score:.4f}, white_score={1.0 - score:.4f}")
+            payoff[i, j] = float(score)
+            print(f"[RESULT] black_score={score:.6f}")
 
-            save_matrix_csv(payoff_path, payoff, black_labels, white_labels, row_header="black_model")
+            _save_payoff_cache(cache_path, black_models, white_models, payoff)
+            write_matrix_csv(output_dir / "black_vs_white_payoff.csv", _names(black_models), _names(white_models), payoff)
 
+    if np.isnan(payoff).any():
+        raise RuntimeError("payoff matrix still contains NaN values after evaluation.")
+
+    games_per_pair = int(cfg.num_envs) * int(cfg.num_repeats)
     (
         black_elo,
         white_elo,
         black_model_payoff,
         white_model_payoff,
-        black_strength,
-        white_strength,
+        black_skill,
+        white_skill,
         pred_black_score,
         pred_white_score,
-        mle_diagnostics,
-    ) = role_elos_from_black_vs_white_payoff_mle_with_alpha(
+        diagnostics,
+    ) = fit_role_mle_with_alpha(
         payoff,
-        average_rating=args.average_rating,
-        games_per_pair=int(args.num_envs) * int(args.num_repeats),
-        l2=args.elo_l2,
-        max_iter=args.elo_max_iter,
-        patience=args.elo_patience,
-        lr=args.elo_lr,
-        min_delta=args.elo_min_delta,
+        average_rating=float(cfg.average_rating),
+        games_per_pair=games_per_pair,
+        l2=float(cfg.elo_l2),
+        max_iter=int(cfg.elo_max_iter),
+        patience=int(cfg.elo_patience),
+        lr=float(cfg.elo_lr),
+        min_delta=float(cfg.elo_min_delta),
     )
 
-    save_matrix_csv(payoff_path, payoff, black_labels, white_labels, row_header="black_model")
-    save_matrix_csv(output_dir / "black_model_payoff_for_elo.csv", black_model_payoff, black_labels, black_labels, row_header="black_model")
-    save_matrix_csv(output_dir / "white_model_payoff_for_elo.csv", white_model_payoff, white_labels, white_labels, row_header="white_model")
-
-    # MLE predictions:
-    #   pred_black_score rows = black models, columns = white models.
-    #   pred_white_score rows = white models, columns = black models.
-    save_matrix_csv(output_dir / "mle_predicted_black_score.csv", pred_black_score, black_labels, white_labels, row_header="black_model")
-    save_matrix_csv(output_dir / "mle_predicted_white_score.csv", pred_white_score, white_labels, black_labels, row_header="white_model")
-    (output_dir / "mle_with_alpha_diagnostics.json").write_text(
-        json.dumps(mle_diagnostics, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    diagnostics.update(
+        {
+            "config": {
+                "f": str(model_root),
+                "h": [asdict(x) for x in cfg.h],
+                "board_size": int(cfg.board_size),
+                "num_envs": int(cfg.num_envs),
+                "num_repeats": int(cfg.num_repeats),
+                "device": str(cfg.device),
+                "algo_cfg": str(cfg.algo_cfg),
+                "interaction": str(cfg.interaction),
+                "cache_size": int(cfg.cache_size),
+                "step_min": cfg.step_min,
+                "step_max": cfg.step_max,
+                "step_mod": cfg.step_mod,
+                "limit_per_h": cfg.limit_per_h,
+            },
+            "num_black_models": len(black_models),
+            "num_white_models": len(white_models),
+            "black_models": [asdict(x) for x in black_models],
+            "white_models": [asdict(x) for x in white_models],
+        }
     )
 
-    save_role_elo_csv(output_dir / "black_elo_ratings.csv", black_models, black_elo, black_strength)
-    save_role_elo_csv(output_dir / "white_elo_ratings.csv", white_models, white_elo, white_strength)
-    save_combined_elo_csv(
-        output_dir / "role_elo_ratings.csv",
-        black_models,
-        black_elo,
-        black_strength,
-        white_models,
-        white_elo,
-        white_strength,
+    write_matrix_csv(output_dir / "black_vs_white_payoff.csv", _names(black_models), _names(white_models), payoff)
+    write_matrix_csv(output_dir / "predicted_black_scores.csv", _names(black_models), _names(white_models), pred_black_score)
+    write_matrix_csv(output_dir / "predicted_white_scores.csv", _names(white_models), _names(black_models), pred_white_score)
+    write_matrix_csv(output_dir / "black_model_payoff_for_elo.csv", _names(black_models), _names(black_models), black_model_payoff)
+    write_matrix_csv(output_dir / "white_model_payoff_for_elo.csv", _names(white_models), _names(white_models), white_model_payoff)
+    write_elo_csv(output_dir / "black_elo_ratings.csv", black_models, black_elo, black_skill)
+    write_elo_csv(output_dir / "white_elo_ratings.csv", white_models, white_elo, white_skill)
+
+    with (output_dir / "elo_diagnostics.json").open("w", encoding="utf-8") as f:
+        json.dump(diagnostics, f, ensure_ascii=False, indent=2)
+
+    plot_role_elo_curve(output_dir / "black_elo_curve.png", "Black role Elo", black_models, black_elo)
+    plot_role_elo_curve(output_dir / "white_elo_curve.png", "White role Elo", white_models, white_elo)
+    plot_payoff_heatmap(output_dir / "black_vs_white_payoff_heatmap.png", payoff, _names(black_models), _names(white_models))
+
+    print("[DONE] Elo evaluation finished.")
+    print(f"[DONE] output_dir={output_dir}")
+    print(f"[DONE] black_advantage_elo={diagnostics['black_advantage_elo']:.3f}")
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Role-separated Elo evaluation for configured Gomoku model folders.")
+    parser.add_argument("--config", type=str, default=None, help="YAML/JSON config file. Recommended.")
+    parser.add_argument("--f", "--model-root", dest="f", type=str, default=None, help="Root folder containing black/ and white/.")
+    parser.add_argument(
+        "--h",
+        type=str,
+        default=None,
+        help=(
+            "JSON/YAML list of architecture folder specs. Example: "
+            "'[{\"folder\":\"temporal1_c64_r4\",\"temporal\":1,\"num_channels\":64,\"num_residual_blocks\":4}]'"
+        ),
     )
+    parser.add_argument("--board-size", type=int, default=None)
+    parser.add_argument("--num-envs", type=int, default=None)
+    parser.add_argument("--num-repeats", type=int, default=None)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--algo-cfg", type=str, default=None, help="Algo config name such as ppo, or a YAML path.")
+    parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--average-rating", type=float, default=None)
+    parser.add_argument("--cache-size", type=int, default=None)
+    parser.add_argument("--interaction", type=str, choices=["random", "mode"], default=None)
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--step-min", type=int, default=None)
+    parser.add_argument("--step-max", type=int, default=None)
+    parser.add_argument("--step-mod", type=int, default=None)
+    parser.add_argument("--limit-per-h", type=int, default=None)
+    parser.add_argument("--elo-l2", type=float, default=None)
+    parser.add_argument("--elo-max-iter", type=int, default=None)
+    parser.add_argument("--elo-patience", type=int, default=None)
+    parser.add_argument("--elo-lr", type=float, default=None)
+    parser.add_argument("--elo-min-delta", type=float, default=None)
+    return parser
 
-    plot_role_curve(output_dir / "black_elo_curve.png", black_models, black_elo, "Black-model MLE Elo curve")
-    plot_role_curve(output_dir / "white_elo_curve.png", white_models, white_elo, "White-model MLE Elo curve")
-    plot_combined_role_curve(output_dir / "role_elo_curve.png", black_models, black_elo, white_models, white_elo)
 
-    print("\n[RESULT] Black-model Elo ratings:")
-    for model, rating in sorted(zip(black_models, black_elo), key=lambda x: (x[0].temporal_steps, x[0].step)):
-        print(f"  {model.name:>20s}  Elo={rating:8.2f}")
-
-    print("\n[RESULT] White-model Elo ratings:")
-    for model, rating in sorted(zip(white_models, white_elo), key=lambda x: (x[0].temporal_steps, x[0].step)):
-        print(f"  {model.name:>20s}  Elo={rating:8.2f}")
-
-    print("\n[RESULT] Fitted global black advantage:")
-    print(f"  alpha_logit={mle_diagnostics['alpha_logit']:.8f}")
-    print(f"  black_advantage_elo={mle_diagnostics['black_advantage_elo']:.2f}")
-    print(f"  MLE iterations={mle_diagnostics['iterations_run']}  best_iter={mle_diagnostics['best_iter']}  stopped_early={mle_diagnostics['stopped_early']}")
-
-    print(f"\n[DONE] real payoff:       {payoff_path}")
-    print(f"[DONE] black Elo csv:    {output_dir / 'black_elo_ratings.csv'}")
-    print(f"[DONE] white Elo csv:    {output_dir / 'white_elo_ratings.csv'}")
-    print(f"[DONE] combined Elo csv: {output_dir / 'role_elo_ratings.csv'}")
-    print(f"[DONE] diagnostics:      {output_dir / 'mle_with_alpha_diagnostics.json'}")
-    print(f"[DONE] combined figure:  {output_dir / 'role_elo_curve.png'}")
+def main() -> None:
+    warnings.filterwarnings("default")
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    cfg = _load_config(args)
+    run_eval(cfg)
 
 
 if __name__ == "__main__":
