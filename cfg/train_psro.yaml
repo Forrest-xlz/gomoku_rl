@@ -1,5 +1,5 @@
 seed: 0
-num_envs: 512
+num_envs: 4096
 board_size: 15
 device: cuda
 out_device: cpu
@@ -8,7 +8,7 @@ version_name: psro-temporal-6-test
 augment: false
 
 epochs: 20000
-steps: 128
+steps: 16
 save_interval: 300
 log_interval: 10
 
