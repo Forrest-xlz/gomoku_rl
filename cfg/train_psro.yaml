@@ -38,13 +38,13 @@ m: 10
 # Training model pool.
 # f stores checkpoint files. e stores metadata. If e is empty/missing, a new
 # pool_meta.json is created under f.
-f: train_model_pool_test
+f: train_model_pool_psro-temporal6-block8-epoch1-numenvs1024
 e: 
 
 # Training-time Elo model pool.
 # elo_models stores checkpoint files. elo_e stores entries + payoff.
 # If elo_e points to existing metadata, current start checkpoint is not added.
-elo_models: elo_eval_model_pool_test
+elo_models: elo_eval_model_pool_psro-temporal6-block8-epoch1-numenvs1024
 elo_e:
 elo_interval: 200
 elo_eval_repeats: 1

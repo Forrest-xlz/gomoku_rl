@@ -41,6 +41,7 @@ class PPO(Policy):
     requested that RNG isolation is unnecessary.
 
     Optional config under cfg.algo.noise_scale:
+
         noise_scale:
           enabled: true
           interval: 20
@@ -60,6 +61,7 @@ class PPO(Policy):
         device: DeviceLike = "cuda",
     ) -> None:
         super().__init__(cfg, action_spec, observation_spec, device)
+
         self.cfg: DictConfig = cfg
         self.device: DeviceLike = device
 
@@ -98,6 +100,7 @@ class PPO(Policy):
         fake_input = observation_spec.zero()
         fake_input["action_mask"] = ~fake_input["action_mask"]
         fake_input = fake_input.to(self.device)
+
         with torch.no_grad():
             self.actor(fake_input)
             self.critic(fake_input)
@@ -170,6 +173,7 @@ class PPO(Policy):
         critic_input = tensordict.select("hidden", "observation", strict=False)
         critic_output = self.critic(critic_input)
         tensordict.update(critic_output)
+
         return tensordict
 
     # -------------------------------------------------------------------------
@@ -193,12 +197,13 @@ class PPO(Policy):
         """Compute PPO clip fraction without calling actor.get_dist().
 
         Some TorchRL/TensorDict versions can build up nested functional wrappers
-        around ``get_dist`` after many repeated manual calls. This fallback
-        instead runs the actor once, reads the output ``probs``, and gathers the
-        probability of the rollout action directly.
+        around ``get_dist`` after many repeated manual calls. This fallback instead
+        runs the actor once, reads the output ``probs``, and gathers the probability
+        of the rollout action directly.
         """
         old_log_prob = minibatch.get("sample_log_prob", None)
         action = minibatch.get("action", None)
+
         if old_log_prob is None or action is None:
             return None
 
@@ -209,16 +214,19 @@ class PPO(Policy):
                 ).clone(False)
                 actor_output: TensorDict = self.actor(actor_input)
                 probs = actor_output.get("probs", None)
+
                 if probs is None:
                     return None
 
                 action_index = action.detach().long()
+
                 if action_index.ndim == probs.ndim:
                     action_index = action_index.squeeze(-1)
+
                 while action_index.ndim < probs.ndim - 1:
                     action_index = action_index.unsqueeze(-1)
-                action_index = action_index.unsqueeze(-1)
 
+                action_index = action_index.unsqueeze(-1)
                 new_prob = probs.gather(-1, action_index).clamp_min(1e-12)
                 new_log_prob = new_prob.log()
         except Exception:
@@ -226,8 +234,10 @@ class PPO(Policy):
 
         old_log_prob = old_log_prob.detach()
         new_log_prob = new_log_prob.detach()
+
         while new_log_prob.ndim < old_log_prob.ndim:
             new_log_prob = new_log_prob.unsqueeze(-1)
+
         while old_log_prob.ndim < new_log_prob.ndim:
             old_log_prob = old_log_prob.unsqueeze(-1)
 
@@ -243,6 +253,7 @@ class PPO(Policy):
         clipped = (ratio < 1.0 - float(self.clip_param)) | (
             ratio > 1.0 + float(self.clip_param)
         )
+
         return clipped.float().mean()
 
     @staticmethod
@@ -250,6 +261,7 @@ class PPO(Policy):
         with torch.no_grad():
             y_pred = y_pred.detach().float().reshape(-1)
             y_true = y_true.detach().float().reshape(-1)
+
             if y_true.numel() <= 1:
                 return float("nan")
 
@@ -297,13 +309,16 @@ class PPO(Policy):
 
     def _flat_grad_vector_from_module(self, module: torch.nn.Module) -> torch.Tensor:
         chunks = []
+
         for p in self._trainable_module_parameters(module):
             if p.grad is None:
                 chunks.append(torch.zeros(p.numel(), device=self.device, dtype=p.dtype))
             else:
                 chunks.append(p.grad.detach().reshape(-1).to(self.device))
+
         if not chunks:
             return torch.zeros((), device=self.device)
+
         return torch.cat(chunks, dim=0)
 
     def _flat_grad_vector(self) -> torch.Tensor:
@@ -326,21 +341,29 @@ class PPO(Policy):
         self, loss_module: ClipPPOLoss, minibatch: TensorDict
     ) -> tuple[torch.Tensor, float]:
         self._zero_module_grad(loss_module)
+
         measurement_batch = self._clone_tensordict_for_measurement(minibatch)
         loss_value, _ = self._loss_value_from_module(loss_module, measurement_batch)
         loss_value.backward()
+
         grad = self._flat_grad_vector_from_module(loss_module)
         loss_item = float(loss_value.detach().item())
+
         self._zero_module_grad(loss_module)
+
         return grad, loss_item
 
     def _grad_vector_for_batch(self, minibatch: TensorDict) -> tuple[torch.Tensor, float]:
         self._zero_optimizer_grad()
+
         loss_value, _ = self._loss_value(minibatch)
         loss_value.backward()
+
         grad = self._flat_grad_vector()
         loss_item = float(loss_value.detach().item())
+
         self._zero_optimizer_grad()
+
         return grad, loss_item
 
     # -------------------------------------------------------------------------
@@ -349,8 +372,10 @@ class PPO(Policy):
     def _should_measure_noise_scale(self) -> bool:
         if not self.noise_scale_enabled:
             return False
+
         if self._noise_update_counter < self.noise_scale_warmup_updates:
             return False
+
         return self._noise_update_counter % self.noise_scale_interval == 0
 
     @staticmethod
@@ -361,6 +386,7 @@ class PPO(Policy):
 
     def _update_noise_ema(self, g2_hat: float, s_hat: float) -> tuple[float, float, float]:
         beta = self.noise_scale_ema_beta
+
         if self._noise_g2_ema is None or self._noise_s_ema is None:
             self._noise_g2_ema = float(g2_hat)
             self._noise_s_ema = float(s_hat)
@@ -375,6 +401,7 @@ class PPO(Policy):
         g2_safe = max(float(self._noise_g2_ema), self.noise_scale_eps)
         s_safe = max(float(self._noise_s_ema), 0.0)
         self._noise_bsimple_ema = s_safe / g2_safe
+
         return float(self._noise_g2_ema), float(self._noise_s_ema), self._noise_bsimple_ema
 
     def _make_shadow_loss_module(self) -> ClipPPOLoss:
@@ -386,6 +413,7 @@ class PPO(Policy):
         the shadow copy via Python deepcopy's memo table.
         """
         shadow_actor, shadow_critic = copy.deepcopy((self.actor, self.critic))
+
         shadow_actor.to(self.device)
         shadow_critic.to(self.device)
         shadow_actor.train()
@@ -395,13 +423,16 @@ class PPO(Policy):
         shadow_loss_module.to(self.device)
         shadow_loss_module.train()
         self._zero_module_grad(shadow_loss_module)
+
         return shadow_loss_module
 
     def _cleanup_shadow_loss_module(self, shadow_loss_module: ClipPPOLoss | None) -> None:
         if shadow_loss_module is not None:
             self._zero_module_grad(shadow_loss_module)
             del shadow_loss_module
+
         gc.collect()
+
         if (
             self.noise_scale_empty_cuda_cache_after_measure
             and torch.cuda.is_available()
@@ -413,16 +444,19 @@ class PPO(Policy):
         """Estimate Bsimple on one PPO minibatch using a temporary shadow model.
 
         The current minibatch is split into two equal independent chunks:
+
         - each half is treated as Bsmall;
         - the average gradient of both halves is treated as Bbig = 2 * Bsmall.
 
         This is the single-GPU analogue of the data-parallel estimator where
         Bsmall is the local per-worker batch and Bbig is the averaged global batch.
+
         All diagnostic forward/backward passes are performed on the shadow loss
         module, not on self.loss_module.
         """
         n_total = self._first_dim_size(minibatch)
         n_small = n_total // 2
+
         if n_small < self.noise_scale_min_half_batch:
             return {
                 "noise_scale/measured": 0.0,
@@ -437,6 +471,7 @@ class PPO(Policy):
         part2 = minibatch[n_small : 2 * n_small]
 
         shadow_loss_module = None
+
         try:
             shadow_loss_module = self._make_shadow_loss_module()
 
@@ -455,6 +490,7 @@ class PPO(Policy):
 
             b_small = float(n_small)
             b_big = float(2 * n_small)
+
             norm_small_f = float(norm_small.item())
             norm_big_f = float(norm_big.item())
 
@@ -470,10 +506,12 @@ class PPO(Policy):
             # stable reported ratio.
             g2_for_ratio = max(g2_hat, self.noise_scale_eps)
             s_for_ratio = max(s_hat, 0.0)
+
             bsimple_raw = s_hat / g2_for_ratio
             bsimple_clipped = s_for_ratio / g2_for_ratio
 
             g2_ema, s_ema, bsimple_ema = self._update_noise_ema(g2_hat, s_hat)
+
             self._noise_measure_counter += 1
 
             return {
@@ -516,6 +554,7 @@ class PPO(Policy):
             }
         finally:
             self._cleanup_shadow_loss_module(shadow_loss_module)
+
             # Defensive cleanup: the main optimizer should not have grads from
             # measurement anyway, but keep the old invariant before PPO update.
             self._zero_optimizer_grad()
@@ -530,6 +569,8 @@ class PPO(Policy):
 
         terminated_raw = data.get(("next", "terminated"), None)
         if terminated_raw is None:
+            # Backward compatibility for old collectors that only have done.
+            # New collectors should always write ("next", "terminated").
             terminated = done
         else:
             terminated = terminated_raw.unsqueeze(-1).to(self.device)
@@ -550,9 +591,11 @@ class PPO(Policy):
 
         loc = adv.mean()
         scale = adv.std().clamp_min(1e-4)
+
         if self.average_gae:
             adv = adv - loc
             adv = adv / scale
+
         data.set("advantage", adv)
         data.set("value_target", value_target)
 
@@ -568,6 +611,7 @@ class PPO(Policy):
         )
 
         self.train()
+
         loss_objectives = []
         loss_critics = []
         loss_entropies = []
@@ -589,14 +633,17 @@ class PPO(Policy):
                     noise_infos.append(self._measure_noise_scale_on_minibatch(minibatch))
 
                 self._zero_optimizer_grad()
+
                 loss_value, loss_vals = self._loss_value(minibatch)
+
                 loss_objectives.append(loss_vals["loss_objective"].clone().detach())
                 loss_critics.append(loss_vals["loss_critic"].clone().detach())
                 loss_entropies.append(loss_vals["loss_entropy"].clone().detach())
                 losses.append(loss_value.clone().detach())
 
                 clip_fraction = self._get_first_existing_loss_value(
-                    loss_vals, ("clip_fraction", "clipfrac", "clip_frac")
+                    loss_vals,
+                    ("clip_fraction", "clipfrac", "clip_frac"),
                 )
                 if clip_fraction is None:
                     clip_fraction = self._manual_clip_fraction_from_probs(minibatch)
@@ -604,6 +651,7 @@ class PPO(Policy):
                     clipfracs.append(clip_fraction.clone().detach().float().mean())
 
                 loss_value.backward()
+
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.loss_module.parameters(),
                     self.max_grad_norm,
@@ -613,6 +661,7 @@ class PPO(Policy):
                 grad_clip_flags.append(
                     (grad_norm_detached > float(self.max_grad_norm)).float()
                 )
+
                 self.optim.step()
                 self._zero_optimizer_grad()
 
@@ -663,6 +712,7 @@ class PPO(Policy):
     def load_state_dict(self, state_dict: Dict):
         self.critic.load_state_dict(state_dict["critic"], strict=False)
         self.actor.load_state_dict(state_dict["actor"])
+
         self.loss_module = self._make_loss_module(self.actor, self.critic)
         self.optim = get_optimizer(self.cfg.optimizer, self.loss_module.parameters())
 
