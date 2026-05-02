@@ -23,3 +23,10 @@ num_channels: 64
 num_residual_blocks: 4
 
 
+noise_scale:
+  enabled: true
+  interval: 20
+  warmup_updates: 0
+  ema_beta: 0.95
+  min_half_batch: 2
+  eps: 1e-12

@@ -20,25 +20,6 @@ DeviceLike = Union[torch.device, str, int, None]
 
 
 class PPO(Policy):
-    """PPO with extra Bsimple / gradient-noise-scale measurement.
-
-    This version preserves the normal PPO learning logic and the existing diagnostic
-    metrics such as grad_clip_frac, clipfrac, and critic_explained_var. The added
-    measurement is read-only with respect to optimization: it performs extra
-    backward passes on selected minibatches, logs gradient-noise-scale statistics,
-    clears gradients, and then continues the normal PPO optimizer step.
-
-    Optional config under cfg.algo.noise_scale:
-
-      noise_scale:
-        enabled: true
-        interval: 20
-        warmup_updates: 0
-        ema_beta: 0.95
-        min_half_batch: 2
-        eps: 1e-12
-    """
-
     def __init__(
         self,
         cfg: DictConfig,
@@ -49,7 +30,6 @@ class PPO(Policy):
         super().__init__(cfg, action_spec, observation_spec, device)
         self.cfg: DictConfig = cfg
         self.device: DeviceLike = device
-
         self.clip_param: float = cfg.clip_param
         self.ppo_epoch: int = int(cfg.ppo_epochs)
         self.entropy_coef: float = cfg.entropy_coef
@@ -98,44 +78,18 @@ class PPO(Policy):
         )
         self.optim = get_optimizer(self.cfg.optimizer, self.loss_module.parameters())
 
-        # -------------------- Bsimple / gradient-noise-scale config --------------------
-        ns_cfg = self.cfg.get("noise_scale", {})
-        self.noise_scale_enabled: bool = bool(ns_cfg.get("enabled", True))
-        self.noise_scale_interval: int = max(1, int(ns_cfg.get("interval", 20)))
-        self.noise_scale_warmup_updates: int = max(
-            0, int(ns_cfg.get("warmup_updates", 0))
-        )
-        self.noise_scale_ema_beta: float = float(ns_cfg.get("ema_beta", 0.95))
-        self.noise_scale_ema_beta = min(max(self.noise_scale_ema_beta, 0.0), 0.9999)
-        self.noise_scale_min_half_batch: int = max(
-            1, int(ns_cfg.get("min_half_batch", 2))
-        )
-        self.noise_scale_eps: float = float(ns_cfg.get("eps", 1e-12))
-
-        self._noise_update_counter: int = 0
-        self._noise_measure_counter: int = 0
-        self._noise_g2_ema: float | None = None
-        self._noise_s_ema: float | None = None
-        self._noise_bsimple_ema: float | None = None
-
     def __call__(self, tensordict: TensorDict):
         tensordict = tensordict.to(self.device)
-
         actor_input = tensordict.select("observation", "action_mask", strict=False)
         actor_output: TensorDict = self.actor(actor_input)
         actor_output = actor_output.exclude("probs")
         tensordict.update(actor_output)
 
-        # share_network=True: critic consumes hidden.
-        # share_network=False: critic consumes observation.
         critic_input = tensordict.select("hidden", "observation", strict=False)
         critic_output = self.critic(critic_input)
         tensordict.update(critic_output)
         return tensordict
 
-    # -------------------------------------------------------------------------
-    # Existing diagnostic helpers
-    # -------------------------------------------------------------------------
     @staticmethod
     def _safe_mean(values: list[torch.Tensor], *, default: float = float("nan")) -> float:
         if not values:
@@ -154,9 +108,10 @@ class PPO(Policy):
         """Compute PPO clip fraction without calling actor.get_dist().
 
         Some TorchRL/TensorDict versions can build up nested functional wrappers
-        around ``get_dist`` after many repeated manual calls. This fallback instead
-        runs the actor once, reads the output ``probs``, and gathers the probability
-        of the rollout action directly.
+        around ``get_dist`` after many repeated manual calls. That may eventually
+        trigger ``RecursionError``. This fallback instead runs the actor once,
+        reads the output ``probs``, and gathers the probability of the rollout
+        action directly.
         """
         old_log_prob = minibatch.get("sample_log_prob", None)
         action = minibatch.get("action", None)
@@ -187,6 +142,7 @@ class PPO(Policy):
 
         old_log_prob = old_log_prob.detach()
         new_log_prob = new_log_prob.detach()
+
         while new_log_prob.ndim < old_log_prob.ndim:
             new_log_prob = new_log_prob.unsqueeze(-1)
         while old_log_prob.ndim < new_log_prob.ndim:
@@ -199,9 +155,7 @@ class PPO(Policy):
 
         log_ratio = (new_log_prob - old_log_prob).clamp(-20.0, 20.0)
         ratio = torch.exp(log_ratio)
-        clipped = (ratio < 1.0 - float(self.clip_param)) | (
-            ratio > 1.0 + float(self.clip_param)
-        )
+        clipped = (ratio < 1.0 - float(self.clip_param)) | (ratio > 1.0 + float(self.clip_param))
         return clipped.float().mean()
 
     @staticmethod
@@ -216,149 +170,6 @@ class PPO(Policy):
                 return float("nan")
             residual_var = torch.var(y_true - y_pred, unbiased=False)
             return (1.0 - residual_var / target_var).item()
-
-    # -------------------------------------------------------------------------
-    # Loss / gradient helpers for Bsimple measurement
-    # -------------------------------------------------------------------------
-    def _loss_value(self, minibatch: TensorDict) -> tuple[torch.Tensor, TensorDict]:
-        loss_vals = self.loss_module(minibatch)
-        loss_value = (
-            loss_vals["loss_objective"]
-            + loss_vals["loss_critic"]
-            + loss_vals["loss_entropy"]
-        )
-        return loss_value, loss_vals
-
-    def _trainable_loss_parameters(self) -> list[torch.nn.Parameter]:
-        return [p for p in self.loss_module.parameters() if p.requires_grad]
-
-    def _zero_optimizer_grad(self) -> None:
-        try:
-            self.optim.zero_grad(set_to_none=True)
-        except TypeError:
-            self.optim.zero_grad()
-
-    def _flat_grad_vector(self) -> torch.Tensor:
-        chunks = []
-        for p in self._trainable_loss_parameters():
-            if p.grad is None:
-                chunks.append(torch.zeros(p.numel(), device=self.device, dtype=p.dtype))
-            else:
-                chunks.append(p.grad.detach().reshape(-1).to(self.device))
-        if not chunks:
-            return torch.zeros((), device=self.device)
-        return torch.cat(chunks, dim=0)
-
-    def _grad_vector_for_batch(self, minibatch: TensorDict) -> tuple[torch.Tensor, float]:
-        self._zero_optimizer_grad()
-        loss_value, _ = self._loss_value(minibatch)
-        loss_value.backward()
-        grad = self._flat_grad_vector()
-        loss_item = float(loss_value.detach().item())
-        self._zero_optimizer_grad()
-        return grad, loss_item
-
-    # -------------------------------------------------------------------------
-    # Bsimple / gradient-noise-scale measurement
-    # -------------------------------------------------------------------------
-    def _should_measure_noise_scale(self) -> bool:
-        if not self.noise_scale_enabled:
-            return False
-        if self._noise_update_counter < self.noise_scale_warmup_updates:
-            return False
-        return self._noise_update_counter % self.noise_scale_interval == 0
-
-    @staticmethod
-    def _first_dim_size(tensordict: TensorDict) -> int:
-        if len(tensordict.shape) == 0:
-            return 0
-        return int(tensordict.shape[0])
-
-    def _update_noise_ema(self, g2_hat: float, s_hat: float) -> tuple[float, float, float]:
-        beta = self.noise_scale_ema_beta
-        if self._noise_g2_ema is None or self._noise_s_ema is None:
-            self._noise_g2_ema = float(g2_hat)
-            self._noise_s_ema = float(s_hat)
-        else:
-            self._noise_g2_ema = beta * self._noise_g2_ema + (1.0 - beta) * float(g2_hat)
-            self._noise_s_ema = beta * self._noise_s_ema + (1.0 - beta) * float(s_hat)
-
-        g2_safe = max(float(self._noise_g2_ema), self.noise_scale_eps)
-        s_safe = max(float(self._noise_s_ema), 0.0)
-        self._noise_bsimple_ema = s_safe / g2_safe
-        return float(self._noise_g2_ema), float(self._noise_s_ema), self._noise_bsimple_ema
-
-    def _measure_noise_scale_on_minibatch(self, minibatch: TensorDict) -> dict[str, float]:
-        """Estimate Bsimple on one PPO minibatch without changing parameters.
-
-        The current minibatch is split into two equal independent chunks:
-          - each half is treated as Bsmall;
-          - the average gradient of both halves is treated as Bbig = 2 * Bsmall.
-
-        This is the single-GPU analogue of the data-parallel estimator where
-        Bsmall is the local per-worker batch and Bbig is the averaged global batch.
-        """
-        n_total = self._first_dim_size(minibatch)
-        n_small = n_total // 2
-        if n_small < self.noise_scale_min_half_batch:
-            return {
-                "noise_scale/measured": 0.0,
-                "noise_scale/skipped_too_small": 1.0,
-                "noise_scale/batch_total": float(n_total),
-            }
-
-        # Use exactly 2*n_small samples so both halves have identical size.
-        part1 = minibatch[:n_small]
-        part2 = minibatch[n_small : 2 * n_small]
-
-        g1, loss1 = self._grad_vector_for_batch(part1)
-        g2, loss2 = self._grad_vector_for_batch(part2)
-
-        norm_small = 0.5 * (
-            torch.dot(g1, g1).detach() + torch.dot(g2, g2).detach()
-        )
-        g_big = 0.5 * (g1 + g2)
-        norm_big = torch.dot(g_big, g_big).detach()
-
-        b_small = float(n_small)
-        b_big = float(2 * n_small)
-        norm_small_f = float(norm_small.item())
-        norm_big_f = float(norm_big.item())
-
-        g2_hat = (b_big * norm_big_f - b_small * norm_small_f) / (b_big - b_small)
-        s_hat = (norm_small_f - norm_big_f) / ((1.0 / b_small) - (1.0 / b_big))
-
-        # Finite-sample estimates can be negative when noisy. Keep raw values for
-        # diagnosis, but use clipped-positive values for the stable reported ratio.
-        g2_for_ratio = max(g2_hat, self.noise_scale_eps)
-        s_for_ratio = max(s_hat, 0.0)
-        bsimple_raw = s_hat / g2_for_ratio
-        bsimple_clipped = s_for_ratio / g2_for_ratio
-        g2_ema, s_ema, bsimple_ema = self._update_noise_ema(g2_hat, s_hat)
-
-        self._noise_measure_counter += 1
-        self._zero_optimizer_grad()
-
-        return {
-            "noise_scale/measured": 1.0,
-            "noise_scale/skipped_too_small": 0.0,
-            "noise_scale/batch_small": b_small,
-            "noise_scale/batch_big": b_big,
-            "noise_scale/batch_total": float(n_total),
-            "noise_scale/grad_norm_sq_small": norm_small_f,
-            "noise_scale/grad_norm_sq_big": norm_big_f,
-            "noise_scale/true_grad_norm_sq_hat": float(g2_hat),
-            "noise_scale/grad_variance_trace_hat": float(s_hat),
-            "noise_scale/bsimple_raw": float(bsimple_raw),
-            "noise_scale/bsimple_clipped": float(bsimple_clipped),
-            "noise_scale/true_grad_norm_sq_ema": float(g2_ema),
-            "noise_scale/grad_variance_trace_ema": float(s_ema),
-            "noise_scale/bsimple_ema": float(bsimple_ema),
-            "noise_scale/loss_half_1": float(loss1),
-            "noise_scale/loss_half_2": float(loss2),
-            "noise_scale/num_measurements": float(self._noise_measure_counter),
-            "noise_scale/update_index": float(self._noise_update_counter),
-        }
 
     def learn(self, data: TensorDict):
         value = data["state_value"].to(self.device)
@@ -380,6 +191,7 @@ class PPO(Policy):
 
         loc = adv.mean()
         scale = adv.std().clamp_min(1e-4)
+
         if self.average_gae:
             adv = adv - loc
         adv = adv / scale
@@ -398,7 +210,6 @@ class PPO(Policy):
         )
 
         self.train()
-
         loss_objectives = []
         loss_critics = []
         loss_entropies = []
@@ -406,20 +217,16 @@ class PPO(Policy):
         grad_norms = []
         grad_clip_flags = []
         clipfracs = []
-        noise_infos = []
 
         for _ in range(self.ppo_epoch):
             for minibatch in make_dataset_naive(data, batch_size=self.batch_size):
                 minibatch = minibatch.to(self.device)
-
-                # Extra read-only measurement. It is intentionally placed before
-                # the normal optimizer step so the measured parameters match the
-                # parameters used by this minibatch update.
-                if self._should_measure_noise_scale():
-                    noise_infos.append(self._measure_noise_scale_on_minibatch(minibatch))
-
-                self._zero_optimizer_grad()
-                loss_value, loss_vals = self._loss_value(minibatch)
+                loss_vals = self.loss_module(minibatch)
+                loss_value = (
+                    loss_vals["loss_objective"]
+                    + loss_vals["loss_critic"]
+                    + loss_vals["loss_entropy"]
+                )
 
                 loss_objectives.append(loss_vals["loss_objective"].clone().detach())
                 loss_critics.append(loss_vals["loss_critic"].clone().detach())
@@ -427,7 +234,8 @@ class PPO(Policy):
                 losses.append(loss_value.clone().detach())
 
                 clip_fraction = self._get_first_existing_loss_value(
-                    loss_vals, ("clip_fraction", "clipfrac", "clip_frac"),
+                    loss_vals,
+                    ("clip_fraction", "clipfrac", "clip_frac"),
                 )
                 if clip_fraction is None:
                     clip_fraction = self._manual_clip_fraction_from_probs(minibatch)
@@ -446,12 +254,10 @@ class PPO(Policy):
                 )
 
                 self.optim.step()
-                self._zero_optimizer_grad()
-                self._noise_update_counter += 1
+                self.optim.zero_grad()
 
         self.eval()
-
-        info = {
+        return {
             "advantage_mean": loc.item(),
             "advantage_std": scale.item(),
             "grad_norm": self._safe_mean(grad_norms),
@@ -463,25 +269,6 @@ class PPO(Policy):
             "loss_critic": torch.stack(loss_critics).mean().item(),
             "loss_entropy": torch.stack(loss_entropies).mean().item(),
         }
-
-        if noise_infos:
-            # Log the last fresh measurement from this learn() call. EMA fields
-            # already contain history across previous learn() calls.
-            info.update(noise_infos[-1])
-        elif self.noise_scale_enabled and self._noise_bsimple_ema is not None:
-            # Keep the EMA visible on learn() calls without a fresh measurement.
-            info.update(
-                {
-                    "noise_scale/measured": 0.0,
-                    "noise_scale/bsimple_ema": float(self._noise_bsimple_ema),
-                    "noise_scale/true_grad_norm_sq_ema": float(self._noise_g2_ema),
-                    "noise_scale/grad_variance_trace_ema": float(self._noise_s_ema),
-                    "noise_scale/num_measurements": float(self._noise_measure_counter),
-                    "noise_scale/update_index": float(self._noise_update_counter),
-                }
-            )
-
-        return info
 
     def state_dict(self) -> Dict:
         return {

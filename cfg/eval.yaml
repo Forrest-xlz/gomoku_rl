@@ -1,12 +1,37 @@
 seed: 0
-num_envs: 2048
 board_size: 15
+num_envs: 512
+num_repeats: 2
 device: cuda
 
-checkpoints:
- - pretrained_models/${board_size}_${board_size}/${algo.name}/0.pt
- - pretrained_models/${board_size}_${board_size}/${algo.name}/1.pt
+interaction: random
 
 defaults:
   - _self_
   - algo: ppo
+
+output_dir: eval_outputs
+resume: true
+cache_size: 4
+
+average_rating: 1200
+elo_l2: 1.0e-4
+elo_max_iter: 5000
+elo_patience: 100
+elo_lr: 0.05
+elo_min_delta: 1.0e-10
+
+h:
+  - name: epoch_00100
+    black_checkpoint: /root/autodl-tmp/gomoku_rl/train_model_pool/black/black_00100.pt
+    white_checkpoint: /root/autodl-tmp/gomoku_rl/train_model_pool/white/white_00100.pt
+    temporal: 6
+    num_channels: 64
+    num_residual_blocks: 4
+
+  - name: epoch_00200
+    black_checkpoint: /root/autodl-tmp/gomoku_rl/train_model_pool/black/black_00200.pt
+    white_checkpoint: /root/autodl-tmp/gomoku_rl/train_model_pool/white/white_00200.pt
+    temporal: 6
+    num_channels: 64
+    num_residual_blocks: 4
