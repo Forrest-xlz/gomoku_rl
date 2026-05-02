@@ -36,8 +36,7 @@ def make_transition(
     """
     # If a player wins at time t, its opponent cannot win immediately after reset.
     reward: torch.Tensor = (
-        tensordict_t.get("win").float()
-        - tensordict_t_plus_1.get("win").float()
+        tensordict_t.get("win").float() - tensordict_t_plus_1.get("win").float()
     ).unsqueeze(-1)
 
     transition: TensorDict = tensordict_t_minus_1.select(
@@ -58,16 +57,17 @@ def make_transition(
             strict=False,
         ),
     )
-
     transition.set(("next", "reward"), reward)
 
     done = tensordict_t_plus_1["done"] | tensordict_t["done"]
 
-    # done: trajectory boundary, can also be set by rollout truncation later.
-    # terminated: real episode end only. It must stay False for rollout truncation
-    # so GAE can bootstrap from next_state_value at the segment boundary.
+    # done: trajectory boundary. It can be set later by rollout truncation.
+    # terminated: real episode end only. Rollout truncation must not change it,
+    # otherwise GAE will treat truncation as terminal and will not bootstrap from
+    # next_state_value.
     transition.set(("next", "done"), done)
     transition.set(("next", "terminated"), done.clone())
+
     return transition
 
 
@@ -89,15 +89,12 @@ def round(
         t_plus_1 : after black move, white decision frame.
         t_plus_2 : after white move, next black decision frame.
 
-    Black transition:
-        t -> t_plus_2
-
-    White transition:
-        t_minus_1 -> t_plus_1
+    Black transition: t -> t_plus_2
+    White transition: t_minus_1 -> t_plus_1
 
     Important:
-        If the environment was reset at t_minus_1, white did not actually make
-        a valid action from that frame. Such white transitions are marked invalid
+        If the environment was reset at t_minus_1, white did not actually make a
+        valid action from that frame. Such white transitions are marked invalid
         and filtered out in PPO.learn().
     """
     tensordict_t_plus_1 = env.step_and_maybe_reset(tensordict=tensordict_t)
@@ -112,10 +109,11 @@ def round(
             tensordict_t_plus_1,
         )
 
+        # For player_white, if the env is reset at t_minus_1, white does not
+        # have a real action at that frame. We keep the transition shape but
+        # mark it invalid. PPO.learn() filters invalid transitions.
         invalid: torch.Tensor = tensordict_t_minus_1["done"]
-        transition_white["next", "done"] = (
-            invalid | transition_white["next", "done"]
-        )
+        transition_white["next", "done"] = invalid | transition_white["next", "done"]
         transition_white["next", "terminated"] = (
             invalid | transition_white["next", "terminated"]
         )
@@ -138,7 +136,6 @@ def round(
             tensordict_t_plus_1,
             tensordict_t_plus_2,
         )
-
         transition_black.set(
             "invalid",
             torch.zeros(env.num_envs, device=env.device, dtype=torch.bool),
@@ -160,9 +157,7 @@ def self_play_step(
     tensordict_t_minus_1: TensorDict,
     tensordict_t: TensorDict,
 ):
-    """
-    Executes a single self-play step in a Gomoku environment using one policy.
-    """
+    """Executes a single self-play step in a Gomoku environment using one policy."""
     tensordict_t_plus_1 = env.step_and_maybe_reset(tensordict=tensordict_t)
 
     with set_interaction_type(type=InteractionType.RANDOM):
@@ -204,7 +199,6 @@ class SelfPlayCollector(Collector):
         self._policy = policy
         self._out_device = out_device or self._env.device
         self._augment = augment
-
         self._t = None
         self._t_minus_1 = None
 
@@ -217,19 +211,15 @@ class SelfPlayCollector(Collector):
     def rollout(self, steps: int) -> tuple[TensorDict, dict]:
         info: defaultdict[str, float] = defaultdict(float)
         self._env.set_post_step(get_log_func(info))
-
         tensordicts = []
-
         start = time.perf_counter()
 
         if self._t_minus_1 is None and self._t is None:
             self._t_minus_1 = self._env.reset()
-
             with set_interaction_type(type=InteractionType.RANDOM):
                 self._t_minus_1 = self._policy(self._t_minus_1)
 
             self._t = self._env.step(self._t_minus_1)
-
             with set_interaction_type(type=InteractionType.RANDOM):
                 self._t = self._policy(self._t)
 
@@ -245,7 +235,9 @@ class SelfPlayCollector(Collector):
                 self._t,
             )
 
-            # Truncate the last transition of this rollout segment.
+            # Truncate the last transition of this rollout segment. Only done is
+            # set here; terminated is intentionally kept as produced by
+            # make_transition(), so GAE can bootstrap at truncation boundaries.
             if i == steps - 2:
                 transition["next", "done"] = torch.ones(
                     transition["next", "done"].shape,
@@ -259,15 +251,10 @@ class SelfPlayCollector(Collector):
             tensordicts.append(transition.to(self._out_device))
 
         end = time.perf_counter()
-
         fps = (steps * self._env.num_envs) / (end - start)
-
         self._env.set_post_step(None)
-
         tensordicts = torch.stack(tensordicts, dim=-1)
-
         info.update({"fps": fps})
-
         return tensordicts, dict(info)
 
 
@@ -285,19 +272,15 @@ class VersusPlayCollector(Collector):
         self._policy_white = policy_white
         self._out_device = out_device or self._env.device
         self._augment = augment
-
         self._t_minus_1 = None
         self._t = None
 
         # Old behavior:
-        #     Skip i == 0 white transition in every rollout.
-        #
+        #   Skip i == 0 white transition in every rollout.
         # New behavior:
-        #     Skip only the first white transition after collector initialization,
-        #     because only that one is built from a fake t_minus_1 state.
-        #
-        # Later rollout boundaries may contain valid white transitions, so they
-        # should be kept.
+        #   Skip only the first white transition after collector initialization,
+        #   because only that one is built from a fake t_minus_1 state.
+        # Later rollout boundaries may contain valid white transitions.
         self._skip_first_white_transition = True
 
     def reset(self):
@@ -309,19 +292,15 @@ class VersusPlayCollector(Collector):
     @torch.no_grad()
     def rollout(self, steps: int) -> tuple[TensorDict, TensorDict, dict]:
         steps = (steps // 2) * 2
-
         info: defaultdict[str, float] = defaultdict(float)
         self._env.set_post_step(get_log_func(info))
-
         blacks = []
         whites = []
-
         start = time.perf_counter()
 
         if self._t_minus_1 is None and self._t is None:
             self._t_minus_1 = self._env.reset()
             self._t = self._env.reset()
-
             self._t_minus_1.update(
                 {
                     "done": torch.ones(
@@ -339,7 +318,6 @@ class VersusPlayCollector(Collector):
 
             with set_interaction_type(type=InteractionType.RANDOM):
                 self._t = self._policy_black(self._t)
-
             self._t.update(
                 {
                     "done": torch.zeros(
@@ -374,14 +352,13 @@ class VersusPlayCollector(Collector):
             )
 
             append_white = not self._skip_first_white_transition
-
             if self._skip_first_white_transition:
                 self._skip_first_white_transition = False
 
-            # Truncate the last transition of this rollout segment.
-            #
-            # This cuts GAE at the rollout boundary. It does not reset the actual
-            # environment state stored in self._t_minus_1 / self._t.
+            # Truncate the last transition of this rollout segment. This cuts
+            # GAE at the rollout boundary but keeps the real environment state in
+            # self._t_minus_1 / self._t. Only done is changed; terminated stays
+            # unchanged so GAE can bootstrap if this is not a real terminal.
             if i == steps // 2 - 1:
                 transition_black["next", "done"] = torch.ones(
                     transition_black["next", "done"].shape,
@@ -396,14 +373,12 @@ class VersusPlayCollector(Collector):
 
             if self._augment:
                 transition_black = augment_transition(transition_black)
-
                 # The skipped first white transition may come from a fake state,
                 # so do not augment it.
                 if append_white:
                     transition_white = augment_transition(transition_white)
 
             blacks.append(transition_black.to(self._out_device))
-
             if append_white:
                 whites.append(transition_white.to(self._out_device))
 
@@ -411,13 +386,9 @@ class VersusPlayCollector(Collector):
         whites = torch.stack(whites, dim=-1) if whites else None
 
         end = time.perf_counter()
-
         fps = (steps * self._env.num_envs) / (end - start)
-
         self._env.set_post_step(None)
-
         info.update({"fps": fps})
-
         return blacks, whites, dict(info)
 
 
@@ -435,7 +406,6 @@ class BlackPlayCollector(Collector):
         self._policy_white = policy_white
         self._out_device = out_device or self._env.device
         self._augment = augment
-
         self._t_minus_1 = None
         self._t = None
 
@@ -447,18 +417,14 @@ class BlackPlayCollector(Collector):
     @torch.no_grad()
     def rollout(self, steps: int) -> tuple[TensorDict, dict]:
         steps = (steps // 2) * 2
-
         info: defaultdict[str, float] = defaultdict(float)
         self._env.set_post_step(get_log_func(info))
-
         blacks = []
-
         start = time.perf_counter()
 
         if self._t_minus_1 is None and self._t is None:
             self._t_minus_1 = self._env.reset()
             self._t = self._env.reset()
-
             self._t_minus_1.update(
                 {
                     "done": torch.ones(
@@ -476,7 +442,6 @@ class BlackPlayCollector(Collector):
 
             with set_interaction_type(type=InteractionType.RANDOM):
                 self._t = self._policy_black(self._t)
-
             self._t.update(
                 {
                     "done": torch.zeros(
@@ -508,7 +473,8 @@ class BlackPlayCollector(Collector):
                 return_white_transitions=False,
             )
 
-            # Truncate the last transition of this rollout segment.
+            # Truncate the last transition of this rollout segment. Only done is
+            # changed; terminated remains the real episode-end flag.
             if i == steps // 2 - 1:
                 transition_black["next", "done"] = torch.ones(
                     transition_black["next", "done"].shape,
@@ -524,13 +490,9 @@ class BlackPlayCollector(Collector):
         blacks = torch.stack(blacks, dim=-1) if blacks else None
 
         end = time.perf_counter()
-
         fps = (steps * self._env.num_envs) / (end - start)
-
         self._env.set_post_step(None)
-
         info.update({"fps": fps})
-
         return blacks, dict(info)
 
 
@@ -548,7 +510,6 @@ class WhitePlayCollector(Collector):
         self._policy_white = policy_white
         self._out_device = out_device or self._env.device
         self._augment = augment
-
         self._t_minus_1 = None
         self._t = None
 
@@ -565,18 +526,14 @@ class WhitePlayCollector(Collector):
     @torch.no_grad()
     def rollout(self, steps: int) -> tuple[TensorDict, dict]:
         steps = (steps // 2) * 2
-
         info: defaultdict[str, float] = defaultdict(float)
         self._env.set_post_step(get_log_func(info))
-
         whites = []
-
         start = time.perf_counter()
 
         if self._t_minus_1 is None and self._t is None:
             self._t_minus_1 = self._env.reset()
             self._t = self._env.reset()
-
             self._t_minus_1.update(
                 {
                     "done": torch.ones(
@@ -602,7 +559,6 @@ class WhitePlayCollector(Collector):
 
             with set_interaction_type(type=InteractionType.RANDOM):
                 self._t = self._policy_black(self._t)
-
             self._t.update(
                 {
                     "done": torch.zeros(
@@ -637,11 +593,11 @@ class WhitePlayCollector(Collector):
             )
 
             append_white = not self._skip_first_white_transition
-
             if self._skip_first_white_transition:
                 self._skip_first_white_transition = False
 
-            # Truncate the last transition of this rollout segment.
+            # Truncate the last transition of this rollout segment. Only done is
+            # changed; terminated remains the real episode-end flag.
             if i == steps // 2 - 1:
                 transition_white["next", "done"] = torch.ones(
                     transition_white["next", "done"].shape,
@@ -659,11 +615,7 @@ class WhitePlayCollector(Collector):
         whites = torch.stack(whites, dim=-1) if whites else None
 
         end = time.perf_counter()
-
         fps = (steps * self._env.num_envs) / (end - start)
-
         self._env.set_post_step(None)
-
         info.update({"fps": fps})
-
         return whites, dict(info)

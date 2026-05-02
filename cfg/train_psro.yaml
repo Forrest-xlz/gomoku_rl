@@ -1,10 +1,10 @@
 seed: 0
-num_envs: 512
+num_envs: 1024  
 board_size: 15
 device: cuda
-out_device: cpu
+out_device: cuda
 run_dir:
-version_name: psro-temporal-6-test
+version_name: psro-temporal6-block8-epoch1-numenvs1024
 augment: false
 
 epochs: 20000

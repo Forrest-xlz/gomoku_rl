@@ -27,9 +27,9 @@ class PPO(Policy):
     """PPO with online-isolated Bsimple / gradient-noise-scale measurement.
 
     Compared with the previous version, the Bsimple measurement no longer runs
-    forward/backward on the training actor/critic/loss_module.  Instead it
-    creates a temporary shadow copy of actor+critic, measures gradients on that
-    shadow model, logs the result, and then deletes the shadow model.
+    forward/backward on the training actor/critic/loss_module. Instead it creates
+    a temporary shadow copy of actor+critic, measures gradients on that shadow
+    model, logs the result, and then deletes the shadow model.
 
     This isolates the normal training model from diagnostic side effects:
     - no main-parameter update from measurement;
@@ -41,16 +41,15 @@ class PPO(Policy):
     requested that RNG isolation is unnecessary.
 
     Optional config under cfg.algo.noise_scale:
-
-    noise_scale:
-      enabled: true
-      interval: 20
-      warmup_updates: 0
-      ema_beta: 0.95
-      min_half_batch: 2
-      eps: 1e-12
-      isolation: shadow_model
-      empty_cuda_cache_after_measure: false
+        noise_scale:
+          enabled: true
+          interval: 20
+          warmup_updates: 0
+          ema_beta: 0.95
+          min_half_batch: 2
+          eps: 1e-12
+          isolation: shadow_model
+          empty_cuda_cache_after_measure: false
     """
 
     def __init__(
@@ -63,6 +62,7 @@ class PPO(Policy):
         super().__init__(cfg, action_spec, observation_spec, device)
         self.cfg: DictConfig = cfg
         self.device: DeviceLike = device
+
         self.clip_param: float = cfg.clip_param
         self.ppo_epoch: int = int(cfg.ppo_epochs)
         self.entropy_coef: float = cfg.entropy_coef
@@ -119,7 +119,7 @@ class PPO(Policy):
         )
         self.noise_scale_eps: float = float(ns_cfg.get("eps", 1e-12))
 
-        # Default to the safe online isolation mode.  The old main-model mode is
+        # Default to the safe online isolation mode. The old main-model mode is
         # intentionally not exposed here, because it can update BatchNorm buffers.
         self.noise_scale_isolation: str = str(
             ns_cfg.get("isolation", "shadow_model")
@@ -159,6 +159,7 @@ class PPO(Policy):
 
     def __call__(self, tensordict: TensorDict):
         tensordict = tensordict.to(self.device)
+
         actor_input = tensordict.select("observation", "action_mask", strict=False)
         actor_output: TensorDict = self.actor(actor_input)
         actor_output = actor_output.exclude("probs")
@@ -192,7 +193,7 @@ class PPO(Policy):
         """Compute PPO clip fraction without calling actor.get_dist().
 
         Some TorchRL/TensorDict versions can build up nested functional wrappers
-        around ``get_dist`` after many repeated manual calls.  This fallback
+        around ``get_dist`` after many repeated manual calls. This fallback
         instead runs the actor once, reads the output ``probs``, and gathers the
         probability of the rollout action directly.
         """
@@ -251,9 +252,11 @@ class PPO(Policy):
             y_true = y_true.detach().float().reshape(-1)
             if y_true.numel() <= 1:
                 return float("nan")
+
             target_var = torch.var(y_true, unbiased=False)
             if torch.isnan(target_var) or target_var.item() < 1e-8:
                 return float("nan")
+
             residual_var = torch.var(y_true - y_pred, unbiased=False)
             return (1.0 - residual_var / target_var).item()
 
@@ -311,7 +314,7 @@ class PPO(Policy):
         """Clone the TensorDict structure so diagnostic forward cannot add keys to it.
 
         clone(False) is a shallow TensorDict clone: tensor storage is shared, but
-        the mapping/keys are independent.  That is enough here because the loss
+        the mapping/keys are independent. That is enough here because the loss
         should not mutate tensor values in-place.
         """
         try:
@@ -377,7 +380,7 @@ class PPO(Policy):
     def _make_shadow_loss_module(self) -> ClipPPOLoss:
         """Create a temporary loss module for isolated Bsimple measurement.
 
-        actor and critic are deep-copied together as one object graph.  This is
+        actor and critic are deep-copied together as one object graph. This is
         important for share_network=True: if the policy and value modules share
         an encoder/trunk, deepcopy((actor, critic)) preserves that sharing inside
         the shadow copy via Python deepcopy's memo table.
@@ -397,7 +400,7 @@ class PPO(Policy):
     def _cleanup_shadow_loss_module(self, shadow_loss_module: ClipPPOLoss | None) -> None:
         if shadow_loss_module is not None:
             self._zero_module_grad(shadow_loss_module)
-        del shadow_loss_module
+            del shadow_loss_module
         gc.collect()
         if (
             self.noise_scale_empty_cuda_cache_after_measure
@@ -414,9 +417,9 @@ class PPO(Policy):
         - the average gradient of both halves is treated as Bbig = 2 * Bsmall.
 
         This is the single-GPU analogue of the data-parallel estimator where
-        Bsmall is the local per-worker batch and Bbig is the averaged global
-        batch.  All diagnostic forward/backward passes are performed on the
-        shadow loss module, not on self.loss_module.
+        Bsmall is the local per-worker batch and Bbig is the averaged global batch.
+        All diagnostic forward/backward passes are performed on the shadow loss
+        module, not on self.loss_module.
         """
         n_total = self._first_dim_size(minibatch)
         n_small = n_total // 2
@@ -462,7 +465,7 @@ class PPO(Policy):
                 (1.0 / b_small) - (1.0 / b_big)
             )
 
-            # Finite-sample estimates can be negative when noisy.  Keep raw
+            # Finite-sample estimates can be negative when noisy. Keep raw
             # values for diagnosis, but use clipped-positive values for the
             # stable reported ratio.
             g2_for_ratio = max(g2_hat, self.noise_scale_eps)
@@ -496,7 +499,7 @@ class PPO(Policy):
                 "noise_scale/update_index": float(self._noise_update_counter),
             }
         except Exception as exc:
-            # Do not let diagnostics break training.  This also avoids falling
+            # Do not let diagnostics break training. This also avoids falling
             # back to the main model, because that would reintroduce BN-buffer
             # contamination.
             return {
@@ -506,7 +509,7 @@ class PPO(Policy):
                 "noise_scale/isolation_shadow_model": 1.0,
                 "noise_scale/batch_total": float(n_total),
                 "noise_scale/update_index": float(self._noise_update_counter),
-                # Keep this numeric for loggers.  The exception text is printed.
+                # Keep this numeric for loggers. The exception text is printed.
                 "noise_scale/shadow_error_type_hash": float(
                     abs(hash(type(exc).__name__)) % 1000000
                 ),
@@ -549,13 +552,14 @@ class PPO(Policy):
         scale = adv.std().clamp_min(1e-4)
         if self.average_gae:
             adv = adv - loc
-        adv = adv / scale
+            adv = adv / scale
         data.set("advantage", adv)
         data.set("value_target", value_target)
 
         invalid = data.get("invalid", None)
         if invalid is not None:
             data = data[~invalid]
+
         data = data.reshape(-1)
 
         critic_explained_var = self._explained_variance(
@@ -577,16 +581,15 @@ class PPO(Policy):
             for minibatch in make_dataset_naive(data, batch_size=self.batch_size):
                 minibatch = minibatch.to(self.device)
 
-                # Online-isolated diagnostic measurement.  It is intentionally
+                # Online-isolated diagnostic measurement. It is intentionally
                 # placed before the normal optimizer step so the measured shadow
                 # parameters match the main parameters used by this minibatch
-                # update.  The main model is not forward/backwarded here.
+                # update. The main model is not forward/backwarded here.
                 if self._should_measure_noise_scale():
                     noise_infos.append(self._measure_noise_scale_on_minibatch(minibatch))
 
                 self._zero_optimizer_grad()
                 loss_value, loss_vals = self._loss_value(minibatch)
-
                 loss_objectives.append(loss_vals["loss_objective"].clone().detach())
                 loss_critics.append(loss_vals["loss_critic"].clone().detach())
                 loss_entropies.append(loss_vals["loss_entropy"].clone().detach())
@@ -610,12 +613,13 @@ class PPO(Policy):
                 grad_clip_flags.append(
                     (grad_norm_detached > float(self.max_grad_norm)).float()
                 )
-
                 self.optim.step()
                 self._zero_optimizer_grad()
+
                 self._noise_update_counter += 1
 
         self.eval()
+
         info = {
             "advantage_mean": loc.item(),
             "advantage_std": scale.item(),
@@ -646,6 +650,7 @@ class PPO(Policy):
                     "noise_scale/update_index": float(self._noise_update_counter),
                 }
             )
+
         return info
 
     def state_dict(self) -> Dict:
