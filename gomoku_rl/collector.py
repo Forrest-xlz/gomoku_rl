@@ -62,8 +62,12 @@ def make_transition(
     transition.set(("next", "reward"), reward)
 
     done = tensordict_t_plus_1["done"] | tensordict_t["done"]
-    transition.set(("next", "done"), done)
 
+    # done: trajectory boundary, can also be set by rollout truncation later.
+    # terminated: real episode end only. It must stay False for rollout truncation
+    # so GAE can bootstrap from next_state_value at the segment boundary.
+    transition.set(("next", "done"), done)
+    transition.set(("next", "terminated"), done.clone())
     return transition
 
 
@@ -108,13 +112,12 @@ def round(
             tensordict_t_plus_1,
         )
 
-        # For player_white, if the env is reset at t_minus_1, white does not
-        # have a real action at that frame. We keep the transition shape but
-        # mark it invalid. PPO.learn() filters invalid transitions.
         invalid: torch.Tensor = tensordict_t_minus_1["done"]
-
         transition_white["next", "done"] = (
             invalid | transition_white["next", "done"]
+        )
+        transition_white["next", "terminated"] = (
+            invalid | transition_white["next", "terminated"]
         )
         transition_white.set("invalid", invalid)
     else:

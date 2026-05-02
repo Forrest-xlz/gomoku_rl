@@ -524,6 +524,13 @@ class PPO(Policy):
         value = data["state_value"].to(self.device)
         next_value = data["next", "state_value"].to(self.device)
         done = data["next", "done"].unsqueeze(-1).to(self.device)
+
+        terminated_raw = data.get(("next", "terminated"), None)
+        if terminated_raw is None:
+            terminated = done
+        else:
+            terminated = terminated_raw.unsqueeze(-1).to(self.device)
+
         reward = data["next", "reward"].to(self.device)
 
         with torch.no_grad():
@@ -534,7 +541,7 @@ class PPO(Policy):
                 next_value,
                 reward,
                 done=done,
-                terminated=done,
+                terminated=terminated,
                 time_dim=data.ndim - 1,
             )
 
