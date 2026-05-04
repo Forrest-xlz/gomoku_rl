@@ -1419,15 +1419,21 @@ class ScreenMonitorWidget(QWidget):
             return
 
         if clicked:
+            # 点击成功后不要立刻 push 自己这一手。
+            # 只保留 pending_click_move，等下一帧屏幕真正确认这颗子出现后再写入 recent_moves。
+            # 这里提前更新 lastmove_reference_board 到“点击后棋盘”，
+            # 这样如果下一帧已经同时包含了对手回应，也能基于该参考棋盘识别对手那一手。
             if self.pending_click_reference_board is not None:
                 self.lastmove_reference_board = self.pending_click_reference_board.copy()
                 self.lastmove_reference_hash = board_hash(self.pending_click_reference_board)
-                self.last_board_hash = self.lastmove_reference_hash
             if self.pending_click_move is not None:
                 self.suggested_move = self.pending_click_move
             self.schedule_fast_refresh()
-        self.pending_click_reference_board = None
-        self.pending_click_move = None
+        else:
+            # 点击失败时不再等待屏幕确认，清空 pending 状态。
+            self.pending_click_reference_board = None
+            self.pending_click_move = None
+
         self.set_status(msg)
         self.update_overlay()
 
@@ -1467,6 +1473,16 @@ class ScreenMonitorWidget(QWidget):
         self.latest_board = result.board
         self.last_board_hash = result.board_hash_value
 
+        pending_self_confirmed = False
+        if self.pending_click_move is not None:
+            row, col = self.pending_click_move
+            if 0 <= row < result.board.shape[0] and 0 <= col < result.board.shape[1]:
+                if int(result.board[row, col]) == self_piece_value(self.my_color):
+                    # 只在屏幕帧真正确认己方这颗子出现后，才把它写入时序历史。
+                    self.push_recent_move(self.pending_click_move)
+                    self.latest_move_board_hash = result.board_hash_value
+                    pending_self_confirmed = True
+
         candidate_move: Optional[tuple[int, int]] = None
         if result.current_turn == self.my_color:
             expected_stone = opponent_piece_value(self.my_color)
@@ -1487,6 +1503,10 @@ class ScreenMonitorWidget(QWidget):
         else:
             self.latest_move = None
             self.latest_move_board_hash = result.board_hash_value
+
+        if pending_self_confirmed:
+            self.pending_click_reference_board = None
+            self.pending_click_move = None
 
         if result.current_turn != self.my_color:
             self.lastmove_reference_board = result.board.copy()

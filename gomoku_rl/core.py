@@ -33,10 +33,10 @@ def _compute_line_counts(
     Generic directional count maps for one occupancy plane.
 
     Returns:
-      h:  (E, H-k+1, W)
-      v:  (E, H, W-k+1)
-      d1: (E, H-k+1, W-k+1)
-      d2: (E, H-k+1, W-k+1)
+        h:  (E, H-k+1, W)
+        v:  (E, H, W-k+1)
+        d1: (E, H-k+1, W-k+1)
+        d2: (E, H-k+1, W-k+1)
     """
     E, B, _ = stones.shape
     kh = kernel_horizontal.shape[-2]
@@ -61,11 +61,14 @@ def _compute_line_counts(
         return z_h, z_v, z_d, z_d.clone()
 
     x = stones.float().unsqueeze(1)  # (E,1,B,B)
+
     h = F.conv2d(x, kernel_horizontal).squeeze(1)
     v = F.conv2d(x, kernel_vertical).squeeze(1)
     d = F.conv2d(x, kernel_diagonal)  # (E,2,...)
+
     d1 = d[:, 0]
     d2 = d[:, 1]
+
     return h, v, d1, d2
 
 
@@ -76,14 +79,20 @@ def _compute_two_plane_counts(
     kernel_vertical: torch.Tensor,
     kernel_diagonal: torch.Tensor,
 ) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
 ]:
     """
     Compute directional count maps for two occupancy planes in one grouped-conv pass.
 
     Returns:
-      a_h, a_v, a_d1, a_d2, b_h, b_v, b_d1, b_d2
+        a_h, a_v, a_d1, a_d2, b_h, b_v, b_d1, b_d2
     """
     E, B, _ = plane_a.shape
     kh = kernel_horizontal.shape[-2]
@@ -106,18 +115,31 @@ def _compute_two_plane_counts(
             dtype=torch.float,
         )
         return (
-            z_h, z_v, z_d, z_d.clone(),
-            z_h.clone(), z_v.clone(), z_d.clone(), z_d.clone(),
+            z_h,
+            z_v,
+            z_d,
+            z_d.clone(),
+            z_h.clone(),
+            z_v.clone(),
+            z_d.clone(),
+            z_d.clone(),
         )
 
     x = torch.stack([plane_a.float(), plane_b.float()], dim=1)  # (E,2,B,B)
+
     h = F.conv2d(x, kernel_horizontal.repeat(2, 1, 1, 1), groups=2)
     v = F.conv2d(x, kernel_vertical.repeat(2, 1, 1, 1), groups=2)
     d = F.conv2d(x, kernel_diagonal.repeat(2, 1, 1, 1), groups=2)
 
     return (
-        h[:, 0], v[:, 0], d[:, 0], d[:, 1],
-        h[:, 1], v[:, 1], d[:, 2], d[:, 3],
+        h[:, 0],
+        v[:, 0],
+        d[:, 0],
+        d[:, 1],
+        h[:, 1],
+        v[:, 1],
+        d[:, 2],
+        d[:, 3],
     )
 
 
@@ -133,7 +155,7 @@ def _counts_to_immediate_five_mask(
     empty: torch.Tensor,
 ) -> torch.Tensor:
     """
-    placing one stone there creates an immediate five-in-a-row.
+    Placing one stone there creates an immediate five-in-a-row.
     """
     if empty.numel() == 0:
         return torch.zeros_like(empty, dtype=torch.bool)
@@ -143,23 +165,25 @@ def _counts_to_immediate_five_mask(
     valid = (atk_h == 4) & (def_h == 0)
     h, _ = valid.shape[-2:]
     for t in range(5):
-        out[:, t:t + h, :] |= valid & empty[:, t:t + h, :]
+        out[:, t : t + h, :] |= valid & empty[:, t : t + h, :]
 
     valid = (atk_v == 4) & (def_v == 0)
     _, w = valid.shape[-2:]
     for t in range(5):
-        out[:, :, t:t + w] |= valid & empty[:, :, t:t + w]
+        out[:, :, t : t + w] |= valid & empty[:, :, t : t + w]
 
     valid = (atk_d1 == 4) & (def_d1 == 0)
     h, w = valid.shape[-2:]
     for t in range(5):
-        out[:, t:t + h, t:t + w] |= valid & empty[:, t:t + h, t:t + w]
+        out[:, t : t + h, t : t + w] |= (
+            valid & empty[:, t : t + h, t : t + w]
+        )
 
     valid = (atk_d2 == 4) & (def_d2 == 0)
     h, w = valid.shape[-2:]
     for t in range(5):
-        out[:, t:t + h, 4 - t:4 - t + w] |= (
-            valid & empty[:, t:t + h, 4 - t:4 - t + w]
+        out[:, t : t + h, 4 - t : 4 - t + w] |= (
+            valid & empty[:, t : t + h, 4 - t : 4 - t + w]
         )
 
     return out
@@ -177,8 +201,10 @@ def _counts_to_four_creation_mask(
     empty: torch.Tensor,
 ) -> torch.Tensor:
     """
-    placing one stone there creates some 4-in-5 window (forcing-four point).
-    Local condition: atk5 == 3 and def5 == 0
+    Placing one stone there creates some 4-in-5 window (forcing-four point).
+
+    Local condition:
+        atk5 == 3 and def5 == 0
     """
     if empty.numel() == 0:
         return torch.zeros_like(empty, dtype=torch.bool)
@@ -188,23 +214,25 @@ def _counts_to_four_creation_mask(
     valid = (atk_h == 3) & (def_h == 0)
     h, _ = valid.shape[-2:]
     for t in range(5):
-        out[:, t:t + h, :] |= valid & empty[:, t:t + h, :]
+        out[:, t : t + h, :] |= valid & empty[:, t : t + h, :]
 
     valid = (atk_v == 3) & (def_v == 0)
     _, w = valid.shape[-2:]
     for t in range(5):
-        out[:, :, t:t + w] |= valid & empty[:, :, t:t + w]
+        out[:, :, t : t + w] |= valid & empty[:, :, t : t + w]
 
     valid = (atk_d1 == 3) & (def_d1 == 0)
     h, w = valid.shape[-2:]
     for t in range(5):
-        out[:, t:t + h, t:t + w] |= valid & empty[:, t:t + h, t:t + w]
+        out[:, t : t + h, t : t + w] |= (
+            valid & empty[:, t : t + h, t : t + w]
+        )
 
     valid = (atk_d2 == 3) & (def_d2 == 0)
     h, w = valid.shape[-2:]
     for t in range(5):
-        out[:, t:t + h, 4 - t:4 - t + w] |= (
-            valid & empty[:, t:t + h, 4 - t:4 - t + w]
+        out[:, t : t + h, 4 - t : 4 - t + w] |= (
+            valid & empty[:, t : t + h, 4 - t : 4 - t + w]
         )
 
     return out
@@ -229,7 +257,8 @@ def _counts_to_open_four_creation_mask(
     T2: placing one stone there creates a true open four: _XXXX_
 
     6-cell window condition:
-      atk6 == 3, def6 == 0, endpoint-empty-count == 2
+        atk6 == 3, def6 == 0, endpoint-empty-count == 2
+
     Then the unique empty among the middle 4 positions is the move.
     """
     if empty.numel() == 0:
@@ -242,28 +271,28 @@ def _counts_to_open_four_creation_mask(
     out = torch.zeros_like(empty, dtype=torch.bool)
 
     valid = (atk6_h == 3) & (def6_h == 0) & (end6_h == 2)
-    out[:, 1:B-4, :] |= valid & empty[:, 1:B-4, :]
-    out[:, 2:B-3, :] |= valid & empty[:, 2:B-3, :]
-    out[:, 3:B-2, :] |= valid & empty[:, 3:B-2, :]
-    out[:, 4:B-1, :] |= valid & empty[:, 4:B-1, :]
+    out[:, 1 : B - 4, :] |= valid & empty[:, 1 : B - 4, :]
+    out[:, 2 : B - 3, :] |= valid & empty[:, 2 : B - 3, :]
+    out[:, 3 : B - 2, :] |= valid & empty[:, 3 : B - 2, :]
+    out[:, 4 : B - 1, :] |= valid & empty[:, 4 : B - 1, :]
 
     valid = (atk6_v == 3) & (def6_v == 0) & (end6_v == 2)
-    out[:, :, 1:B-4] |= valid & empty[:, :, 1:B-4]
-    out[:, :, 2:B-3] |= valid & empty[:, :, 2:B-3]
-    out[:, :, 3:B-2] |= valid & empty[:, :, 3:B-2]
-    out[:, :, 4:B-1] |= valid & empty[:, :, 4:B-1]
+    out[:, :, 1 : B - 4] |= valid & empty[:, :, 1 : B - 4]
+    out[:, :, 2 : B - 3] |= valid & empty[:, :, 2 : B - 3]
+    out[:, :, 3 : B - 2] |= valid & empty[:, :, 3 : B - 2]
+    out[:, :, 4 : B - 1] |= valid & empty[:, :, 4 : B - 1]
 
     valid = (atk6_d1 == 3) & (def6_d1 == 0) & (end6_d1 == 2)
-    out[:, 1:B-4, 1:B-4] |= valid & empty[:, 1:B-4, 1:B-4]
-    out[:, 2:B-3, 2:B-3] |= valid & empty[:, 2:B-3, 2:B-3]
-    out[:, 3:B-2, 3:B-2] |= valid & empty[:, 3:B-2, 3:B-2]
-    out[:, 4:B-1, 4:B-1] |= valid & empty[:, 4:B-1, 4:B-1]
+    out[:, 1 : B - 4, 1 : B - 4] |= valid & empty[:, 1 : B - 4, 1 : B - 4]
+    out[:, 2 : B - 3, 2 : B - 3] |= valid & empty[:, 2 : B - 3, 2 : B - 3]
+    out[:, 3 : B - 2, 3 : B - 2] |= valid & empty[:, 3 : B - 2, 3 : B - 2]
+    out[:, 4 : B - 1, 4 : B - 1] |= valid & empty[:, 4 : B - 1, 4 : B - 1]
 
     valid = (atk6_d2 == 3) & (def6_d2 == 0) & (end6_d2 == 2)
-    out[:, 1:B-4, 4:B-1] |= valid & empty[:, 1:B-4, 4:B-1]
-    out[:, 2:B-3, 3:B-2] |= valid & empty[:, 2:B-3, 3:B-2]
-    out[:, 3:B-2, 2:B-3] |= valid & empty[:, 3:B-2, 2:B-3]
-    out[:, 4:B-1, 1:B-4] |= valid & empty[:, 4:B-1, 1:B-4]
+    out[:, 1 : B - 4, 4 : B - 1] |= valid & empty[:, 1 : B - 4, 4 : B - 1]
+    out[:, 2 : B - 3, 3 : B - 2] |= valid & empty[:, 2 : B - 3, 3 : B - 2]
+    out[:, 3 : B - 2, 2 : B - 3] |= valid & empty[:, 3 : B - 2, 2 : B - 3]
+    out[:, 4 : B - 1, 1 : B - 4] |= valid & empty[:, 4 : B - 1, 1 : B - 4]
 
     return out
 
@@ -284,14 +313,23 @@ def _counts_to_open_four_defense_mask(
     empty: torch.Tensor,
 ) -> torch.Tensor:
     """
-    T3-defense part: ALL defense points against an opponent T2 window.
+    T3-defense part: defense points against an opponent open-four-threat window.
 
     For each valid 6-cell threat window:
-      atk6 == 3, def6 == 0, endpoint-empty-count == 2
+        atk6 == 3, def6 == 0, endpoint-empty-count == 2
 
     Keep:
-      - both endpoints
-      - the unique middle empty (opponent's T2 move itself)
+        1. the unique empty among the middle 4 cells;
+        2. the immediate left side of the opponent 3-stone span;
+        3. the immediate right side of the opponent 3-stone span.
+
+    This is intentionally stricter than keeping both 6-window endpoints.
+    For example:
+        . . X X X .  -> keep positions 1 and 5, not position 0
+        . X X X . .  -> keep positions 0 and 4, not position 5
+
+    The 6-cell window is still required, because the two outer endpoints
+    are what distinguishes a true open-four threat from a wall/blocked threat.
     """
     if empty.numel() == 0:
         return torch.zeros_like(empty, dtype=torch.bool)
@@ -302,37 +340,71 @@ def _counts_to_open_four_defense_mask(
 
     out = torch.zeros_like(empty, dtype=torch.bool)
 
+    # Horizontal-like direction used by the existing kernels:
+    # window positions are [0, 1, 2, 3, 4, 5] along dim=1.
     valid = (atk6_h == 3) & (def6_h == 0) & (end6_h == 2)
-    out[:, 0:B-5, :] |= valid & empty[:, 0:B-5, :]
-    out[:, 5:B,   :] |= valid & empty[:, 5:B,   :]
-    out[:, 1:B-4, :] |= valid & empty[:, 1:B-4, :]
-    out[:, 2:B-3, :] |= valid & empty[:, 2:B-3, :]
-    out[:, 3:B-2, :] |= valid & empty[:, 3:B-2, :]
-    out[:, 4:B-1, :] |= valid & empty[:, 4:B-1, :]
+    e1 = valid & empty[:, 1 : B - 4, :]
+    e2 = valid & empty[:, 2 : B - 3, :]
+    e3 = valid & empty[:, 3 : B - 2, :]
+    e4 = valid & empty[:, 4 : B - 1, :]
 
+    # Middle unique empty: opponent's direct open-four creation point.
+    out[:, 1 : B - 4, :] |= e1
+    out[:, 2 : B - 3, :] |= e2
+    out[:, 3 : B - 2, :] |= e3
+    out[:, 4 : B - 1, :] |= e4
+
+    # Span endpoints. Position 0 is useful unless position 1 is the middle empty.
+    # Position 5 is useful unless position 4 is the middle empty.
+    out[:, 0 : B - 5, :] |= (e2 | e3 | e4) & empty[:, 0 : B - 5, :]
+    out[:, 5:B, :] |= (e1 | e2 | e3) & empty[:, 5:B, :]
+
+    # Vertical-like direction: window positions are along dim=2.
     valid = (atk6_v == 3) & (def6_v == 0) & (end6_v == 2)
-    out[:, :, 0:B-5] |= valid & empty[:, :, 0:B-5]
-    out[:, :, 5:B  ] |= valid & empty[:, :, 5:B  ]
-    out[:, :, 1:B-4] |= valid & empty[:, :, 1:B-4]
-    out[:, :, 2:B-3] |= valid & empty[:, :, 2:B-3]
-    out[:, :, 3:B-2] |= valid & empty[:, :, 3:B-2]
-    out[:, :, 4:B-1] |= valid & empty[:, :, 4:B-1]
+    e1 = valid & empty[:, :, 1 : B - 4]
+    e2 = valid & empty[:, :, 2 : B - 3]
+    e3 = valid & empty[:, :, 3 : B - 2]
+    e4 = valid & empty[:, :, 4 : B - 1]
 
+    out[:, :, 1 : B - 4] |= e1
+    out[:, :, 2 : B - 3] |= e2
+    out[:, :, 3 : B - 2] |= e3
+    out[:, :, 4 : B - 1] |= e4
+
+    out[:, :, 0 : B - 5] |= (e2 | e3 | e4) & empty[:, :, 0 : B - 5]
+    out[:, :, 5:B] |= (e1 | e2 | e3) & empty[:, :, 5:B]
+
+    # Main diagonal direction: positions are (r+t, c+t).
     valid = (atk6_d1 == 3) & (def6_d1 == 0) & (end6_d1 == 2)
-    out[:, 0:B-5, 0:B-5] |= valid & empty[:, 0:B-5, 0:B-5]
-    out[:, 5:B,   5:B  ] |= valid & empty[:, 5:B,   5:B  ]
-    out[:, 1:B-4, 1:B-4] |= valid & empty[:, 1:B-4, 1:B-4]
-    out[:, 2:B-3, 2:B-3] |= valid & empty[:, 2:B-3, 2:B-3]
-    out[:, 3:B-2, 3:B-2] |= valid & empty[:, 3:B-2, 3:B-2]
-    out[:, 4:B-1, 4:B-1] |= valid & empty[:, 4:B-1, 4:B-1]
+    e1 = valid & empty[:, 1 : B - 4, 1 : B - 4]
+    e2 = valid & empty[:, 2 : B - 3, 2 : B - 3]
+    e3 = valid & empty[:, 3 : B - 2, 3 : B - 2]
+    e4 = valid & empty[:, 4 : B - 1, 4 : B - 1]
 
+    out[:, 1 : B - 4, 1 : B - 4] |= e1
+    out[:, 2 : B - 3, 2 : B - 3] |= e2
+    out[:, 3 : B - 2, 3 : B - 2] |= e3
+    out[:, 4 : B - 1, 4 : B - 1] |= e4
+
+    out[:, 0 : B - 5, 0 : B - 5] |= (
+        (e2 | e3 | e4) & empty[:, 0 : B - 5, 0 : B - 5]
+    )
+    out[:, 5:B, 5:B] |= (e1 | e2 | e3) & empty[:, 5:B, 5:B]
+
+    # Anti-diagonal direction: positions are (r+t, c+5-t).
     valid = (atk6_d2 == 3) & (def6_d2 == 0) & (end6_d2 == 2)
-    out[:, 0:B-5, 5:B  ] |= valid & empty[:, 0:B-5, 5:B  ]
-    out[:, 5:B,   0:B-5] |= valid & empty[:, 5:B,   0:B-5]
-    out[:, 1:B-4, 4:B-1] |= valid & empty[:, 1:B-4, 4:B-1]
-    out[:, 2:B-3, 3:B-2] |= valid & empty[:, 2:B-3, 3:B-2]
-    out[:, 3:B-2, 2:B-3] |= valid & empty[:, 3:B-2, 2:B-3]
-    out[:, 4:B-1, 1:B-4] |= valid & empty[:, 4:B-1, 1:B-4]
+    e1 = valid & empty[:, 1 : B - 4, 4 : B - 1]
+    e2 = valid & empty[:, 2 : B - 3, 3 : B - 2]
+    e3 = valid & empty[:, 3 : B - 2, 2 : B - 3]
+    e4 = valid & empty[:, 4 : B - 1, 1 : B - 4]
+
+    out[:, 1 : B - 4, 4 : B - 1] |= e1
+    out[:, 2 : B - 3, 3 : B - 2] |= e2
+    out[:, 3 : B - 2, 2 : B - 3] |= e3
+    out[:, 4 : B - 1, 1 : B - 4] |= e4
+
+    out[:, 0 : B - 5, 5:B] |= (e2 | e3 | e4) & empty[:, 0 : B - 5, 5:B]
+    out[:, 5:B, 0 : B - 5] |= (e1 | e2 | e3) & empty[:, 5:B, 0 : B - 5]
 
     return out
 
@@ -365,20 +437,29 @@ class Gomoku:
             dtype=torch.long,
         )
         self.done: torch.Tensor = torch.zeros(
-            num_envs, dtype=torch.bool, device=self.device
+            num_envs,
+            dtype=torch.bool,
+            device=self.device,
         )
         self.turn: torch.Tensor = torch.zeros(
-            num_envs, dtype=torch.long, device=self.device
+            num_envs,
+            dtype=torch.long,
+            device=self.device,
         )
         self.move_count: torch.Tensor = torch.zeros(
-            num_envs, dtype=torch.long, device=self.device
+            num_envs,
+            dtype=torch.long,
+            device=self.device,
         )
         self.last_move: torch.Tensor = -torch.ones(
-            num_envs, dtype=torch.long, device=self.device
+            num_envs,
+            dtype=torch.long,
+            device=self.device,
         )
-
         self.env_ids: torch.Tensor = torch.arange(
-            num_envs, device=self.device, dtype=torch.long
+            num_envs,
+            device=self.device,
+            dtype=torch.long,
         )
 
         self.kernel_horizontal = (
@@ -486,22 +567,18 @@ class Gomoku:
 
     def to(self, device):
         self.device = device
-
         self.board = self.board.to(device=device)
         self.done = self.done.to(device=device)
         self.turn = self.turn.to(device=device)
         self.move_count = self.move_count.to(device=device)
         self.last_move = self.last_move.to(device=device)
         self.env_ids = self.env_ids.to(device=device)
-
         self.kernel_horizontal = self.kernel_horizontal.to(device=device)
         self.kernel_vertical = self.kernel_vertical.to(device=device)
         self.kernel_diagonal = self.kernel_diagonal.to(device=device)
-
         self.kernel_horizontal6 = self.kernel_horizontal6.to(device=device)
         self.kernel_vertical6 = self.kernel_vertical6.to(device=device)
         self.kernel_diagonal6 = self.kernel_diagonal6.to(device=device)
-
         self.kernel_horizontal6_end = self.kernel_horizontal6_end.to(device=device)
         self.kernel_vertical6_end = self.kernel_vertical6_end.to(device=device)
         self.kernel_diagonal6_end = self.kernel_diagonal6_end.to(device=device)
@@ -522,7 +599,9 @@ class Gomoku:
             self.last_move[env_indices] = -1
 
     def step(
-        self, action: torch.Tensor, env_mask: torch.Tensor | None = None
+        self,
+        action: torch.Tensor,
+        env_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if env_mask is None:
             env_mask = torch.ones_like(action, dtype=torch.bool)
@@ -532,16 +611,17 @@ class Gomoku:
 
         nop = (values_on_board != 0) | (~env_mask)
         inc = torch.logical_not(nop).long()
-        piece = torch.where(self.turn == 0, 1, -1)
 
+        piece = torch.where(self.turn == 0, 1, -1)
         board_1d_view[self.env_ids, action] = torch.where(
-            nop, values_on_board, piece
+            nop,
+            values_on_board,
+            piece,
         )
 
         self.move_count = self.move_count + inc
 
         board_one_side = (self.board == piece.unsqueeze(-1).unsqueeze(-1)).float()
-
         self.done = compute_done(
             board_one_side,
             self.kernel_horizontal,
@@ -556,13 +636,11 @@ class Gomoku:
 
     def get_encoded_board(self) -> torch.Tensor:
         piece = torch.where(self.turn == 0, 1, -1).unsqueeze(-1).unsqueeze(-1)
-
         layer1 = (self.board == piece).float()
         layer2 = (self.board == -piece).float()
 
         last_x = self.last_move // self.board_size
         last_y = self.last_move % self.board_size
-
         board_ids = torch.arange(self.board_size, device=self.device)
 
         layer3 = (
@@ -578,24 +656,25 @@ class Gomoku:
     def get_action_mask(self) -> torch.Tensor:
         """
         Sync-reduced version:
-        - no stage-by-stage Python early-stop on GPU tensors
-        - compute local masks on GPU first
-        - apply T0 > T1 > T2 > T3 priority once at the end
+          - no stage-by-stage Python early-stop on GPU tensors
+          - compute local masks on GPU first
+          - apply T0 > T1 > T2 > T3 priority once at the end
 
         Priority:
-        T0) current player immediate five
-        T1) block opponent immediate five
-        T2) current player creates true open four: _XXXX_
-        T3) opponent T2 full defense points ∪ current player's forcing-four points
-        fallback) normal legal moves
+          T0) current player immediate five
+          T1) block opponent immediate five
+          T2) current player creates true open four: _XXXX_
+          T3) opponent open-four-threat defense points ∪ current player's forcing-four points
+          fallback) normal legal moves
         """
-        legal = (self.board == 0)
+        legal = self.board == 0
+
         if not self.action_pruning_enabled:
             return legal.flatten(start_dim=1)
 
         piece = torch.where(self.turn == 0, 1, -1).view(-1, 1, 1)
-        mine = (self.board == piece)
-        opp = (self.board == -piece)
+        mine = self.board == piece
+        opp = self.board == -piece
 
         final_mask = legal.clone()
 
@@ -612,8 +691,14 @@ class Gomoku:
         legal5 = legal[active5]
 
         (
-            mine5_h, mine5_v, mine5_d1, mine5_d2,
-            opp5_h, opp5_v, opp5_d1, opp5_d2,
+            mine5_h,
+            mine5_v,
+            mine5_d1,
+            mine5_d2,
+            opp5_h,
+            opp5_v,
+            opp5_d1,
+            opp5_d2,
         ) = _compute_two_plane_counts(
             mine5,
             opp5,
@@ -623,23 +708,49 @@ class Gomoku:
         )
 
         my_mask5 = _counts_to_immediate_five_mask(
-            mine5_h, mine5_v, mine5_d1, mine5_d2,
-            opp5_h, opp5_v, opp5_d1, opp5_d2,
+            mine5_h,
+            mine5_v,
+            mine5_d1,
+            mine5_d2,
+            opp5_h,
+            opp5_v,
+            opp5_d1,
+            opp5_d2,
             legal5,
         )
         opp_mask5 = _counts_to_immediate_five_mask(
-            opp5_h, opp5_v, opp5_d1, opp5_d2,
-            mine5_h, mine5_v, mine5_d1, mine5_d2,
+            opp5_h,
+            opp5_v,
+            opp5_d1,
+            opp5_d2,
+            mine5_h,
+            mine5_v,
+            mine5_d1,
+            mine5_d2,
             legal5,
         )
 
-        hit_t0_local = my_mask5.flatten(start_dim=1).any(dim=1) & (active5_local_mc >= 8)
-        hit_t1_local = opp_mask5.flatten(start_dim=1).any(dim=1) & (active5_local_mc >= 7) & (~hit_t0_local)
+        hit_t0_local = my_mask5.flatten(start_dim=1).any(dim=1) & (
+            active5_local_mc >= 8
+        )
+        hit_t1_local = (
+            opp_mask5.flatten(start_dim=1).any(dim=1)
+            & (active5_local_mc >= 7)
+            & (~hit_t0_local)
+        )
 
         t0_mask_global = torch.zeros_like(legal)
         t1_mask_global = torch.zeros_like(legal)
-        hit_t0_global = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        hit_t1_global = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        hit_t0_global = torch.zeros(
+            self.num_envs,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        hit_t1_global = torch.zeros(
+            self.num_envs,
+            dtype=torch.bool,
+            device=self.device,
+        )
 
         t0_mask_global[active5_ids] = my_mask5
         t1_mask_global[active5_ids] = opp_mask5
@@ -654,7 +765,8 @@ class Gomoku:
             device=self.device,
         )
         id_to_active5[active5_ids] = torch.arange(
-            active5_ids.shape[0], device=self.device
+            active5_ids.shape[0],
+            device=self.device,
         )
 
         # ============================================================
@@ -670,8 +782,14 @@ class Gomoku:
             legal6 = legal[active6]
 
             (
-                mine6_h, mine6_v, mine6_d1, mine6_d2,
-                opp6_h, opp6_v, opp6_d1, opp6_d2,
+                mine6_h,
+                mine6_v,
+                mine6_d1,
+                mine6_d2,
+                opp6_h,
+                opp6_v,
+                opp6_d1,
+                opp6_d2,
             ) = _compute_two_plane_counts(
                 mine6,
                 opp6,
@@ -688,21 +806,45 @@ class Gomoku:
             )
 
             t2_mask_local = _counts_to_open_four_creation_mask(
-                mine6_h, mine6_v, mine6_d1, mine6_d2,
-                opp6_h, opp6_v, opp6_d1, opp6_d2,
-                end6_h, end6_v, end6_d1, end6_d2,
+                mine6_h,
+                mine6_v,
+                mine6_d1,
+                mine6_d2,
+                opp6_h,
+                opp6_v,
+                opp6_d1,
+                opp6_d2,
+                end6_h,
+                end6_v,
+                end6_d1,
+                end6_d2,
                 legal6,
             )
-            hit_t2_local = t2_mask_local.flatten(start_dim=1).any(dim=1) & (active6_local_mc >= 6)
+
+            hit_t2_local = t2_mask_local.flatten(start_dim=1).any(dim=1) & (
+                active6_local_mc >= 6
+            )
 
             opp_t2_def_mask_local = _counts_to_open_four_defense_mask(
-                opp6_h, opp6_v, opp6_d1, opp6_d2,
-                mine6_h, mine6_v, mine6_d1, mine6_d2,
-                end6_h, end6_v, end6_d1, end6_d2,
+                opp6_h,
+                opp6_v,
+                opp6_d1,
+                opp6_d2,
+                mine6_h,
+                mine6_v,
+                mine6_d1,
+                mine6_d2,
+                end6_h,
+                end6_v,
+                end6_d1,
+                end6_d2,
                 legal6,
             )
-            hit_t3_local = opp_t2_def_mask_local.flatten(start_dim=1).any(dim=1) & (~hit_t2_local)
 
+            hit_t3_local = (
+                opp_t2_def_mask_local.flatten(start_dim=1).any(dim=1)
+                & (~hit_t2_local)
+            )
             t3_mask_local = opp_t2_def_mask_local.clone()
 
             loc_in_active5 = id_to_active5[active6_ids]
@@ -724,8 +866,16 @@ class Gomoku:
 
             t2_mask_global = torch.zeros_like(legal)
             t3_mask_global = torch.zeros_like(legal)
-            hit_t2_global = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-            hit_t3_global = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            hit_t2_global = torch.zeros(
+                self.num_envs,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            hit_t3_global = torch.zeros(
+                self.num_envs,
+                dtype=torch.bool,
+                device=self.device,
+            )
 
             t2_mask_global[active6_ids] = t2_mask_local
             t3_mask_global[active6_ids] = t3_mask_local
@@ -734,8 +884,16 @@ class Gomoku:
         else:
             t2_mask_global = torch.zeros_like(legal)
             t3_mask_global = torch.zeros_like(legal)
-            hit_t2_global = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-            hit_t3_global = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            hit_t2_global = torch.zeros(
+                self.num_envs,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            hit_t3_global = torch.zeros(
+                self.num_envs,
+                dtype=torch.bool,
+                device=self.device,
+            )
 
         # ============================================================
         # Resolve priority once, on GPU.

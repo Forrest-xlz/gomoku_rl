@@ -25,7 +25,7 @@ num_residual_blocks: 8
 
 noise_scale:
   enabled: true
-  interval: 48
+  interval: 192
   warmup_updates: 0
   ema_beta: 0.95
   min_half_batch: 2
