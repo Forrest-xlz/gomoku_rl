@@ -20,37 +20,28 @@ from .common import (
     make_ppo_actor,
 )
 
+
 DeviceLike = Union[torch.device, str, int, None]
 
 
 class PPO(Policy):
-    """PPO with online-isolated Bsimple / gradient-noise-scale measurement.
+    """PPO with online-isolated Bsimple measurement and outer-epoch schedules.
 
-    Compared with the previous version, the Bsimple measurement no longer runs
-    forward/backward on the training actor/critic/loss_module. Instead it creates
-    a temporary shadow copy of actor+critic, measures gradients on that shadow
-    model, logs the result, and then deletes the shadow model.
+    Schedule config under cfg.algo:
 
-    This isolates the normal training model from diagnostic side effects:
-    - no main-parameter update from measurement;
-    - no main-gradient residue from measurement;
-    - no optimizer-state change from measurement;
-    - no BatchNorm running_mean/running_var change on the main model.
+        lr_decay_mode: constant | linear
+        lr_start: 1e-4
+        lr_end: 1e-5
+        lr_epochs: 5000
 
-    Random-state isolation is intentionally not implemented, because the user
-    requested that RNG isolation is unnecessary.
+        entropy_decay_mode: constant | linear
+        entropy_start: 0.01
+        entropy_end: 0.001
+        entropy_epochs: 5000
 
-    Optional config under cfg.algo.noise_scale:
-
-        noise_scale:
-          enabled: true
-          interval: 20
-          warmup_updates: 0
-          ema_beta: 0.95
-          min_half_batch: 2
-          eps: 1e-12
-          isolation: shadow_model
-          empty_cuda_cache_after_measure: false
+    The runner calls set_outer_epoch(epoch_index) once per outer epoch before
+    PPO learning. The active learning rate and entropy coefficient are returned
+    in learn() info and are therefore logged by the runner.
     """
 
     def __init__(
@@ -65,14 +56,46 @@ class PPO(Policy):
         self.cfg: DictConfig = cfg
         self.device: DeviceLike = device
 
-        self.clip_param: float = cfg.clip_param
+        self.clip_param: float = float(cfg.clip_param)
         self.ppo_epoch: int = int(cfg.ppo_epochs)
-        self.entropy_coef: float = cfg.entropy_coef
-        self.gae_gamma: float = cfg.gamma
-        self.gae_lambda: float = cfg.gae_lambda
+        self.entropy_coef: float = float(cfg.entropy_coef)
+        self.gae_gamma: float = float(cfg.gamma)
+        self.gae_lambda: float = float(cfg.gae_lambda)
         self.average_gae: bool = bool(cfg.average_gae)
         self.batch_size: int = int(cfg.batch_size)
-        self.max_grad_norm: float = cfg.max_grad_norm
+        self.max_grad_norm: float = float(cfg.max_grad_norm)
+
+        # -------------------- outer-epoch LR / entropy schedule --------------------
+        base_lr = float(self.cfg.optimizer.kwargs.lr)
+        self.lr_decay_mode: str = self._normalize_schedule_mode(
+            self.cfg.get("lr_decay_mode", "constant")
+        )
+        self.lr_start: float = float(self.cfg.get("lr_start", base_lr))
+        self.lr_end: float = float(self.cfg.get("lr_end", self.lr_start))
+        self.lr_epochs: int = max(1, int(self.cfg.get("lr_epochs", 1)))
+
+        self.entropy_decay_mode: str = self._normalize_schedule_mode(
+            self.cfg.get("entropy_decay_mode", "constant")
+        )
+        self.entropy_start: float = float(
+            self.cfg.get("entropy_start", self.entropy_coef)
+        )
+        self.entropy_end: float = float(
+            self.cfg.get("entropy_end", self.entropy_start)
+        )
+        self.entropy_epochs: int = max(1, int(self.cfg.get("entropy_epochs", 1)))
+
+        self._outer_epoch_index: int = 0
+        self.current_lr: float = (
+            self.lr_start if self._is_linear_mode(self.lr_decay_mode) else base_lr
+        )
+        self.current_entropy_coef: float = (
+            self.entropy_start
+            if self._is_linear_mode(self.entropy_decay_mode)
+            else self.entropy_coef
+        )
+        self.entropy_coef = float(self.current_entropy_coef)
+        # -------------------------------------------------------------------------
 
         if self.cfg.get("share_network"):
             actor_value_operator = make_ppo_ac(
@@ -100,13 +123,13 @@ class PPO(Policy):
         fake_input = observation_spec.zero()
         fake_input["action_mask"] = ~fake_input["action_mask"]
         fake_input = fake_input.to(self.device)
-
         with torch.no_grad():
             self.actor(fake_input)
             self.critic(fake_input)
 
         self.loss_module = self._make_loss_module(self.actor, self.critic)
         self.optim = get_optimizer(self.cfg.optimizer, self.loss_module.parameters())
+        self._apply_outer_epoch_schedule(self._outer_epoch_index)
 
         # -------------------- Bsimple / gradient-noise-scale config --------------------
         ns_cfg = self.cfg.get("noise_scale", {})
@@ -133,7 +156,6 @@ class PPO(Policy):
                 "for this isolated PPO implementation."
             )
 
-        # If true, calls torch.cuda.empty_cache() after deleting the shadow model.
         # Usually keep false: PyTorch's caching allocator may keep memory reserved
         # in nvidia-smi, but the deleted shadow memory is reusable by PyTorch.
         self.noise_scale_empty_cuda_cache_after_measure: bool = bool(
@@ -147,15 +169,123 @@ class PPO(Policy):
         self._noise_bsimple_ema: float | None = None
 
     # -------------------------------------------------------------------------
+    # Outer-epoch schedule helpers
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def _normalize_schedule_mode(mode) -> str:
+        mode_str = str(mode).strip().lower()
+        if mode_str in {"true", "on", "enable", "enabled", "linear_decay", "decay"}:
+            return "linear"
+        if mode_str in {"false", "off", "disable", "disabled", "none"}:
+            return "constant"
+        return mode_str
+
+    @staticmethod
+    def _is_linear_mode(mode: str) -> bool:
+        return str(mode).strip().lower() in {"linear", "lin"}
+
+    @staticmethod
+    def _linear_value(start: float, end: float, epochs: int, epoch_index: int) -> float:
+        epochs = max(1, int(epochs))
+        progress = min(max(float(epoch_index), 0.0), float(epochs)) / float(epochs)
+        return float(start + (end - start) * progress)
+
+    def _scheduled_lr(self, epoch_index: int) -> float:
+        if self._is_linear_mode(self.lr_decay_mode):
+            return self._linear_value(
+                self.lr_start,
+                self.lr_end,
+                self.lr_epochs,
+                epoch_index,
+            )
+        return float(self.cfg.optimizer.kwargs.lr)
+
+    def _scheduled_entropy_coef(self, epoch_index: int) -> float:
+        if self._is_linear_mode(self.entropy_decay_mode):
+            return self._linear_value(
+                self.entropy_start,
+                self.entropy_end,
+                self.entropy_epochs,
+                epoch_index,
+            )
+        return float(self.cfg.entropy_coef)
+
+    def _set_optimizer_lr(self, lr: float) -> None:
+        if not hasattr(self, "optim") or self.optim is None:
+            return
+        for group in self.optim.param_groups:
+            group["lr"] = float(lr)
+
+    @staticmethod
+    def _set_loss_module_entropy_coef(loss_module: ClipPPOLoss, value: float) -> None:
+        """Best-effort update across TorchRL versions."""
+        value = float(value)
+        for attr_name in ("entropy_coef", "entropy_coeff"):
+            if hasattr(loss_module, attr_name):
+                attr_value = getattr(loss_module, attr_name)
+                if torch.is_tensor(attr_value):
+                    attr_value.data.fill_(value)
+                else:
+                    setattr(loss_module, attr_name, value)
+
+        buffers = getattr(loss_module, "_buffers", {})
+        for buffer_name in ("entropy_coef", "entropy_coeff"):
+            buffer = buffers.get(buffer_name, None)
+            if torch.is_tensor(buffer):
+                buffer.data.fill_(value)
+
+    def _apply_outer_epoch_schedule(self, epoch_index: int) -> None:
+        self._outer_epoch_index = max(0, int(epoch_index))
+        self.current_lr = self._scheduled_lr(self._outer_epoch_index)
+        self.current_entropy_coef = self._scheduled_entropy_coef(
+            self._outer_epoch_index
+        )
+        self.entropy_coef = float(self.current_entropy_coef)
+
+        self._set_optimizer_lr(self.current_lr)
+        if hasattr(self, "loss_module") and self.loss_module is not None:
+            self._set_loss_module_entropy_coef(
+                self.loss_module,
+                self.current_entropy_coef,
+            )
+
+    def set_outer_epoch(self, epoch_index: int) -> dict[str, float]:
+        """Set LR / entropy coefficient according to the current outer epoch."""
+        self._apply_outer_epoch_schedule(epoch_index)
+        return self.get_schedule_info()
+
+    def get_schedule_info(self) -> dict[str, float]:
+        return {
+            "schedule/outer_epoch": float(self._outer_epoch_index),
+            "schedule/lr": float(self.current_lr),
+            "schedule/lr_decay_linear": float(self._is_linear_mode(self.lr_decay_mode)),
+            "schedule/lr_start": float(self.lr_start),
+            "schedule/lr_end": float(self.lr_end),
+            "schedule/lr_epochs": float(self.lr_epochs),
+            "schedule/entropy_coef": float(self.current_entropy_coef),
+            "schedule/entropy_decay_linear": float(
+                self._is_linear_mode(self.entropy_decay_mode)
+            ),
+            "schedule/entropy_start": float(self.entropy_start),
+            "schedule/entropy_end": float(self.entropy_end),
+            "schedule/entropy_epochs": float(self.entropy_epochs),
+        }
+
+    # -------------------------------------------------------------------------
     # Model / loss helpers
     # -------------------------------------------------------------------------
+    def _entropy_bonus_enabled(self) -> bool:
+        if self._is_linear_mode(self.entropy_decay_mode):
+            return True
+        return bool(self.entropy_coef)
+
     def _make_loss_module(self, actor, critic) -> ClipPPOLoss:
         return ClipPPOLoss(
             actor=actor,
             critic=critic,
             clip_epsilon=self.clip_param,
-            entropy_bonus=bool(self.entropy_coef),
-            entropy_coef=self.entropy_coef,
+            entropy_bonus=self._entropy_bonus_enabled(),
+            entropy_coef=float(self.entropy_coef),
             normalize_advantage=self.cfg.get("normalize_advantage", True),
             loss_critic_type="smooth_l1",
         )
@@ -194,39 +324,32 @@ class PPO(Policy):
         return None
 
     def _manual_clip_fraction_from_probs(self, minibatch: TensorDict) -> torch.Tensor | None:
-        """Compute PPO clip fraction without calling actor.get_dist().
-
-        Some TorchRL/TensorDict versions can build up nested functional wrappers
-        around ``get_dist`` after many repeated manual calls. This fallback instead
-        runs the actor once, reads the output ``probs``, and gathers the probability
-        of the rollout action directly.
-        """
+        """Compute PPO clip fraction without calling actor.get_dist()."""
         old_log_prob = minibatch.get("sample_log_prob", None)
         action = minibatch.get("action", None)
-
         if old_log_prob is None or action is None:
             return None
 
         try:
             with torch.no_grad():
                 actor_input = minibatch.select(
-                    "observation", "action_mask", "hidden", strict=False
+                    "observation",
+                    "action_mask",
+                    "hidden",
+                    strict=False,
                 ).clone(False)
                 actor_output: TensorDict = self.actor(actor_input)
                 probs = actor_output.get("probs", None)
-
                 if probs is None:
                     return None
 
                 action_index = action.detach().long()
-
                 if action_index.ndim == probs.ndim:
                     action_index = action_index.squeeze(-1)
-
                 while action_index.ndim < probs.ndim - 1:
                     action_index = action_index.unsqueeze(-1)
-
                 action_index = action_index.unsqueeze(-1)
+
                 new_prob = probs.gather(-1, action_index).clamp_min(1e-12)
                 new_log_prob = new_prob.log()
         except Exception:
@@ -237,13 +360,13 @@ class PPO(Policy):
 
         while new_log_prob.ndim < old_log_prob.ndim:
             new_log_prob = new_log_prob.unsqueeze(-1)
-
         while old_log_prob.ndim < new_log_prob.ndim:
             old_log_prob = old_log_prob.unsqueeze(-1)
 
         try:
             new_log_prob, old_log_prob = torch.broadcast_tensors(
-                new_log_prob, old_log_prob
+                new_log_prob,
+                old_log_prob,
             )
         except RuntimeError:
             return None
@@ -253,7 +376,6 @@ class PPO(Policy):
         clipped = (ratio < 1.0 - float(self.clip_param)) | (
             ratio > 1.0 + float(self.clip_param)
         )
-
         return clipped.float().mean()
 
     @staticmethod
@@ -261,14 +383,11 @@ class PPO(Policy):
         with torch.no_grad():
             y_pred = y_pred.detach().float().reshape(-1)
             y_true = y_true.detach().float().reshape(-1)
-
             if y_true.numel() <= 1:
                 return float("nan")
-
             target_var = torch.var(y_true, unbiased=False)
             if torch.isnan(target_var) or target_var.item() < 1e-8:
                 return float("nan")
-
             residual_var = torch.var(y_true - y_pred, unbiased=False)
             return (1.0 - residual_var / target_var).item()
 
@@ -276,7 +395,9 @@ class PPO(Policy):
     # Loss / gradient helpers
     # -------------------------------------------------------------------------
     def _loss_value_from_module(
-        self, loss_module: ClipPPOLoss, minibatch: TensorDict
+        self,
+        loss_module: ClipPPOLoss,
+        minibatch: TensorDict,
     ) -> tuple[torch.Tensor, TensorDict]:
         loss_vals = loss_module(minibatch)
         loss_value = (
@@ -309,16 +430,13 @@ class PPO(Policy):
 
     def _flat_grad_vector_from_module(self, module: torch.nn.Module) -> torch.Tensor:
         chunks = []
-
         for p in self._trainable_module_parameters(module):
             if p.grad is None:
                 chunks.append(torch.zeros(p.numel(), device=self.device, dtype=p.dtype))
             else:
                 chunks.append(p.grad.detach().reshape(-1).to(self.device))
-
         if not chunks:
             return torch.zeros((), device=self.device)
-
         return torch.cat(chunks, dim=0)
 
     def _flat_grad_vector(self) -> torch.Tensor:
@@ -326,44 +444,33 @@ class PPO(Policy):
 
     @staticmethod
     def _clone_tensordict_for_measurement(minibatch: TensorDict) -> TensorDict:
-        """Clone the TensorDict structure so diagnostic forward cannot add keys to it.
-
-        clone(False) is a shallow TensorDict clone: tensor storage is shared, but
-        the mapping/keys are independent. That is enough here because the loss
-        should not mutate tensor values in-place.
-        """
+        """Clone TensorDict structure so diagnostic forward cannot add keys to it."""
         try:
             return minibatch.clone(False)
         except TypeError:
             return minibatch.clone()
 
     def _grad_vector_for_batch_with_loss_module(
-        self, loss_module: ClipPPOLoss, minibatch: TensorDict
+        self,
+        loss_module: ClipPPOLoss,
+        minibatch: TensorDict,
     ) -> tuple[torch.Tensor, float]:
         self._zero_module_grad(loss_module)
-
         measurement_batch = self._clone_tensordict_for_measurement(minibatch)
         loss_value, _ = self._loss_value_from_module(loss_module, measurement_batch)
         loss_value.backward()
-
         grad = self._flat_grad_vector_from_module(loss_module)
         loss_item = float(loss_value.detach().item())
-
         self._zero_module_grad(loss_module)
-
         return grad, loss_item
 
     def _grad_vector_for_batch(self, minibatch: TensorDict) -> tuple[torch.Tensor, float]:
         self._zero_optimizer_grad()
-
         loss_value, _ = self._loss_value(minibatch)
         loss_value.backward()
-
         grad = self._flat_grad_vector()
         loss_item = float(loss_value.detach().item())
-
         self._zero_optimizer_grad()
-
         return grad, loss_item
 
     # -------------------------------------------------------------------------
@@ -372,10 +479,8 @@ class PPO(Policy):
     def _should_measure_noise_scale(self) -> bool:
         if not self.noise_scale_enabled:
             return False
-
         if self._noise_update_counter < self.noise_scale_warmup_updates:
             return False
-
         return self._noise_update_counter % self.noise_scale_interval == 0
 
     @staticmethod
@@ -386,7 +491,6 @@ class PPO(Policy):
 
     def _update_noise_ema(self, g2_hat: float, s_hat: float) -> tuple[float, float, float]:
         beta = self.noise_scale_ema_beta
-
         if self._noise_g2_ema is None or self._noise_s_ema is None:
             self._noise_g2_ema = float(g2_hat)
             self._noise_s_ema = float(s_hat)
@@ -401,19 +505,11 @@ class PPO(Policy):
         g2_safe = max(float(self._noise_g2_ema), self.noise_scale_eps)
         s_safe = max(float(self._noise_s_ema), 0.0)
         self._noise_bsimple_ema = s_safe / g2_safe
-
         return float(self._noise_g2_ema), float(self._noise_s_ema), self._noise_bsimple_ema
 
     def _make_shadow_loss_module(self) -> ClipPPOLoss:
-        """Create a temporary loss module for isolated Bsimple measurement.
-
-        actor and critic are deep-copied together as one object graph. This is
-        important for share_network=True: if the policy and value modules share
-        an encoder/trunk, deepcopy((actor, critic)) preserves that sharing inside
-        the shadow copy via Python deepcopy's memo table.
-        """
+        """Create a temporary loss module for isolated Bsimple measurement."""
         shadow_actor, shadow_critic = copy.deepcopy((self.actor, self.critic))
-
         shadow_actor.to(self.device)
         shadow_critic.to(self.device)
         shadow_actor.train()
@@ -423,40 +519,23 @@ class PPO(Policy):
         shadow_loss_module.to(self.device)
         shadow_loss_module.train()
         self._zero_module_grad(shadow_loss_module)
-
         return shadow_loss_module
 
-    def _cleanup_shadow_loss_module(self, shadow_loss_module: ClipPPOLoss | None) -> None:
+    def _cleanup_shadow_loss_module(
+        self,
+        shadow_loss_module: ClipPPOLoss | None,
+    ) -> None:
         if shadow_loss_module is not None:
             self._zero_module_grad(shadow_loss_module)
             del shadow_loss_module
-
         gc.collect()
-
-        if (
-            self.noise_scale_empty_cuda_cache_after_measure
-            and torch.cuda.is_available()
-            and torch.device(self.device).type == "cuda"
-        ):
+        if self.noise_scale_empty_cuda_cache_after_measure and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     def _measure_noise_scale_on_minibatch(self, minibatch: TensorDict) -> dict[str, float]:
-        """Estimate Bsimple on one PPO minibatch using a temporary shadow model.
-
-        The current minibatch is split into two equal independent chunks:
-
-        - each half is treated as Bsmall;
-        - the average gradient of both halves is treated as Bbig = 2 * Bsmall.
-
-        This is the single-GPU analogue of the data-parallel estimator where
-        Bsmall is the local per-worker batch and Bbig is the averaged global batch.
-
-        All diagnostic forward/backward passes are performed on the shadow loss
-        module, not on self.loss_module.
-        """
+        """Estimate Bsimple on one PPO minibatch using a temporary shadow model."""
         n_total = self._first_dim_size(minibatch)
         n_small = n_total // 2
-
         if n_small < self.noise_scale_min_half_batch:
             return {
                 "noise_scale/measured": 0.0,
@@ -471,15 +550,16 @@ class PPO(Policy):
         part2 = minibatch[n_small : 2 * n_small]
 
         shadow_loss_module = None
-
         try:
             shadow_loss_module = self._make_shadow_loss_module()
 
             g1, loss1 = self._grad_vector_for_batch_with_loss_module(
-                shadow_loss_module, part1
+                shadow_loss_module,
+                part1,
             )
             g2, loss2 = self._grad_vector_for_batch_with_loss_module(
-                shadow_loss_module, part2
+                shadow_loss_module,
+                part2,
             )
 
             norm_small = 0.5 * (
@@ -490,7 +570,6 @@ class PPO(Policy):
 
             b_small = float(n_small)
             b_big = float(2 * n_small)
-
             norm_small_f = float(norm_small.item())
             norm_big_f = float(norm_big.item())
 
@@ -506,12 +585,10 @@ class PPO(Policy):
             # stable reported ratio.
             g2_for_ratio = max(g2_hat, self.noise_scale_eps)
             s_for_ratio = max(s_hat, 0.0)
-
             bsimple_raw = s_hat / g2_for_ratio
             bsimple_clipped = s_for_ratio / g2_for_ratio
 
             g2_ema, s_ema, bsimple_ema = self._update_noise_ema(g2_hat, s_hat)
-
             self._noise_measure_counter += 1
 
             return {
@@ -537,9 +614,6 @@ class PPO(Policy):
                 "noise_scale/update_index": float(self._noise_update_counter),
             }
         except Exception as exc:
-            # Do not let diagnostics break training. This also avoids falling
-            # back to the main model, because that would reintroduce BN-buffer
-            # contamination.
             return {
                 "noise_scale/measured": 0.0,
                 "noise_scale/skipped_too_small": 0.0,
@@ -547,22 +621,22 @@ class PPO(Policy):
                 "noise_scale/isolation_shadow_model": 1.0,
                 "noise_scale/batch_total": float(n_total),
                 "noise_scale/update_index": float(self._noise_update_counter),
-                # Keep this numeric for loggers. The exception text is printed.
                 "noise_scale/shadow_error_type_hash": float(
                     abs(hash(type(exc).__name__)) % 1000000
                 ),
             }
         finally:
             self._cleanup_shadow_loss_module(shadow_loss_module)
-
-            # Defensive cleanup: the main optimizer should not have grads from
-            # measurement anyway, but keep the old invariant before PPO update.
             self._zero_optimizer_grad()
 
     # -------------------------------------------------------------------------
     # PPO learning
     # -------------------------------------------------------------------------
     def learn(self, data: TensorDict):
+        # Re-apply the current outer-epoch schedule at the start of every learn()
+        # call. This protects against optimizer-state reloads or outside changes.
+        self._apply_outer_epoch_schedule(self._outer_epoch_index)
+
         value = data["state_value"].to(self.device)
         next_value = data["next", "state_value"].to(self.device)
         done = data["next", "done"].unsqueeze(-1).to(self.device)
@@ -591,7 +665,6 @@ class PPO(Policy):
 
         loc = adv.mean()
         scale = adv.std().clamp_min(1e-4)
-
         if self.average_gae:
             adv = adv - loc
             adv = adv / scale
@@ -625,10 +698,6 @@ class PPO(Policy):
             for minibatch in make_dataset_naive(data, batch_size=self.batch_size):
                 minibatch = minibatch.to(self.device)
 
-                # Online-isolated diagnostic measurement. It is intentionally
-                # placed before the normal optimizer step so the measured shadow
-                # parameters match the main parameters used by this minibatch
-                # update. The main model is not forward/backwarded here.
                 if self._should_measure_noise_scale():
                     noise_infos.append(self._measure_noise_scale_on_minibatch(minibatch))
 
@@ -651,7 +720,6 @@ class PPO(Policy):
                     clipfracs.append(clip_fraction.clone().detach().float().mean())
 
                 loss_value.backward()
-
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.loss_module.parameters(),
                     self.max_grad_norm,
@@ -664,7 +732,6 @@ class PPO(Policy):
 
                 self.optim.step()
                 self._zero_optimizer_grad()
-
                 self._noise_update_counter += 1
 
         self.eval()
@@ -681,13 +748,11 @@ class PPO(Policy):
             "loss_critic": torch.stack(loss_critics).mean().item(),
             "loss_entropy": torch.stack(loss_entropies).mean().item(),
         }
+        info.update(self.get_schedule_info())
 
         if noise_infos:
-            # Log the last fresh measurement from this learn() call. EMA fields
-            # already contain history across previous learn() calls.
             info.update(noise_infos[-1])
         elif self.noise_scale_enabled and self._noise_bsimple_ema is not None:
-            # Keep the EMA visible on learn() calls without a fresh measurement.
             info.update(
                 {
                     "noise_scale/measured": 0.0,
@@ -720,6 +785,11 @@ class PPO(Policy):
         if opt_state is not None:
             self.optim.load_state_dict(opt_state)
             print("optimizer state loaded successfully.")
+
+        # Checkpoint optimizer state may carry old LR values. Restore the current
+        # schedule value immediately; the runner will set the correct resumed
+        # outer epoch before the next learn() call.
+        self._apply_outer_epoch_schedule(self._outer_epoch_index)
 
     def train(self):
         self.actor.train()

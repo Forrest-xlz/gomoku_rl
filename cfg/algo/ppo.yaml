@@ -1,14 +1,13 @@
 name: ppo
-
 # ppo
+
 ppo_epochs: 1 # 3
 clip_param: 0.2 # 0.2
 entropy_coef: 0.01 # 0.01
 gae_lambda: 0.95
 gamma: 0.99 # 0.99
 max_grad_norm: 0.5
-batch_size: 4096  # 4096
-
+batch_size: 4096 # 4096
 normalize_advantage: true
 average_gae: False
 share_network: true
@@ -18,10 +17,23 @@ optimizer:
   kwargs:
     lr: 1e-4
 
+# Outer-epoch schedules.
+# Modes:
+#   constant: keep the original fixed value.
+#   linear: linearly interpolate start -> end over *_epochs outer epochs,
+#           then clamp at *_end.
+lr_decay_mode: constant
+lr_start: 1e-4
+lr_end: 1e-5
+lr_epochs: 5000
+
+entropy_decay_mode: constant
+entropy_start: 0.01
+entropy_end: 0.001
+entropy_epochs: 5000
 
 num_channels: 64
 num_residual_blocks: 8
-
 
 noise_scale:
   enabled: true

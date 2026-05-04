@@ -55,12 +55,6 @@ elo_mle_lr: 0.05
 elo_mle_patience: 100
 elo_l2: 0.0001
 
-# Black/white balance control.
-balance:
-  enabled: false
-  lower: 0.3
-  upper: 0.7
-  ema_alpha: 0.33
 
 wandb:
   name: ${version_name}
