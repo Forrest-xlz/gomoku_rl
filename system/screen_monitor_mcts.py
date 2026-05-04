@@ -32,6 +32,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QStatusBar,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -137,6 +138,35 @@ class InferResult:
     click_requested: bool = False
     clicked_screen_pos: Optional[tuple[int, int]] = None
     reference_board_after_click: Optional[np.ndarray] = None
+
+
+@dataclass
+class PonderJob:
+    generation: int
+    board: np.ndarray
+    latest_move: Optional[tuple[int, int]]
+    recent_moves: tuple[tuple[int, int], ...]
+    current_turn: Optional[Piece]
+    board_hash_value: str
+    my_color: Piece
+    game_active: bool
+    stop_event: threading.Event
+    num_simulations: int
+    adaptive_num_simulations: bool
+    extend_on_root_disagreement: bool
+
+
+@dataclass
+class PonderResult:
+    generation: int
+    ok: bool
+    error: str = ""
+    board_hash_value: Optional[str] = None
+    move: Optional[tuple[int, int]] = None
+    model_msg: str = ""
+    status_msg: str = ""
+    predicted: bool = False
+    search_turn: Optional[Piece] = None
 
 
 class MonitorOverlay(QWidget):
@@ -673,6 +703,73 @@ def run_infer_job(job: InferJob, model_manager: MCTSManager) -> InferResult:
         return result
 
 
+def run_ponder_job(job: PonderJob, model_manager: MCTSManager) -> PonderResult:
+    """Continue MCTS from the opponent-to-move root while the opponent is thinking.
+
+    This intentionally calls the same MCTSManager.predict() used by normal inference.
+    Because the manager owns the reusable tree, repeated pondering calls on the same
+    board keep adding simulations to the same root. When the opponent's real move is
+    later detected, the next predict() call can reuse the corresponding child subtree.
+    """
+    result = PonderResult(
+        generation=job.generation,
+        ok=False,
+        board_hash_value=job.board_hash_value,
+        search_turn=job.current_turn,
+    )
+    try:
+        if job.stop_event.is_set() or not job.game_active:
+            result.ok = True
+            return result
+        if job.current_turn is None:
+            result.ok = True
+            return result
+        if job.current_turn == job.my_color:
+            result.ok = True
+            return result
+
+        # Pondering must be responsive. Do not run the full normal-thinking
+        # budget in one blocking call; otherwise the opponent may have already
+        # moved while this job is still finishing 500+ simulations. We shrink
+        # only the MCTS budget for this background job. The tree itself is not
+        # reset, so repeated small chunks still accumulate on the reusable root.
+        mcts_cfg = getattr(model_manager, "mcts_cfg", None)
+        saved_fields: dict[str, object] = {}
+        if mcts_cfg is not None:
+            for name, value in (
+                ("num_simulations", int(job.num_simulations)),
+                ("adaptive_num_simulations", bool(job.adaptive_num_simulations)),
+                ("extend_on_root_disagreement", bool(job.extend_on_root_disagreement)),
+            ):
+                if hasattr(mcts_cfg, name):
+                    saved_fields[name] = getattr(mcts_cfg, name)
+                    setattr(mcts_cfg, name, value)
+        try:
+            move, msg, _current_player = model_manager.predict(
+                job.board,
+                job.latest_move,
+                recent_moves=job.recent_moves,
+            )
+        finally:
+            if mcts_cfg is not None:
+                for name, value in saved_fields.items():
+                    setattr(mcts_cfg, name, value)
+        result.ok = True
+        result.predicted = True
+        result.move = move
+        result.model_msg = msg if move is not None else "无可用对手候选"
+        if move is not None:
+            row, col = move
+            result.status_msg = f"对手思考中：MCTS 已继续搜索，对手候选第 {row + 1} 行第 {col + 1} 列。"
+        else:
+            result.status_msg = "对手思考中：MCTS 已继续搜索，但未得到可用对手候选。"
+        return result
+    except Exception as exc:
+        logging.exception("run_ponder_job failed")
+        result.error = f"对手思考 MCTS 失败：{exc}"
+        return result
+
+
 class ScreenMonitorWidget(QWidget):
     def __init__(self, cfg: DictConfig, model_manager: MCTSManager):
         super().__init__()
@@ -698,17 +795,26 @@ class ScreenMonitorWidget(QWidget):
         self.game_active: bool = False
         self.detect_busy: bool = False
         self.infer_busy: bool = False
+        self.ponder_busy: bool = False
         self.pending_manual_request: bool = False
         self.pending_fast_refresh: bool = False
         self.run_generation: int = 0
         self.current_future: Optional[Future] = None
         self.infer_future: Optional[Future] = None
+        self.ponder_future: Optional[Future] = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gomoku_detect")
         self.infer_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gomoku_infer")
         self.click_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gomoku_click")
         self.click_future: Optional[Future] = None
         self.last_infer_request_hash: Optional[str] = None
+        self.last_ponder_request_hash: Optional[str] = None
+        self.last_ponder_result_hash: Optional[str] = None
         self.lastmove_reference_hash: Optional[str] = None
+        self.own_mcts_msg: str = ""
+        self.own_mcts_hash: Optional[str] = None
+        self.opponent_mcts_msg: str = ""
+        self.opponent_mcts_hash: Optional[str] = None
+        self.opponent_mcts_move: Optional[tuple[int, int]] = None
         self.stop_event = threading.Event()
         self.stop_event.set()
         self.pending_click_reference_board: Optional[np.ndarray] = None
@@ -748,6 +854,37 @@ class ScreenMonitorWidget(QWidget):
                 if steps >= 1:
                     return steps
         return 1
+
+    @property
+    def ponder_enabled(self) -> bool:
+        return bool(self.cfg.get("mcts_ponder_enabled", True))
+
+    @property
+    def ponder_continuous(self) -> bool:
+        return bool(self.cfg.get("mcts_ponder_continuous", True))
+
+    @property
+    def ponder_num_simulations(self) -> int:
+        # Pondering runs in small chunks so a quick opponent move does not leave
+        # a long stale 500-simulation job blocking our turn. Continuous pondering
+        # still accumulates many chunks when the opponent actually thinks longer.
+        configured = self.cfg.get("mcts_ponder_num_simulations", None)
+        if configured is not None:
+            return max(1, int(configured))
+        base = max(1, int(self.cfg.get("mcts_num_simulations", 64)))
+        return max(8, min(64, int(round(base / 8))))
+
+    @property
+    def ponder_adaptive_num_simulations(self) -> bool:
+        return bool(self.cfg.get("mcts_ponder_adaptive_num_simulations", False))
+
+    @property
+    def ponder_extend_on_root_disagreement(self) -> bool:
+        return bool(self.cfg.get("mcts_ponder_extend_on_root_disagreement", False))
+
+    @property
+    def search_busy(self) -> bool:
+        return self.infer_busy or self.ponder_busy
 
     def push_recent_move(self, move: Optional[tuple[int, int]]) -> None:
         if move is None:
@@ -889,13 +1026,15 @@ class ScreenMonitorWidget(QWidget):
         )
         root_layout.addWidget(self.status_label)
 
-        self.model_label = QLabel("模型建议：-")
-        self.model_label.setWordWrap(True)
-        self.model_label.setMinimumHeight(118)
+        self.model_label = QTextEdit()
+        self.model_label.setReadOnly(True)
+        self.model_label.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.model_label.setMinimumHeight(300)
         self.model_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.model_label.setPlainText("模型建议：-")
         self.model_label.setStyleSheet(
             """
-            QLabel {
+            QTextEdit {
                 background: #f8fbff;
                 border: 1px solid #b7d8ff;
                 border-left: 5px solid #2d8cff;
@@ -1030,10 +1169,10 @@ class ScreenMonitorWidget(QWidget):
             self.end_game(set_status_text="Esc：已结束当前对局。")
 
     @staticmethod
-    def format_model_message(raw_msg: str = "") -> str:
+    def normalize_message_parts(raw_msg: str = "") -> list[str]:
         msg = (raw_msg or "").strip()
         if not msg or msg == "-":
-            return "模型建议：-"
+            return []
 
         normalized = msg.replace("\r\n", "\n").replace("\r", "\n")
         for sep in ("；", ";", "|", "｜"):
@@ -1044,18 +1183,92 @@ class ScreenMonitorWidget(QWidget):
             item = line.strip().strip("，,。")
             if not item:
                 continue
-            if item.startswith("模型建议："):
-                item = item.removeprefix("模型建议：").strip()
-            if item.startswith("模型建议:"):
-                item = item.removeprefix("模型建议:").strip()
-            parts.append(item)
+            for prefix in ("模型建议：", "模型建议:", "我方思考：", "我方思考:", "对手思考：", "对手思考:"):
+                if item.startswith(prefix):
+                    item = item.removeprefix(prefix).strip()
+            if item:
+                parts.append(item)
+        return parts
 
+    @staticmethod
+    def format_model_message(raw_msg: str = "") -> str:
+        parts = ScreenMonitorWidget.normalize_message_parts(raw_msg)
         if not parts:
             return "模型建议：-"
         return "模型建议：\n" + "\n".join(f"  · {part}" for part in parts)
 
+    def _hash_state_suffix(self, msg_hash: Optional[str]) -> str:
+        if not msg_hash or not self.last_board_hash:
+            return ""
+        if msg_hash == self.last_board_hash:
+            return "当前局面"
+        return "上一局面，等待更新"
+
+    def refresh_model_message(self) -> None:
+        sections: list[str] = []
+
+        own_parts = self.normalize_message_parts(self.own_mcts_msg)
+        own_header = "我方思考 MCTS"
+        own_suffix = self._hash_state_suffix(self.own_mcts_hash)
+        if own_suffix:
+            own_header += f"（{own_suffix}）"
+        if own_parts:
+            own_body = "\n".join(f"  · {part}" for part in own_parts)
+        elif self.game_active and self.last_turn == self.my_color:
+            own_body = "  · 轮到我方，等待/执行我方 MCTS。"
+        elif self.game_active:
+            own_body = "  · 当前不是我方回合，暂无新的我方 MCTS。"
+        else:
+            own_body = ""
+        if own_body:
+            sections.append(f"{own_header}：\n" + own_body)
+
+        opponent_parts = self.normalize_message_parts(self.opponent_mcts_msg)
+        opponent_header = "对手思考 MCTS"
+        opponent_suffix = self._hash_state_suffix(self.opponent_mcts_hash)
+        if opponent_suffix:
+            opponent_header += f"（{opponent_suffix}）"
+        if self.opponent_mcts_move is not None:
+            r, c = self.opponent_mcts_move
+            opponent_header += f"候选第 {r + 1} 行第 {c + 1} 列"
+        if opponent_parts:
+            opponent_body = "\n".join(f"  · {part}" for part in opponent_parts)
+        elif self.game_active and self.last_turn is not None and self.last_turn != self.my_color:
+            opponent_body = "  · 对手回合，后台小批量 MCTS 搜索中。"
+        elif self.game_active:
+            opponent_body = "  · 当前不是对手回合，未接受新的对手思考结果。"
+        else:
+            opponent_body = ""
+        if opponent_body:
+            sections.append(f"{opponent_header}：\n" + opponent_body)
+
+        if not sections:
+            self.model_label.setPlainText("模型建议：-")
+        else:
+            self.model_label.setPlainText("模型建议：\n" + "\n\n".join(sections))
+
+    def clear_model_message(self) -> None:
+        self.own_mcts_msg = ""
+        self.own_mcts_hash = None
+        self.opponent_mcts_msg = ""
+        self.opponent_mcts_hash = None
+        self.opponent_mcts_move = None
+        self.model_label.setPlainText("模型建议：-")
+
     def set_model_message(self, raw_msg: str = "") -> None:
-        self.model_label.setText(self.format_model_message(raw_msg))
+        if not raw_msg:
+            # During an active game, an empty update means “no new result yet”,
+            # not “wipe the panel”.  Keep the previous MCTS text and refresh the
+            # placeholders according to the current turn.  When the game is not
+            # active, empty still means clear.
+            if self.game_active:
+                self.refresh_model_message()
+            else:
+                self.clear_model_message()
+            return
+        self.own_mcts_msg = raw_msg
+        self.own_mcts_hash = self.last_board_hash
+        self.refresh_model_message()
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(f"状态：{text}")
@@ -1100,6 +1313,13 @@ class ScreenMonitorWidget(QWidget):
         self.last_board_hash = None
         self.last_suggested_hash = None
         self.last_infer_request_hash = None
+        self.last_ponder_request_hash = None
+        self.last_ponder_result_hash = None
+        self.own_mcts_msg = ""
+        self.own_mcts_hash = None
+        self.opponent_mcts_msg = ""
+        self.opponent_mcts_hash = None
+        self.opponent_mcts_move = None
         self.perspective_matrix = None
         self.pending_fast_refresh = False
         self.pending_manual_request = False
@@ -1138,15 +1358,19 @@ class ScreenMonitorWidget(QWidget):
         self.game_active = False
         self.detect_busy = False
         self.infer_busy = False
+        self.ponder_busy = False
         self.pending_manual_request = False
         self.pending_fast_refresh = False
         self.current_future = None
         self.infer_future = None
+        self.ponder_future = None
         self.pending_click_reference_board = None
         self.pending_click_move = None
         self.suggested_move = None
         self.last_suggested_hash = None
         self.last_infer_request_hash = None
+        self.last_ponder_request_hash = None
+        self.last_ponder_result_hash = None
         self.set_model_message()
         self.update_phase_label()
         self.refresh_controls()
@@ -1292,7 +1516,7 @@ class ScreenMonitorWidget(QWidget):
         self.submit_frame_job(request_manual_infer=True)
 
     def maybe_submit_infer_job(self, request_manual_infer: bool) -> None:
-        if self.infer_busy:
+        if self.search_busy:
             if request_manual_infer:
                 self.pending_manual_request = True
             return
@@ -1331,6 +1555,40 @@ class ScreenMonitorWidget(QWidget):
             stop_event=self.stop_event,
         )
         self.infer_future = self.infer_executor.submit(run_infer_job, job, self.model_manager)
+
+    def maybe_submit_ponder_job(self) -> None:
+        if not self.ponder_enabled:
+            return
+        if self.search_busy:
+            return
+        if not self.game_active or self.stop_event.is_set():
+            return
+        if self.latest_board is None:
+            return
+        if self.last_board_hash is None:
+            return
+        if self.last_turn is None or self.last_turn == self.my_color:
+            return
+        if not self.ponder_continuous and self.last_ponder_request_hash == self.last_board_hash:
+            return
+
+        self.ponder_busy = True
+        self.last_ponder_request_hash = self.last_board_hash
+        job = PonderJob(
+            generation=self.run_generation,
+            board=self.latest_board.copy(),
+            latest_move=self.latest_move,
+            recent_moves=tuple(self.recent_moves),
+            current_turn=self.last_turn,
+            board_hash_value=self.last_board_hash,
+            my_color=self.my_color,
+            game_active=self.game_active,
+            stop_event=self.stop_event,
+            num_simulations=self.ponder_num_simulations,
+            adaptive_num_simulations=self.ponder_adaptive_num_simulations,
+            extend_on_root_disagreement=self.ponder_extend_on_root_disagreement,
+        )
+        self.ponder_future = self.infer_executor.submit(run_ponder_job, job, self.model_manager)
 
     def on_poll_tick(self) -> None:
         self.submit_frame_job(request_manual_infer=False)
@@ -1467,6 +1725,7 @@ class ScreenMonitorWidget(QWidget):
             return
 
         prev_board = None if self.latest_board is None else self.latest_board.copy()
+        prev_turn = self.last_turn
         self.last_turn = result.current_turn
         self.perspective_matrix = result.perspective_matrix
         self.latest_warped = result.warped
@@ -1518,11 +1777,33 @@ class ScreenMonitorWidget(QWidget):
         else:
             self.turn_label.setText(f"当前轮次：{'黑方' if result.current_turn == Piece.BLACK else '白方'}")
 
-        if result.board_changed:
+        actual_move_detected = (
+            pending_self_confirmed
+            or candidate_move is not None
+            or (prev_turn is not None and result.current_turn is not None and prev_turn != result.current_turn)
+        )
+        if result.board_changed and actual_move_detected:
             self.suggested_move = None
             self.last_suggested_hash = None
+
+            if result.current_turn == self.my_color:
+                # 对手刚落子，轮到我方：不要清空上一轮我方 MCTS 文本。
+                # 面板应持久化显示旧结果，直到新的我方 MCTS 完成后再覆盖。
+                # 对手思考期间的最后一批 MCTS 数据也保留，方便和我方新搜索一起显示。
+                pass
+            elif result.current_turn is not None:
+                # 我方刚落子，进入新的对手回合：保留刚刚用于落子的我方 MCTS 结果。
+                # 只重置新一轮对手 pondering 的请求状态；对手区显示“搜索中”，
+                # 等第一批新 ponder 结果回来后再覆盖。
+                self.opponent_mcts_msg = ""
+                self.opponent_mcts_hash = None
+                self.opponent_mcts_move = None
+                self.last_ponder_request_hash = None
+                self.last_ponder_result_hash = None
+
             if self.mode != RunMode.MANUAL:
                 self.last_infer_request_hash = None
+            self.refresh_model_message()
 
         self.render_preview()
         self.update_phase_label()
@@ -1532,6 +1813,7 @@ class ScreenMonitorWidget(QWidget):
             self.maybe_submit_infer_job(request_manual_infer=True)
         else:
             self.maybe_submit_infer_job(request_manual_infer=False)
+        self.maybe_submit_ponder_job()
 
     def consume_infer_result(self) -> None:
         if self.infer_future is None or not self.infer_future.done():
@@ -1557,7 +1839,9 @@ class ScreenMonitorWidget(QWidget):
         if result.predicted:
             self.suggested_move = result.move
             self.last_suggested_hash = result.board_hash_value
-            self.set_model_message(result.model_msg)
+            self.own_mcts_msg = result.model_msg
+            self.own_mcts_hash = result.board_hash_value
+            self.refresh_model_message()
             self.render_preview()
             self.update_overlay()
 
@@ -1567,10 +1851,67 @@ class ScreenMonitorWidget(QWidget):
         if result.click_requested and result.move is not None and result.clicked_screen_pos is not None:
             self.start_click_task(result.move, result.clicked_screen_pos, result.reference_board_after_click)
 
+        self.maybe_submit_ponder_job()
+
+    def consume_ponder_result(self) -> None:
+        if self.ponder_future is None or not self.ponder_future.done():
+            return
+
+        future = self.ponder_future
+        self.ponder_future = None
+        self.ponder_busy = False
+        try:
+            result: PonderResult = future.result()
+        except Exception as exc:
+            logging.exception("consume_ponder_result failed")
+            self.set_status(f"对手思考 MCTS 线程异常：{exc}")
+            if self.pending_manual_request:
+                self.maybe_submit_infer_job(request_manual_infer=True)
+            else:
+                self.maybe_submit_infer_job(request_manual_infer=False)
+            self.maybe_submit_ponder_job()
+            return
+
+        if result.generation != self.run_generation:
+            return
+        if not result.ok:
+            if result.error:
+                self.set_status(result.error)
+            return
+
+        # Only accept a ponder result while the screen is still on the same
+        # opponent-to-move board.  If the opponent has already moved, the old
+        # background job may still have helped the reusable tree, but its text is
+        # stale and must not overwrite the UI as “opponent thinking”.
+        accept_result = False
+        if result.predicted and result.board_hash_value is not None:
+            if result.board_hash_value == self.last_board_hash and self.last_turn is not None and self.last_turn != self.my_color:
+                accept_result = True
+
+        if accept_result:
+            self.opponent_mcts_msg = result.model_msg
+            self.opponent_mcts_hash = result.board_hash_value
+            self.opponent_mcts_move = result.move
+            self.last_ponder_result_hash = result.board_hash_value
+            self.refresh_model_message()
+
+        if result.status_msg and result.board_hash_value == self.last_board_hash:
+            self.set_status(result.status_msg)
+
+        if self.pending_manual_request:
+            self.maybe_submit_infer_job(request_manual_infer=True)
+        else:
+            self.maybe_submit_infer_job(request_manual_infer=False)
+
+        if self.game_active and not self.stop_event.is_set():
+            delay_ms = int(self.cfg.get("mcts_ponder_interval_ms", 1))
+            QTimer.singleShot(max(0, delay_ms), self.maybe_submit_ponder_job)
+
     def consume_background_results(self) -> None:
         self.consume_click_result()
         self.consume_worker_result()
         self.consume_infer_result()
+        self.consume_ponder_result()
 
 
 @hydra.main(version_base=None, config_path=CONFIG_PATH, config_name="screen_monitor_demo")
@@ -1589,8 +1930,8 @@ def main(cfg: DictConfig) -> None:
 
     window = QMainWindow()
     window.setWindowTitle("screen_monitor_mcts")
-    window.resize(410, 760)
-    window.setFixedWidth(410)
+    window.resize(460, 980)
+    window.setFixedWidth(460)
     window.setWindowFlag(Qt.WindowStaysOnTopHint, True)
     window.setCentralWidget(widget)
     status_bar = QStatusBar(window)
