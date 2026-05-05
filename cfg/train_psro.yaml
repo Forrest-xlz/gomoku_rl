@@ -1,10 +1,10 @@
 seed: 0
-num_envs: 1024  
+num_envs: 512  
 board_size: 15
 device: cuda
 out_device: cuda
 run_dir:
-version_name: psro-temporal6-block8-epoch1-numenvs1024
+version_name: psro-temporal6-block8-epoch1-numenvs1024-512
 augment: false
 
 epochs: 20000
@@ -14,9 +14,9 @@ log_interval: 10
 
 # Resume offset for checkpoint/model-pool/Elo names.
 # Example: pretrain_epoch_offset=1000 and save_interval=100 -> black_01100.pt.
-pretrain_epoch_offset: 10500
-black_checkpoint: wandb/run-20260503_074530-yxopjebs/files/black_10500.pt
-white_checkpoint: wandb/run-20260503_074530-yxopjebs/files/white_10500.pt
+pretrain_epoch_offset: 14400
+black_checkpoint: wandb/run-20260505_043222-fsnkc9hi/files/black_14400.pt
+white_checkpoint: wandb/run-20260505_043222-fsnkc9hi/files/white_14400.pt
 
 # Action pruning settings.
 action_pruning:
@@ -39,13 +39,13 @@ m: 10
 # f stores checkpoint files. e stores metadata. If e is empty/missing, a new
 # pool_meta.json is created under f.
 f: train_model_pool_psro-temporal6-block8-epoch1-numenvs1024
-e: wandb/run-20260503_074530-yxopjebs/files/pool_meta_10500.json
+e: wandb/run-20260505_043222-fsnkc9hi/files/pool_meta_14400.json
 
 # Training-time Elo model pool.
 # elo_models stores checkpoint files. elo_e stores entries + payoff.
 # If elo_e points to existing metadata, current start checkpoint is not added.
 elo_models: elo_eval_model_pool_psro-temporal6-block8-epoch1-numenvs1024
-elo_e:  wandb/run-20260503_074530-yxopjebs/files/elo_meta_10500.json
+elo_e:  wandb/run-20260505_043222-fsnkc9hi/files/elo_meta_14400.json
 elo_interval: 200
 elo_eval_repeats: 1
 elo_base: 1200.0

@@ -488,6 +488,26 @@ class PSRORLRunner(EloEvalMixin, Runner):
     def _epoch_label(self, epoch_value: int) -> str:
         return f"{int(epoch_value):05d}"
 
+    # ---------------------------- schedule helpers ----------------------------
+
+    def _set_policy_schedules(self, epoch: int, info: dict[str, Any]) -> None:
+        """Apply per-outer-epoch LR / entropy schedules before learning.
+
+        ``epoch`` is the zero-based local outer epoch from tqdm. When training is
+        resumed from checkpoints, ``pretrain_epoch_offset`` is added so decay
+        continues from the global outer epoch instead of restarting from zero.
+        """
+        schedule_epoch = int(self.pretrain_epoch_offset + epoch)
+
+        for policy_name, policy in (
+            ("policy_black", self.policy_black),
+            ("policy_white", self.policy_white),
+        ):
+            if hasattr(policy, "set_outer_epoch"):
+                policy.set_outer_epoch(schedule_epoch)
+            if hasattr(policy, "get_schedule_info"):
+                info.update(add_prefix(policy.get_schedule_info(), f"{policy_name}/"))
+
     # ---------------------------- balance helpers ----------------------------
 
     def _applied_mode_to_flags(self, mode: str) -> dict[str, float]:
@@ -710,6 +730,9 @@ class PSRORLRunner(EloEvalMixin, Runner):
         logging.info("Added current policies to role-separated training pool: black=%s white=%s", black_entry.id, white_entry.id)
 
     def _epoch(self, epoch: int) -> dict[str, Any]:
+        schedule_info: dict[str, Any] = {}
+        self._set_policy_schedules(epoch, schedule_info)
+
         applied_mode = self._get_applied_mode_for_current_epoch()
         use_self_play = (self._rng.random() < self.self_play_prob) or len(self.pool) == 0
         if use_self_play:
@@ -717,6 +740,7 @@ class PSRORLRunner(EloEvalMixin, Runner):
         else:
             info = self._rollout_against_pool(applied_mode, epoch)
 
+        info.update(schedule_info)
         info.update(
             {
                 "psro/self_play_prob": self.self_play_prob,
