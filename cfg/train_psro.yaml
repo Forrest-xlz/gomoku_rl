@@ -1,5 +1,5 @@
 seed: 0
-num_envs: 512  
+num_envs: 512
 board_size: 15
 device: cuda
 out_device: cuda
@@ -26,7 +26,6 @@ action_pruning:
 use_temporal_feature: true
 temporal_num_steps: 6
 
-
 # Dota/OpenAI-Five-style historical policy-pool self-play.
 # p: probability of current_black vs current_white self-play.
 # l: quality-score learning rate for sampled historical opponents.
@@ -34,6 +33,13 @@ temporal_num_steps: 6
 p: 0.8
 l: 0.2
 m: 10
+
+# Black/white balance control for PSRO.
+# If enabled, the runner directly alternates update modes:
+#   white_only -> both -> white_only -> both -> ...
+# No win-rate EMA, lower bound, or upper bound is used.
+balance:
+  enabled: true
 
 # Training model pool.
 # f stores checkpoint files. e stores metadata. If e is empty/missing, a new
@@ -45,7 +51,7 @@ e: wandb/run-20260505_043222-fsnkc9hi/files/pool_meta_14400.json
 # elo_models stores checkpoint files. elo_e stores entries + payoff.
 # If elo_e points to existing metadata, current start checkpoint is not added.
 elo_models: elo_eval_model_pool_psro-temporal6-block8-epoch1-numenvs1024
-elo_e:  wandb/run-20260505_043222-fsnkc9hi/files/elo_meta_14400.json
+elo_e: wandb/run-20260505_043222-fsnkc9hi/files/elo_meta_14400.json
 elo_interval: 200
 elo_eval_repeats: 1
 elo_base: 1200.0
@@ -54,7 +60,6 @@ elo_mle_iters: 1000
 elo_mle_lr: 0.05
 elo_mle_patience: 100
 elo_l2: 0.0001
-
 
 wandb:
   name: ${version_name}

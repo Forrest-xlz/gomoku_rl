@@ -1,9 +1,10 @@
-"""Base runner without baseline-pool evaluation.
+"""Base runner utilities shared by InRL and PSRO.
 
-This version keeps only shared environment/policy/checkpoint utilities used by
-InRL and PSRO. The old fixed-baseline pool loading/evaluation path has been
-removed; runners use current-vs-current balance eval and the shared Elo model
-pool instead.
+This version keeps the original runner behavior and allows fully independent
+black/white PPO configs through ``cfg.algo.black`` and ``cfg.algo.white``.
+If role sections are present, each role section is treated as a complete PPO
+config; it is not merged with a shared ``common`` block. The top-level
+``cfg.algo`` remains a flat fallback/inference/backward-compatible PPO config.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from typing import Any, Tuple
 
 import torch
 import wandb
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
 
 from gomoku_rl.env import LEGACY_MODE, TEMPORAL_MOVE_HISTORY_MODE, GomokuEnv
@@ -54,8 +55,12 @@ class _RunnerEnvMixin:
 
 
 class Runner(_RunnerEnvMixin, abc.ABC):
+    _ROLE_CFG_KEYS = {"black", "white"}
+    _NON_DEFAULT_ALGO_KEYS = {"black", "white", "common"}
+
     def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
+
         observation_mode, temporal_num_steps = self._get_observation_cfg()
         self.env = self._make_env(
             num_envs=cfg.num_envs,
@@ -70,21 +75,25 @@ class Runner(_RunnerEnvMixin, abc.ABC):
 
         seed = cfg.get("seed", None)
         set_seed(seed)
+
         self.epochs: int = cfg.get("epochs")
         self.steps = cfg.steps
         self.save_interval: int = cfg.get("save_interval", -1)
         self.pretrain_epoch_offset = int(cfg.get("pretrain_epoch_offset", 0))
 
+        self.algo_black_cfg = self._make_role_algo_cfg("black")
+        self.algo_white_cfg = self._make_role_algo_cfg("white")
+
         self.policy_black = get_policy(
-            name=cfg.algo.name,
-            cfg=cfg.algo,
+            name=self.algo_black_cfg.name,
+            cfg=self.algo_black_cfg,
             action_spec=self.env.action_spec,
             observation_spec=self.env.observation_spec,
             device=self.env.device,
         )
         self.policy_white = get_policy(
-            name=cfg.algo.name,
-            cfg=cfg.algo,
+            name=self.algo_white_cfg.name,
+            cfg=self.algo_white_cfg,
             action_spec=self.env.action_spec,
             observation_spec=self.env.observation_spec,
             device=self.env.device,
@@ -101,6 +110,36 @@ class Runner(_RunnerEnvMixin, abc.ABC):
         os.makedirs(run_dir, exist_ok=True)
         logging.info("run_dir:%s", run_dir)
         self.run_dir = run_dir
+
+    def _make_role_algo_cfg(self, role: str) -> DictConfig:
+        """Return the complete algorithm config for one role.
+
+        Backward compatibility:
+            If ``cfg.algo.black`` / ``cfg.algo.white`` is absent, this returns
+            ``cfg.algo`` exactly as before.
+
+        Role-split behavior:
+            If the role section exists, that section is treated as a complete
+            PPO config. It is not merged with top-level defaults or a
+            ``common`` section. This keeps black/white hyperparameters fully
+            explicit and leaves the top-level ``cfg.algo`` available as a flat
+            inference/backward-compatible config.
+        """
+        if role not in self._ROLE_CFG_KEYS:
+            raise ValueError(f"unknown role config '{role}', expected one of {sorted(self._ROLE_CFG_KEYS)}")
+
+        algo_cfg: DictConfig = self.cfg.algo
+        role_cfg = algo_cfg.get(role, None)
+        if role_cfg is None:
+            return algo_cfg
+
+        role_container = OmegaConf.to_container(role_cfg, resolve=True)
+        merged = OmegaConf.create(role_container)
+        with open_dict(merged):
+            if merged.get("name", None) is None:
+                merged.name = algo_cfg.get("name", "ppo")
+            merged.role = role
+        return merged
 
     def _completed_epoch(self, local_epoch: int) -> int:
         return int(self.pretrain_epoch_offset + local_epoch + 1)
@@ -125,11 +164,13 @@ class Runner(_RunnerEnvMixin, abc.ABC):
             info: dict[str, Any] = {}
             info.update(self._epoch(epoch=i))
             self._log(info=info, epoch=i)
+
             if self.save_interval > 0 and (i + 1) % self.save_interval == 0:
                 ckpt_epoch = self._completed_epoch(i)
                 epoch_label = self._epoch_label(ckpt_epoch)
                 torch.save(self.policy_black.state_dict(), os.path.join(self.run_dir, f"black_{epoch_label}.pt"))
                 torch.save(self.policy_white.state_dict(), os.path.join(self.run_dir, f"white_{epoch_label}.pt"))
+
             pbar.set_postfix({"fps": info.get("fps", 0.0), "epoch": self._completed_epoch(i)})
 
         torch.save(self.policy_black.state_dict(), os.path.join(self.run_dir, "black_final.pt"))

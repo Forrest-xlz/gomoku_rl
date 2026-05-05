@@ -465,17 +465,12 @@ class PSRORLRunner(EloEvalMixin, Runner):
 
         balance_cfg = self.cfg.get("balance", {})
         self.balance_enabled = bool(balance_cfg.get("enabled", True))
-        self.balance_lower = float(balance_cfg.get("lower", 0.40))
-        self.balance_upper = float(balance_cfg.get("upper", 0.60))
-        self.balance_ema_alpha = float(balance_cfg.get("ema_alpha", 0.20))
-        if not (0.0 <= self.balance_lower < self.balance_upper <= 1.0):
-            raise ValueError(f"invalid balance bounds: lower={self.balance_lower}, upper={self.balance_upper}")
-        if not (0.0 < self.balance_ema_alpha <= 1.0):
-            raise ValueError(f"invalid balance ema_alpha: {self.balance_ema_alpha}, expected in (0, 1]")
-
-        self.black_vs_white_ema: float | None = None
-        self.current_bias_mode = self._MODE_BOTH
-        self.bias_turn_next = False
+        # Direct PSRO balance for no-foul Gomoku: if enabled, do not use win-rate
+        # thresholds or EMA. The update mode simply alternates between updating both
+        # roles and updating white only. This gives white extra optimization steps
+        # while still preventing black from being completely starved.
+        self.current_bias_mode = self._MODE_WHITE_ONLY if self.balance_enabled else self._MODE_BOTH
+        self.bias_turn_next = bool(self.balance_enabled)
 
     # ---------------------------- epoch helpers ----------------------------
 
@@ -525,7 +520,7 @@ class PSRORLRunner(EloEvalMixin, Runner):
         }
 
     def _phase_flags(self) -> dict[str, float]:
-        if self.current_bias_mode == self._MODE_BOTH:
+        if not self.balance_enabled:
             return {"balance/bias_active": 0.0, "balance/next_turn_biased": 0.0, "balance/next_turn_both": 1.0}
         return {
             "balance/bias_active": 1.0,
@@ -533,48 +528,19 @@ class PSRORLRunner(EloEvalMixin, Runner):
             "balance/next_turn_both": float(not self.bias_turn_next),
         }
 
-    def _ema_trigger_flags(self) -> dict[str, float]:
-        if self.black_vs_white_ema is None:
-            return {"balance/trigger_lower": 0.0, "balance/trigger_upper": 0.0}
+    def _balance_trigger_flags(self) -> dict[str, float]:
         return {
-            "balance/trigger_lower": float(self.black_vs_white_ema < self.balance_lower),
-            "balance/trigger_upper": float(self.black_vs_white_ema > self.balance_upper),
+            "balance/trigger_black_only": 0.0,
+            "balance/trigger_white_only": float(self.balance_enabled),
         }
 
-    def _update_black_vs_white_ema(self, black_vs_white_raw: float) -> float:
-        if self.black_vs_white_ema is None:
-            ema = black_vs_white_raw
-        else:
-            ema = self.balance_ema_alpha * black_vs_white_raw + (1.0 - self.balance_ema_alpha) * self.black_vs_white_ema
-        self.black_vs_white_ema = float(ema)
-        return self.black_vs_white_ema
-
-    def _decide_bias_mode_from_ema(self) -> str:
-        if not self.balance_enabled or self.black_vs_white_ema is None:
-            return self._MODE_BOTH
-        if self.black_vs_white_ema > self.balance_upper:
-            return self._MODE_WHITE_ONLY
-        if self.black_vs_white_ema < self.balance_lower:
-            return self._MODE_BLACK_ONLY
-        return self._MODE_BOTH
-
-    def _update_bias_state_after_eval(self) -> None:
-        prev_bias_mode = self.current_bias_mode
-        new_bias_mode = self._decide_bias_mode_from_ema()
-        if new_bias_mode == self._MODE_BOTH:
-            self.current_bias_mode = self._MODE_BOTH
-            self.bias_turn_next = False
-            return
-        if prev_bias_mode != new_bias_mode:
-            self.current_bias_mode = new_bias_mode
-            self.bias_turn_next = True
-            return
-        self.current_bias_mode = new_bias_mode
-
     def _get_applied_mode_for_current_epoch(self) -> str:
-        if self.current_bias_mode == self._MODE_BOTH:
+        if not self.balance_enabled:
+            self.current_bias_mode = self._MODE_BOTH
             return self._MODE_BOTH
-        applied_mode = self.current_bias_mode if self.bias_turn_next else self._MODE_BOTH
+
+        self.current_bias_mode = self._MODE_WHITE_ONLY
+        applied_mode = self._MODE_WHITE_ONLY if self.bias_turn_next else self._MODE_BOTH
         self.bias_turn_next = not self.bias_turn_next
         return applied_mode
 
@@ -757,16 +723,13 @@ class PSRORLRunner(EloEvalMixin, Runner):
                 "elo_eval/num_models": float(len(self.elo_league)),
                 "elo_eval/payoff_coverage": self.elo_league.payoff_coverage(include_self=True),
                 "balance/enabled": float(self.balance_enabled),
-                "balance/lower": self.balance_lower,
-                "balance/upper": self.balance_upper,
-                "balance/ema_alpha": self.balance_ema_alpha,
+                "balance/fixed_alternating": float(self.balance_enabled),
+                "balance/fixed_bias_white_only": float(self.balance_enabled),
             }
         )
         info.update(self._bias_mode_to_flags(self.current_bias_mode))
         info.update(self._phase_flags())
-        info.update(self._ema_trigger_flags())
-        if self.black_vs_white_ema is not None:
-            info["eval/black_vs_white_ema"] = self.black_vs_white_ema
+        info.update(self._balance_trigger_flags())
 
         self._maybe_add_current_to_pool(epoch, info)
         if epoch % 50 == 0 and epoch != 0 and torch.cuda.is_available():
@@ -906,7 +869,6 @@ class PSRORLRunner(EloEvalMixin, Runner):
     def _format_eval_summary(self, info: dict[str, Any]) -> str:
         parts = [
             f"Black vs White:{info['eval/black_vs_white'] * 100.0:.2f}%",
-            f"EMA:{info['eval/black_vs_white_ema'] * 100.0:.2f}%",
             f"pool_black:{self.pool.role_size('black')} pool_white:{self.pool.role_size('white')}",
             f"elo_models:{len(self.elo_league)}",
             f"p_self:{self.self_play_prob:.3f}",
@@ -925,12 +887,9 @@ class PSRORLRunner(EloEvalMixin, Runner):
     def _log(self, info: dict[str, Any], epoch: int):
         if epoch % self.log_interval == 0:
             black_vs_white_raw = float(eval_win_rate(self.eval_env, player_black=self.policy_black, player_white=self.policy_white))
-            black_vs_white_ema = self._update_black_vs_white_ema(black_vs_white_raw)
-            self._update_bias_state_after_eval()
             info.update(
                 {
                     "eval/black_vs_white": black_vs_white_raw,
-                    "eval/black_vs_white_ema": black_vs_white_ema,
                     "pool_black/size": float(self.pool.role_size("black")),
                     "pool_black/prob_variance": self.pool.prob_variance("black"),
                     "pool_white/size": float(self.pool.role_size("white")),
@@ -939,7 +898,7 @@ class PSRORLRunner(EloEvalMixin, Runner):
                     "elo_eval/payoff_coverage": self.elo_league.payoff_coverage(include_self=True),
                 }
             )
-            info.update(self._ema_trigger_flags())
+            info.update(self._balance_trigger_flags())
             info.update(self._bias_mode_to_flags(self.current_bias_mode))
             info.update(self._phase_flags())
 
@@ -948,17 +907,12 @@ class PSRORLRunner(EloEvalMixin, Runner):
         if epoch % self.log_interval == 0 or "elo_eval/current_black" in info:
             if "eval/black_vs_white" not in info:
                 black_vs_white_raw = float(eval_win_rate(self.eval_env, player_black=self.policy_black, player_white=self.policy_white))
-                black_vs_white_ema = self._update_black_vs_white_ema(black_vs_white_raw)
-                self._update_bias_state_after_eval()
                 info["eval/black_vs_white"] = black_vs_white_raw
-                info["eval/black_vs_white_ema"] = black_vs_white_ema
             print(self._format_eval_summary(info))
         else:
             info.update(self._bias_mode_to_flags(self.current_bias_mode))
             info.update(self._phase_flags())
-            info.update(self._ema_trigger_flags())
-            if self.black_vs_white_ema is not None:
-                info["eval/black_vs_white_ema"] = self.black_vs_white_ema
+            info.update(self._balance_trigger_flags())
 
         return super()._log(info, epoch)
 
