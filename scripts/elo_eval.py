@@ -70,7 +70,8 @@ Outputs:
     output_dir/
       black_models.csv
       white_models.csv
-      black_vs_white_payoff.csv
+      black_vs_white_payoff_history.csv      # persistent cache of all evaluated pairs
+      black_vs_white_payoff_for_elo.csv      # current-config matrix used for this Elo fit
       predicted_black_scores.csv
       black_elo_ratings.csv
       white_elo_ratings.csv
@@ -80,7 +81,6 @@ Outputs:
       black_elo_curve.png
       white_elo_curve.png
       black_vs_white_payoff_heatmap.png
-      payoff_cache.npz
 """
 
 from __future__ import annotations
@@ -999,11 +999,23 @@ def write_models_csv(path: Path, models: Sequence[RoleModel]) -> None:
 
 
 def write_matrix_csv(path: Path, row_names: Sequence[str], col_names: Sequence[str], matrix: np.ndarray) -> None:
-    with path.open("w", newline="", encoding="utf-8") as f:
+    """Atomically write a matrix CSV.
+
+    The payoff CSV is used both as human-readable output and as the resume file.
+    Writing through a temporary file avoids leaving a half-written CSV if the
+    process is interrupted during file writing.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+
+    with tmp_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([""] + list(col_names))
         for name, row in zip(row_names, matrix):
             writer.writerow([name] + ["" if np.isnan(x) else f"{float(x):.8f}" for x in row])
+
+    tmp_path.replace(path)
 
 
 def write_elo_csv(path: Path, models: Sequence[RoleModel], elos: np.ndarray, skills: np.ndarray) -> None:
@@ -1036,34 +1048,276 @@ def _names(models: Sequence[RoleModel]) -> list[str]:
     return [m.name for m in models]
 
 
-def _load_payoff_cache(cache_path: Path, black_models: Sequence[RoleModel], white_models: Sequence[RoleModel]) -> np.ndarray | None:
-    if not cache_path.exists():
+def read_matrix_csv(path: Path) -> tuple[list[str], list[str], np.ndarray] | None:
+    """Read a named matrix CSV written by write_matrix_csv.
+
+    Format:
+        first row: empty cell + column names
+        later rows: row name + numeric cells, empty cell means NaN
+    """
+
+    if not path.exists():
         return None
+
     try:
-        data = np.load(cache_path, allow_pickle=True)
-        old_black = [str(x) for x in data["black_names"].tolist()]
-        old_white = [str(x) for x in data["white_names"].tolist()]
-        matrix = np.asarray(data["payoff"], dtype=np.float64)
+        with path.open("r", newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
     except Exception as exc:
-        print(f"[WARN] failed to load payoff cache {cache_path}: {exc}")
+        print(f"[WARN] failed to read matrix csv {path}: {exc}")
         return None
 
-    if old_black != _names(black_models) or old_white != _names(white_models):
-        print("[WARN] payoff cache exists but model list changed; ignoring cache.")
+    if len(rows) < 2:
+        print(f"[WARN] matrix csv is empty or incomplete: {path}")
         return None
-    if matrix.shape != (len(black_models), len(white_models)):
-        print("[WARN] payoff cache shape mismatch; ignoring cache.")
+
+    col_names = [str(x).strip() for x in rows[0][1:]]
+    row_names: list[str] = []
+    values: list[list[float]] = []
+    expected_cols = len(col_names)
+
+    for line_no, row in enumerate(rows[1:], start=2):
+        if not row:
+            continue
+
+        row_name = str(row[0]).strip()
+        if not row_name:
+            print(f"[WARN] empty row name in {path} line={line_no}; skipping row")
+            continue
+
+        row_names.append(row_name)
+        value_cells = list(row[1:])
+
+        if len(value_cells) < expected_cols:
+            value_cells += [""] * (expected_cols - len(value_cells))
+        elif len(value_cells) > expected_cols:
+            value_cells = value_cells[:expected_cols]
+
+        parsed_row: list[float] = []
+        for cell in value_cells:
+            text = str(cell).strip()
+            if text == "":
+                parsed_row.append(np.nan)
+            else:
+                try:
+                    parsed_row.append(float(text))
+                except ValueError:
+                    print(
+                        f"[WARN] invalid matrix value in {path} "
+                        f"line={line_no}: {text!r}; treating as NaN"
+                    )
+                    parsed_row.append(np.nan)
+        values.append(parsed_row)
+
+    if not row_names or not col_names:
+        print(f"[WARN] matrix csv has no usable names: {path}")
         return None
-    return matrix
+
+    matrix = np.asarray(values, dtype=np.float64)
+    if matrix.shape != (len(row_names), len(col_names)):
+        print(
+            f"[WARN] matrix csv shape mismatch: matrix={matrix.shape}, "
+            f"names=({len(row_names)}, {len(col_names)}); ignoring {path}"
+        )
+        return None
+
+    return row_names, col_names, matrix
 
 
-def _save_payoff_cache(cache_path: Path, black_models: Sequence[RoleModel], white_models: Sequence[RoleModel], payoff: np.ndarray) -> None:
-    np.savez_compressed(
-        cache_path,
-        black_names=np.asarray(_names(black_models), dtype=object),
-        white_names=np.asarray(_names(white_models), dtype=object),
-        payoff=np.asarray(payoff, dtype=np.float64),
+def merge_named_matrix(
+    base_row_names: Sequence[str],
+    base_col_names: Sequence[str],
+    base_matrix: np.ndarray,
+    overlay_row_names: Sequence[str],
+    overlay_col_names: Sequence[str],
+    overlay_matrix: np.ndarray,
+) -> tuple[list[str], list[str], np.ndarray, int]:
+    """Merge finite values from overlay_matrix into base_matrix by row/column names.
+
+    Existing rows/columns are preserved. New rows/columns from the overlay are
+    appended. Only finite overlay values are copied, so NaN does not erase an
+    older cached result.
+    """
+
+    base_matrix = np.asarray(base_matrix, dtype=np.float64)
+    overlay_matrix = np.asarray(overlay_matrix, dtype=np.float64)
+
+    if base_matrix.shape != (len(base_row_names), len(base_col_names)):
+        raise ValueError(
+            f"base matrix shape={base_matrix.shape} does not match "
+            f"names=({len(base_row_names)}, {len(base_col_names)})"
+        )
+    if overlay_matrix.shape != (len(overlay_row_names), len(overlay_col_names)):
+        raise ValueError(
+            f"overlay matrix shape={overlay_matrix.shape} does not match "
+            f"names=({len(overlay_row_names)}, {len(overlay_col_names)})"
+        )
+
+    merged_rows = [str(x) for x in base_row_names]
+    merged_cols = [str(x) for x in base_col_names]
+    row_seen = set(merged_rows)
+    col_seen = set(merged_cols)
+
+    for name in overlay_row_names:
+        name = str(name)
+        if name not in row_seen:
+            merged_rows.append(name)
+            row_seen.add(name)
+
+    for name in overlay_col_names:
+        name = str(name)
+        if name not in col_seen:
+            merged_cols.append(name)
+            col_seen.add(name)
+
+    merged = np.full((len(merged_rows), len(merged_cols)), np.nan, dtype=np.float64)
+    merged_row_index = {name: i for i, name in enumerate(merged_rows)}
+    merged_col_index = {name: j for j, name in enumerate(merged_cols)}
+
+    for i, row_name in enumerate(base_row_names):
+        new_i = merged_row_index[str(row_name)]
+        for j, col_name in enumerate(base_col_names):
+            value = base_matrix[i, j]
+            if np.isfinite(value):
+                merged[new_i, merged_col_index[str(col_name)]] = float(value)
+
+    copied = 0
+    for i, row_name in enumerate(overlay_row_names):
+        new_i = merged_row_index[str(row_name)]
+        for j, col_name in enumerate(overlay_col_names):
+            value = overlay_matrix[i, j]
+            if np.isfinite(value):
+                merged[new_i, merged_col_index[str(col_name)]] = float(value)
+                copied += 1
+
+    return merged_rows, merged_cols, merged, copied
+
+
+def _load_payoff_csv(
+    csv_path: Path,
+    black_models: Sequence[RoleModel],
+    white_models: Sequence[RoleModel],
+) -> np.ndarray | None:
+    """Load relevant current-config pairs from a named payoff CSV.
+
+    The CSV is matched by model name instead of by raw position. This makes it
+    safe to add or remove checkpoints in the current config: matching old pairs
+    are copied into the current matrix, while unknown pairs remain NaN.
+    """
+
+    loaded = read_matrix_csv(csv_path)
+    if loaded is None:
+        return None
+
+    old_black, old_white, old_matrix = loaded
+    new_black = _names(black_models)
+    new_white = _names(white_models)
+    new_matrix = np.full((len(new_black), len(new_white)), np.nan, dtype=np.float64)
+
+    old_black_index = {name: i for i, name in enumerate(old_black)}
+    old_white_index = {name: j for j, name in enumerate(old_white)}
+
+    matched_black = sum(1 for name in new_black if name in old_black_index)
+    matched_white = sum(1 for name in new_white if name in old_white_index)
+
+    copied = 0
+    for new_i, black_name in enumerate(new_black):
+        old_i = old_black_index.get(black_name)
+        if old_i is None:
+            continue
+
+        for new_j, white_name in enumerate(new_white):
+            old_j = old_white_index.get(white_name)
+            if old_j is None:
+                continue
+
+            value = old_matrix[old_i, old_j]
+            if np.isfinite(value):
+                new_matrix[new_i, new_j] = float(value)
+                copied += 1
+
+    total = new_matrix.size
+    print(
+        f"[RESUME] loaded payoff csv {csv_path}: "
+        f"matched_black={matched_black}/{len(new_black)}, "
+        f"matched_white={matched_white}/{len(new_white)}, "
+        f"copied={copied}/{total}, "
+        f"remaining={total - copied}"
     )
+
+    if copied == 0:
+        print("[WARN] payoff csv was found but no old pairs could be reused.")
+        print("[WARN] old black sample:", old_black[:5])
+        print("[WARN] new black sample:", new_black[:5])
+        print("[WARN] old white sample:", old_white[:5])
+        print("[WARN] new white sample:", new_white[:5])
+        return None
+
+    return new_matrix
+
+
+def init_payoff_history(
+    history_csv_path: Path,
+    legacy_payoff_csv_path: Path,
+    black_models: Sequence[RoleModel],
+    white_models: Sequence[RoleModel],
+    current_payoff: np.ndarray,
+) -> tuple[list[str], list[str], np.ndarray]:
+    """Initialize the persistent history payoff matrix.
+
+    history_csv_path keeps every evaluated pair ever seen in this output_dir.
+    legacy_payoff_csv_path is read once as a fallback so old runs that only had
+    black_vs_white_payoff_for_elo.csv can be migrated without losing rows/cols.
+    The current payoff matrix is merged last, so newly evaluated or re-evaluated
+    current pairs overwrite old cached values.
+    """
+
+    history_rows: list[str] = []
+    history_cols: list[str] = []
+    history_matrix = np.full((0, 0), np.nan, dtype=np.float64)
+
+    # Read the old current-config file first, then the new history file. If both
+    # contain the same pair, the explicit history file wins.
+    seen_sources: set[Path] = set()
+    for source_path in (legacy_payoff_csv_path, history_csv_path):
+        source_path = source_path.expanduser().resolve()
+        if source_path in seen_sources or not source_path.exists():
+            continue
+        seen_sources.add(source_path)
+        loaded = read_matrix_csv(source_path)
+        if loaded is None:
+            continue
+        source_rows, source_cols, source_matrix = loaded
+        history_rows, history_cols, history_matrix, copied = merge_named_matrix(
+            history_rows,
+            history_cols,
+            history_matrix,
+            source_rows,
+            source_cols,
+            source_matrix,
+        )
+        print(
+            f"[HISTORY] merged {copied} finite pairs from {source_path} "
+            f"into persistent payoff history"
+        )
+
+    current_rows = _names(black_models)
+    current_cols = _names(white_models)
+    history_rows, history_cols, history_matrix, copied_current = merge_named_matrix(
+        history_rows,
+        history_cols,
+        history_matrix,
+        current_rows,
+        current_cols,
+        current_payoff,
+    )
+
+    write_matrix_csv(history_csv_path, history_rows, history_cols, history_matrix)
+    print(
+        f"[HISTORY] cache={history_csv_path} rows={len(history_rows)} cols={len(history_cols)} "
+        f"finite_pairs={int(np.isfinite(history_matrix).sum())}/{history_matrix.size} "
+        f"current_finite_pairs_merged={copied_current}"
+    )
+    return history_rows, history_cols, history_matrix
 
 
 # -----------------------------------------------------------------------------
@@ -1178,17 +1432,49 @@ def run_eval(cfg: EvalConfig) -> None:
         cache_size=int(cfg.cache_size),
     )
 
-    cache_path = output_dir / "payoff_cache.npz"
-    payoff = None
+    # Split the responsibilities of payoff files:
+    #   - history_payoff_csv_path is the persistent resume/cache file. It keeps
+    #     all evaluated pairs ever seen in this output_dir.
+    #   - payoff_csv_path is the current-config matrix used by this Elo fit. It
+    #     intentionally follows the current black_models x white_models shape.
+    payoff_csv_path = output_dir / "black_vs_white_payoff_for_elo.csv"
+    history_payoff_csv_path = output_dir / "black_vs_white_payoff_history.csv"
+
+    payoff = np.full((len(black_models), len(white_models)), np.nan, dtype=np.float64)
     if cfg.resume:
-        payoff = _load_payoff_cache(cache_path, black_models, white_models)
-        if payoff is not None:
+        # Merge all available cache sources for the current matrix. The persistent
+        # history is read first, and the current-output file is read second so a
+        # crash after writing the current file but before writing history can
+        # still be recovered.
+        loaded_any = False
+        for resume_path in (history_payoff_csv_path, payoff_csv_path):
+            cached_payoff = _load_payoff_csv(resume_path, black_models, white_models)
+            if cached_payoff is None:
+                continue
+            mask = np.isfinite(cached_payoff)
+            payoff[mask] = cached_payoff[mask]
+            loaded_any = loaded_any or bool(mask.any())
             finished = int(np.isfinite(payoff).sum())
             total = payoff.size
-            print(f"[RESUME] loaded payoff cache: {finished}/{total} pairs finished")
+            print(f"[RESUME] merged {resume_path}: {finished}/{total} pairs available")
+        if not loaded_any:
+            print("[RESUME] no reusable payoff pairs found; evaluating from scratch for current config")
 
-    if payoff is None:
-        payoff = np.full((len(black_models), len(white_models)), np.nan, dtype=np.float64)
+    # Initialize/update the persistent history before overwriting the current
+    # output matrix. This protects older rows/columns if the new config is smaller.
+    history_black_names, history_white_names, history_payoff = init_payoff_history(
+        history_csv_path=history_payoff_csv_path,
+        legacy_payoff_csv_path=payoff_csv_path,
+        black_models=black_models,
+        white_models=white_models,
+        current_payoff=payoff,
+    )
+    history_black_index = {name: i for i, name in enumerate(history_black_names)}
+    history_white_index = {name: j for j, name in enumerate(history_white_names)}
+
+    # Create/update the current-config payoff CSV immediately so the run has a
+    # visible checkpoint file for this exact Elo fitting matrix.
+    write_matrix_csv(payoff_csv_path, _names(black_models), _names(white_models), payoff)
 
     total_pairs = len(black_models) * len(white_models)
     pair_index = 0
@@ -1213,8 +1499,14 @@ def run_eval(cfg: EvalConfig) -> None:
             payoff[i, j] = float(score)
             print(f"[RESULT] black_score={score:.6f}")
 
-            _save_payoff_cache(cache_path, black_models, white_models, payoff)
-            write_matrix_csv(output_dir / "black_vs_white_payoff.csv", _names(black_models), _names(white_models), payoff)
+            # Online checkpointing:
+            #   1) current-config payoff for this Elo fit
+            #   2) persistent history payoff for future resume/migration
+            hist_i = history_black_index[black_model.name]
+            hist_j = history_white_index[white_model.name]
+            history_payoff[hist_i, hist_j] = float(score)
+            write_matrix_csv(payoff_csv_path, _names(black_models), _names(white_models), payoff)
+            write_matrix_csv(history_payoff_csv_path, history_black_names, history_white_names, history_payoff)
 
     if np.isnan(payoff).any():
         raise RuntimeError("payoff matrix still contains NaN values after evaluation.")
@@ -1257,6 +1549,8 @@ def run_eval(cfg: EvalConfig) -> None:
                 "step_max": cfg.step_max,
                 "step_mod": cfg.step_mod,
                 "limit_per_h": cfg.limit_per_h,
+                "payoff_csv": str(payoff_csv_path),
+                "history_payoff_csv": str(history_payoff_csv_path),
             },
             "num_black_models": len(black_models),
             "num_white_models": len(white_models),
@@ -1265,7 +1559,8 @@ def run_eval(cfg: EvalConfig) -> None:
         }
     )
 
-    write_matrix_csv(output_dir / "black_vs_white_payoff.csv", _names(black_models), _names(white_models), payoff)
+    write_matrix_csv(payoff_csv_path, _names(black_models), _names(white_models), payoff)
+    write_matrix_csv(history_payoff_csv_path, history_black_names, history_white_names, history_payoff)
     write_matrix_csv(output_dir / "predicted_black_scores.csv", _names(black_models), _names(white_models), pred_black_score)
     write_matrix_csv(output_dir / "predicted_white_scores.csv", _names(white_models), _names(black_models), pred_white_score)
     write_matrix_csv(output_dir / "black_model_payoff_for_elo.csv", _names(black_models), _names(black_models), black_model_payoff)
