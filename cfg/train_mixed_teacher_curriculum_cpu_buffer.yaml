@@ -1,0 +1,119 @@
+seed: 0
+
+# This num_envs is still used to build the base training/eval specs and current policies.
+# Mixed teacher rollout env counts are controlled by base_env_num below.
+num_envs: 512
+board_size: 15
+device: cuda
+out_device: cpu
+run_dir:
+version_name: mixed-teacher-curriculum-cpu-buffer-temporal6-block4
+augment: false
+
+# Outer epochs: each outer epoch collects rollouts from all selected teachers
+# according to q-softmax env allocation, concatenates the rollout TensorDicts,
+# and calls the original PPO learner once. PPO inner epochs/minibatches are
+# still controlled by cfg/algo/ppo.yaml or algo role configs.
+epochs: 1
+outer_epochs: 2
+override_epochs_from_outer: true
+steps: 128
+save_interval: 300
+log_interval: 10
+
+# Continue checkpoint numbering and LR/entropy schedules from a previous run.
+pretrain_epoch_offset: 0
+
+# Optional starting checkpoint for the current trainable black/white policies.
+black_checkpoint: wandb/run-20260508_092607-qprkiv43/files/black_05700.pt
+white_checkpoint: wandb/run-20260508_092607-qprkiv43/files/white_05700.pt
+
+# Action pruning settings.
+action_pruning:
+  enabled: true
+
+# Observation settings. Must match the checkpoint architecture.
+use_temporal_feature: true
+temporal_num_steps: 6
+
+# ---------------------------------------------------------------------------
+# Mixed teacher curriculum.
+# ---------------------------------------------------------------------------
+# f/e point to an existing role-separated historical model pool.
+# black_entries teach current white; white_entries teach current black.
+f: train_model_pool_psro-temporal6-block4-psro-bucket
+e: wandb/run-20260508_092607-qprkiv43/files/pool_meta_05700.json
+
+# bucket_size/start_bucket/end_bucket only define the selected metadata range:
+# selected entries = entries[start_bucket * bucket_size : end_bucket * bucket_size]
+# After selection, bucket identity is discarded and all selected single models
+# are mixed by q-softmax.
+bucket_size: 20
+start_bucket: 27
+end_bucket:
+
+# Which current roles to update:
+#   both       -> current black vs selected historical white teachers,
+#                 and current white vs selected historical black teachers
+#   black      -> only current black learns from historical white teachers
+#   white      -> only current white learns from historical black teachers
+# black_only / white_only are also accepted.
+train_roles: both
+
+# Softmax over each selected model's existing quality/q.
+teacher_prob_temperature: 1.0
+
+# Env allocation rule:
+#   env_i = round(base_env_num * prob_i * n_selected_models)
+# If prob_i == 1 / n, the model receives base_env_num envs.
+base_env_num: 256
+min_envs_per_teacher: 50
+max_envs_per_teacher: 1000
+env_rounding: round  # round | floor | ceil | stochastic
+
+# Shuffle concatenated teacher rollout rows before passing them into PPO.learn().
+# mode=env shuffles teacher/env trajectory rows while preserving time order for GAE.
+shuffle_rollout_before_ppo: true
+rollout_shuffle_mode: env
+
+# Memory-safe complete-mixed-batch mode. Teacher rollouts are collected in small
+# chunks, immediately moved/stored on CPU, concatenated into one full CPU mixed
+# batch, and PPO moves only each minibatch to CUDA. This keeps the same global
+# mixed teacher distribution without keeping all rollout samples on GPU.
+offload_rollout_to_cpu: true
+ppo_learn_from_cpu_buffer: true
+collector_out_device: cpu
+rollout_storage_device: cpu
+teacher_chunk_size: 8
+
+# Usually false: the old teacher pool is fixed and will not be mutated.
+# If true, the old PSRO quality update is applied to every active teacher model.
+update_teacher_quality: false
+l: 0.2
+
+# Balance control. For this mixed curriculum, default false is cleaner.
+# If train_roles=both and enabled=true, this alternates white_only -> both -> white_only -> both.
+balance:
+  enabled: false
+
+# Training-time Elo model pool.
+elo_models: elo_eval_model_pool_mixed_teacher_curriculum
+elo_e:  wandb/run-20260508_092607-qprkiv43/files/elo_meta_05700.json
+elo_interval: 200
+elo_eval_repeats: 1
+elo_base: 1200.0
+elo_scale: 400.0
+elo_mle_iters: 1000
+elo_mle_lr: 0.05
+elo_mle_patience: 100
+elo_l2: 0.0001
+
+wandb:
+  name: ${version_name}
+  group: ${board_size}_${board_size}_${algo.name}_MIXED_TEACHER_CURRICULUM
+  project: gomoku_rl
+  mode: online
+
+defaults:
+  - _self_
+  - algo: ppo

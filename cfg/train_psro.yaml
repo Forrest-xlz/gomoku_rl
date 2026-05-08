@@ -1,10 +1,10 @@
 seed: 0
-num_envs: 512
+num_envs: 1536
 board_size: 15
 device: cuda
 out_device: cuda
 run_dir:
-version_name: psro-temporal6-block8-epoch1-numenvs1024-512-balance
+version_name: psro-temporal6-block4-psro-bucket
 augment: false
 
 epochs: 20000
@@ -14,9 +14,9 @@ log_interval: 10
 
 # Resume offset for checkpoint/model-pool/Elo names.
 # Example: pretrain_epoch_offset=1000 and save_interval=100 -> black_01100.pt.
-pretrain_epoch_offset: 0
-black_checkpoint: 
-white_checkpoint: 
+pretrain_epoch_offset: 2700
+black_checkpoint: wandb/run-20260508_001742-t4iot4cl/files/black_02700.pt
+white_checkpoint: wandb/run-20260508_001742-t4iot4cl/files/white_02700.pt
 
 # Action pruning settings.
 action_pruning:
@@ -27,11 +27,10 @@ use_temporal_feature: true
 temporal_num_steps: 6
 
 # Dota/OpenAI-Five-style historical policy-pool self-play.
-# p: probability of current_black vs current_white self-play.
-# l: quality-score learning rate for sampled historical opponents.
-# m: add current black/white to training pool every m epochs.
-p: 0.8
-l: 0.2
+self_play_phase_epochs: 160
+bucket_phase_epochs: 40
+bucket_size: 20
+l: 0.4
 m: 10
 
 # Black/white balance control for PSRO.
@@ -45,13 +44,13 @@ balance:
 # f stores checkpoint files. e stores metadata. If e is empty/missing, a new
 # pool_meta.json is created under f.
 f: train_model_pool_psro-temporal6-block4-psro-bucket
-e: 
+e: wandb/run-20260508_001742-t4iot4cl/files/pool_meta_02700.json
 
 # Training-time Elo model pool.
 # elo_models stores checkpoint files. elo_e stores entries + payoff.
 # If elo_e points to existing metadata, current start checkpoint is not added.
 elo_models: elo_eval_model_pool_psro-temporal6-block4-psro-bucket
-elo_e: 
+elo_e: wandb/run-20260508_001742-t4iot4cl/files/elo_meta_02700.json
 elo_interval: 200
 elo_eval_repeats: 1
 elo_base: 1200.0

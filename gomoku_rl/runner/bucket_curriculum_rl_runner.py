@@ -1,24 +1,25 @@
-"""PSRO-style historical-pool runner with role-separated bucket replay.
+"""Role-separated bucket-curriculum runner for Gomoku RL.
 
-This module contains the full training logic for ``scripts/train_psro.py``.
-It keeps PSRO code in the same runner style as ``IndependentRLRunner``: the
-script file is only a Hydra entry point, while the runner owns rollout, update,
-logging, checkpointing, model-pool snapshots, and Elo evaluation.
+This runner trains the current black/white policies against an existing
+role-separated historical model pool. Historical models are grouped into
+ordered buckets of ``bucket_size`` according to their metadata order:
 
-Compared with the previous per-epoch random historical-pool sampling, this
-version keeps the original role-separated quality score update unchanged, but
-changes opponent sampling to a two-level bucket structure:
+    bucket 0: entries[0:bucket_size]
+    bucket 1: entries[bucket_size:2*bucket_size]
+    ...
 
-1. consecutive historical models are grouped into buckets of ``bucket_size``;
-2. a bucket score is the sum of the qualities of all models inside it;
-3. a bucket is sampled by softmax(bucket_score);
-4. the sampled bucket is locked for the whole bucket phase;
-5. every epoch in that phase samples one model inside the locked bucket by
-   softmax(model_quality).
+The curriculum iterates buckets from early to late. For each curriculum cycle,
+the runner trains on bucket 0 for ``epochs_per_bucket`` epochs, then bucket 1,
+then bucket 2, until the last selected bucket. It repeats this full pass for
+``curriculum_cycles`` cycles.
 
-The training schedule is phase-based instead of Bernoulli self-play:
-``self_play_phase_epochs`` epochs of current black-vs-current white self-play,
-then ``bucket_phase_epochs`` epochs of bucket replay, repeated.
+For role-separated Gomoku training:
+- current black trains against the selected historical white bucket;
+- current white trains against the selected historical black bucket.
+
+The teacher pool is treated as fixed by default: current models are saved as run
+checkpoints, but they are not appended back to the teacher pool unless you edit
+this file intentionally.
 """
 
 from __future__ import annotations
@@ -321,12 +322,32 @@ class RoleSeparatedDiskPolicyPool:
         idx = rng.choices(range(len(buckets)), weights=[b.prob for b in buckets], k=1)[0]
         return buckets[idx]
 
-    def sample_from_bucket(self, bucket: RolePoolBucket, rng: random.Random) -> tuple[int, RolePoolEntry, float]:
+    def get_bucket(self, role: str, bucket_size: int, bucket_index: int) -> RolePoolBucket:
+        buckets = self._make_buckets(role, bucket_size)
+        if not buckets:
+            raise RuntimeError(f"No complete {role} buckets are available.")
+        idx = int(bucket_index)
+        if not (0 <= idx < len(buckets)):
+            raise IndexError(f"{role} bucket index out of range: index={idx}, available={len(buckets)}")
+        return buckets[idx]
+
+    def sample_from_bucket(
+        self,
+        bucket: RolePoolBucket,
+        rng: random.Random,
+        *,
+        mode: str = "softmax_quality",
+    ) -> tuple[int, RolePoolEntry, float]:
         entries = self._entries(bucket.role)
         valid_indices = [idx for idx in bucket.entry_indices if 0 <= int(idx) < len(entries)]
         if not valid_indices:
             raise RuntimeError(f"Cannot sample from empty or stale bucket: {bucket}")
-        probs = self._softmax_from_scores([float(entries[idx].quality) for idx in valid_indices])
+        if mode == "uniform":
+            probs = [1.0 / len(valid_indices)] * len(valid_indices)
+        elif mode == "softmax_quality":
+            probs = self._softmax_from_scores([float(entries[idx].quality) for idx in valid_indices])
+        else:
+            raise ValueError(f"unknown bucket sampling mode: {mode}")
         local_idx = rng.choices(range(len(valid_indices)), weights=probs, k=1)[0]
         entry_idx = int(valid_indices[local_idx])
         return entry_idx, entries[entry_idx], float(probs[local_idx])
@@ -463,15 +484,15 @@ class RoleSeparatedDiskPolicyPool:
         return delta
 
 
-class PSRORLRunner(EloEvalMixin, Runner):
-    """Independent RL runner with role-separated bucket replay and global Elo."""
+class BucketCurriculumRLRunner(EloEvalMixin, Runner):
+    """Independent RL runner with ordered historical bucket curriculum and global Elo."""
 
     _MODE_BOTH = "both"
     _MODE_BLACK_ONLY = "black_only"
     _MODE_WHITE_ONLY = "white_only"
 
     _PHASE_SELF_PLAY = "self_play"
-    _PHASE_BUCKET = "bucket"
+    _PHASE_BUCKET = "bucket_curriculum"
 
     def __init__(self, cfg: DictConfig) -> None:
         # Defensive compatibility: old configs may still contain eval_baseline_pool.
@@ -485,31 +506,51 @@ class PSRORLRunner(EloEvalMixin, Runner):
         self.pretrain_epoch_offset = int(self.cfg.get("pretrain_epoch_offset", 0))
         if self.pretrain_epoch_offset < 0:
             raise ValueError(f"pretrain_epoch_offset must be >= 0, got {self.pretrain_epoch_offset}")
+        self.curriculum_epoch_offset = int(self.cfg.get("curriculum_epoch_offset", 0))
+        if self.curriculum_epoch_offset < 0:
+            raise ValueError(f"curriculum_epoch_offset must be >= 0, got {self.curriculum_epoch_offset}")
 
         seed = self.cfg.get("seed", None)
         self._rng = random.Random(None if seed is None else int(seed))
         self.run_id = sanitize_id(get_run_id())
 
-        self.self_play_phase_epochs = int(self.cfg.get("self_play_phase_epochs", 80))
-        self.bucket_phase_epochs = int(self.cfg.get("bucket_phase_epochs", 20))
         self.bucket_size = int(self.cfg.get("bucket_size", 10))
-        self.pool_lr = float(self.cfg.get("l", self.cfg.get("pool_lr", 0.01)))
-        self.add_to_pool_interval = int(self.cfg.get("m", self.cfg.get("add_to_pool_interval", 10)))
+        self.epochs_per_bucket = int(self.cfg.get("epochs_per_bucket", self.cfg.get("bucket_epochs", 20)))
+        self.curriculum_cycles = int(self.cfg.get("curriculum_cycles", 1))
+        self.start_bucket = int(self.cfg.get("start_bucket", 0))
+        raw_end_bucket = self.cfg.get("end_bucket", None)
+        self.end_bucket: int | None = None if raw_end_bucket is None or str(raw_end_bucket).lower() in {"", "none", "null"} else int(raw_end_bucket)
+        self.train_roles = str(self.cfg.get("train_roles", "both")).lower().strip()
+        self.sample_within_bucket = str(self.cfg.get("sample_within_bucket", "softmax_quality")).lower().strip()
+        self.allow_self_play_fallback = bool(self.cfg.get("allow_self_play_fallback", False))
+        self.override_epochs_from_curriculum = bool(self.cfg.get("override_epochs_from_curriculum", True))
+        self.update_teacher_quality = bool(self.cfg.get("update_teacher_quality", False))
+        self.pool_lr = float(self.cfg.get("l", self.cfg.get("pool_lr", 0.0)))
 
-        if self.self_play_phase_epochs < 0:
-            raise ValueError(f"self_play_phase_epochs must be >= 0, got {self.self_play_phase_epochs}")
-        if self.bucket_phase_epochs < 0:
-            raise ValueError(f"bucket_phase_epochs must be >= 0, got {self.bucket_phase_epochs}")
-        if self.self_play_phase_epochs + self.bucket_phase_epochs <= 0:
-            raise ValueError("self_play_phase_epochs + bucket_phase_epochs must be > 0")
         if self.bucket_size <= 0:
             raise ValueError(f"bucket_size must be > 0, got {self.bucket_size}")
+        if self.epochs_per_bucket <= 0:
+            raise ValueError(f"epochs_per_bucket must be > 0, got {self.epochs_per_bucket}")
+        if self.curriculum_cycles <= 0:
+            raise ValueError(f"curriculum_cycles must be > 0, got {self.curriculum_cycles}")
+        if self.start_bucket < 0:
+            raise ValueError(f"start_bucket must be >= 0, got {self.start_bucket}")
+        if self.train_roles not in {self._MODE_BOTH, self._MODE_BLACK_ONLY, self._MODE_WHITE_ONLY, "black", "white"}:
+            raise ValueError(
+                "train_roles must be one of: both, black, white, black_only, white_only; "
+                f"got {self.train_roles!r}"
+            )
+        if self.train_roles == "black":
+            self.train_roles = self._MODE_BLACK_ONLY
+        elif self.train_roles == "white":
+            self.train_roles = self._MODE_WHITE_ONLY
+        if self.sample_within_bucket not in {"softmax_quality", "uniform"}:
+            raise ValueError(
+                "sample_within_bucket must be 'softmax_quality' or 'uniform', "
+                f"got {self.sample_within_bucket!r}"
+            )
         if self.pool_lr < 0.0:
             raise ValueError(f"l/pool_lr must be >= 0, got {self.pool_lr}")
-
-        # p/self_play_prob is intentionally no longer used for sampling. Keep a
-        # best-effort read only for backward-compatible logging if old configs pass it.
-        self.legacy_self_play_prob = self.cfg.get("p", self.cfg.get("self_play_prob", None))
 
         pool_dir = self.cfg.get("f", self.cfg.get("model_pool_dir", "model_pool"))
         meta_path = self.cfg.get("e", self.cfg.get("model_pool_meta", None))
@@ -519,15 +560,46 @@ class PSRORLRunner(EloEvalMixin, Runner):
             run_id=self.run_id,
             prevent_overwrite=True,
         )
+        self.available_curriculum_buckets = self._compute_available_bucket_count()
+        if self.end_bucket is None:
+            self.end_bucket = self.available_curriculum_buckets
+        if self.end_bucket < self.start_bucket:
+            raise ValueError(f"end_bucket must be >= start_bucket, got {self.end_bucket} < {self.start_bucket}")
+        if self.end_bucket > self.available_curriculum_buckets:
+            raise ValueError(
+                f"end_bucket={self.end_bucket} exceeds available curriculum buckets "
+                f"{self.available_curriculum_buckets} for train_roles={self.train_roles}"
+            )
+        self.selected_bucket_count = int(self.end_bucket - self.start_bucket)
+        if self.selected_bucket_count <= 0 and not self.allow_self_play_fallback:
+            raise ValueError(
+                "No complete curriculum buckets are available. Check model_pool_meta, "
+                "model_pool_dir, bucket_size, train_roles, start_bucket, and end_bucket. "
+                "Set allow_self_play_fallback=true only if you intentionally want self-play fallback."
+            )
+        self.curriculum_total_epochs = int(
+            self.curriculum_cycles * max(1, self.selected_bucket_count) * self.epochs_per_bucket
+        )
+        if self.override_epochs_from_curriculum:
+            self.epochs = self.curriculum_total_epochs
+
         logging.info(
-            "Role-separated bucket PSRO training pool loaded: black=%d, white=%d, total=%d, "
-            "bucket_size=%d, self_play_phase_epochs=%d, bucket_phase_epochs=%d, dir=%s, meta=%s",
+            "Bucket curriculum pool loaded: black=%d, white=%d, total=%d, "
+            "bucket_size=%d, available_buckets=%d, selected=[%d,%d), "
+            "epochs_per_bucket=%d, curriculum_cycles=%d, total_epochs=%d, "
+            "train_roles=%s, sample_within_bucket=%s, dir=%s, meta=%s",
             self.pool.role_size("black"),
             self.pool.role_size("white"),
             self.pool.total_size(),
             self.bucket_size,
-            self.self_play_phase_epochs,
-            self.bucket_phase_epochs,
+            self.available_curriculum_buckets,
+            self.start_bucket,
+            self.end_bucket,
+            self.epochs_per_bucket,
+            self.curriculum_cycles,
+            self.epochs,
+            self.train_roles,
+            self.sample_within_bucket,
             self.pool.pool_dir,
             self.pool.meta_path,
         )
@@ -565,17 +637,6 @@ class PSRORLRunner(EloEvalMixin, Runner):
             augment=self.cfg.get("augment", False),
         )
 
-        added_pool_entries = self.pool.ensure_non_empty(
-            black_state_dict=self.policy_black.state_dict(),
-            white_state_dict=self.policy_white.state_dict(),
-            epoch=self.pretrain_epoch_offset,
-        )
-        if added_pool_entries:
-            logging.info(
-                "Added initial current policies to empty role pool(s): %s",
-                ", ".join(entry.id for entry in added_pool_entries),
-            )
-
         # Important: only add the starting current model if the Elo metadata is empty.
         # If `elo_e` points to an existing metadata file, that file fully controls the Elo pool.
         if len(self.elo_league) == 0:
@@ -601,11 +662,12 @@ class PSRORLRunner(EloEvalMixin, Runner):
         self.current_bias_mode = self._MODE_WHITE_ONLY if self.balance_enabled else self._MODE_BOTH
         self.bias_turn_next = bool(self.balance_enabled)
 
-        self._locked_bucket_phase_index: int | None = None
-        self._locked_buckets: dict[str, RolePoolBucket | None] = {"black": None, "white": None}
-        self._current_train_phase = self._PHASE_SELF_PLAY
-        self._current_phase_index = 0
-        self._current_phase_pos = 0
+        self._current_train_phase = self._PHASE_BUCKET if self.selected_bucket_count > 0 else self._PHASE_SELF_PLAY
+        self._current_cycle_index = 0
+        self._current_bucket_index = self.start_bucket
+        self._current_bucket_offset = 0
+        self._current_epoch_in_bucket = 0
+        self._current_buckets: dict[str, RolePoolBucket | None] = {"black": None, "white": None}
 
     # ---------------------------- epoch helpers ----------------------------
 
@@ -618,57 +680,72 @@ class PSRORLRunner(EloEvalMixin, Runner):
     def _epoch_label(self, epoch_value: int) -> str:
         return f"{int(epoch_value):05d}"
 
-    def _phase_state(self, local_epoch: int) -> tuple[str, int, int]:
-        cycle_len = int(self.self_play_phase_epochs + self.bucket_phase_epochs)
-        global_zero_based_epoch = int(self.pretrain_epoch_offset + local_epoch)
-        phase_index = global_zero_based_epoch // cycle_len
-        phase_pos = global_zero_based_epoch % cycle_len
-        if self.self_play_phase_epochs > 0 and phase_pos < self.self_play_phase_epochs:
-            return self._PHASE_SELF_PLAY, phase_index, phase_pos
-        return self._PHASE_BUCKET, phase_index, phase_pos
+    def _compute_available_bucket_count(self) -> int:
+        black_bucket_count = self.pool.bucket_count("black", self.bucket_size)
+        white_bucket_count = self.pool.bucket_count("white", self.bucket_size)
+        if self.train_roles == self._MODE_BOTH:
+            return int(min(black_bucket_count, white_bucket_count))
+        if self.train_roles == self._MODE_BLACK_ONLY:
+            # Current black learns from historical white teachers.
+            return int(white_bucket_count)
+        if self.train_roles == self._MODE_WHITE_ONLY:
+            # Current white learns from historical black teachers.
+            return int(black_bucket_count)
+        raise ValueError(f"unknown train_roles: {self.train_roles}")
 
-    def _lock_buckets_for_phase(self, phase_index: int) -> None:
-        # Caller guarantees that both role pools have at least one complete bucket.
-        self._locked_buckets["black"] = self.pool.sample_bucket("black", self.bucket_size, self._rng)
-        self._locked_buckets["white"] = self.pool.sample_bucket("white", self.bucket_size, self._rng)
-        self._locked_bucket_phase_index = int(phase_index)
+    def _curriculum_state(self, local_epoch: int) -> tuple[int, int, int, int]:
+        if self.selected_bucket_count <= 0:
+            return 0, 0, self.start_bucket, 0
+        global_zero_based_epoch = int(self.curriculum_epoch_offset + local_epoch)
+        cycle_len = int(self.selected_bucket_count * self.epochs_per_bucket)
+        cycle_index = int(global_zero_based_epoch // cycle_len)
+        pos_in_cycle = int(global_zero_based_epoch % cycle_len)
+        bucket_offset = int(pos_in_cycle // self.epochs_per_bucket)
+        epoch_in_bucket = int(pos_in_cycle % self.epochs_per_bucket)
+        bucket_index = int(self.start_bucket + bucket_offset)
+        return cycle_index, bucket_offset, bucket_index, epoch_in_bucket
 
-        logging.info(
-            "Locked PSRO buckets for phase=%d: black_bucket=%s prob=%.6f q_sum=%.6f size=%d; "
-            "white_bucket=%s prob=%.6f q_sum=%.6f size=%d",
-            phase_index,
-            self._locked_buckets["black"].id if self._locked_buckets["black"] else "none",
-            self._locked_buckets["black"].prob if self._locked_buckets["black"] else 0.0,
-            self._locked_buckets["black"].quality if self._locked_buckets["black"] else 0.0,
-            self._locked_buckets["black"].size if self._locked_buckets["black"] else 0,
-            self._locked_buckets["white"].id if self._locked_buckets["white"] else "none",
-            self._locked_buckets["white"].prob if self._locked_buckets["white"] else 0.0,
-            self._locked_buckets["white"].quality if self._locked_buckets["white"] else 0.0,
-            self._locked_buckets["white"].size if self._locked_buckets["white"] else 0,
-        )
+    def _prepare_curriculum_bucket(self, local_epoch: int) -> str:
+        cycle_index, bucket_offset, bucket_index, epoch_in_bucket = self._curriculum_state(local_epoch)
+        self._current_cycle_index = cycle_index
+        self._current_bucket_offset = bucket_offset
+        self._current_bucket_index = bucket_index
+        self._current_epoch_in_bucket = epoch_in_bucket
 
-    def _prepare_phase(self, local_epoch: int) -> tuple[str, int, int]:
-        scheduled_phase, phase_index, phase_pos = self._phase_state(local_epoch)
-        phase = scheduled_phase
-        self._current_phase_index = int(phase_index)
-        self._current_phase_pos = int(phase_pos)
+        if self.selected_bucket_count <= 0:
+            self._current_train_phase = self._PHASE_SELF_PLAY
+            self._current_buckets = {"black": None, "white": None}
+            return self._PHASE_SELF_PLAY
 
-        if scheduled_phase == self._PHASE_BUCKET and self.bucket_phase_epochs > 0:
-            if self.pool.has_complete_buckets(self.bucket_size):
-                if self._locked_bucket_phase_index != phase_index:
-                    self._lock_buckets_for_phase(phase_index)
-            else:
-                # No complete black/white buckets yet: bucket phase falls back to
-                # ordinary current-black-vs-current-white self-play.
-                phase = self._PHASE_SELF_PLAY
-                self._locked_bucket_phase_index = None
-                self._locked_buckets = {"black": None, "white": None}
-        else:
-            self._locked_bucket_phase_index = None
-            self._locked_buckets = {"black": None, "white": None}
+        self._current_train_phase = self._PHASE_BUCKET
+        self._current_buckets = {"black": None, "white": None}
+        if self.train_roles in (self._MODE_BOTH, self._MODE_WHITE_ONLY):
+            # Historical black bucket teaches current white.
+            self._current_buckets["black"] = self.pool.get_bucket("black", self.bucket_size, bucket_index)
+        if self.train_roles in (self._MODE_BOTH, self._MODE_BLACK_ONLY):
+            # Historical white bucket teaches current black.
+            self._current_buckets["white"] = self.pool.get_bucket("white", self.bucket_size, bucket_index)
+        return self._PHASE_BUCKET
 
-        self._current_train_phase = phase
-        return phase, phase_index, phase_pos
+    def _get_current_bucket(self, role: str) -> RolePoolBucket:
+        bucket = self._current_buckets.get(role)
+        if bucket is None:
+            raise RuntimeError(
+                f"No current {role} bucket is prepared for train_roles={self.train_roles}. "
+                "This usually means the requested role is not trained in this run."
+            )
+        return bucket
+
+    def _get_applied_mode_for_config(self) -> str:
+        if self.train_roles in (self._MODE_BLACK_ONLY, self._MODE_WHITE_ONLY):
+            return self.train_roles
+        if not self.balance_enabled:
+            self.current_bias_mode = self._MODE_BOTH
+            return self._MODE_BOTH
+        self.current_bias_mode = self._MODE_WHITE_ONLY
+        applied_mode = self._MODE_WHITE_ONLY if self.bias_turn_next else self._MODE_BOTH
+        self.bias_turn_next = not self.bias_turn_next
+        return applied_mode
 
     # ---------------------------- schedule helpers ----------------------------
 
@@ -722,13 +799,7 @@ class PSRORLRunner(EloEvalMixin, Runner):
         }
 
     def _get_applied_mode_for_current_epoch(self) -> str:
-        if not self.balance_enabled:
-            self.current_bias_mode = self._MODE_BOTH
-            return self._MODE_BOTH
-        self.current_bias_mode = self._MODE_WHITE_ONLY
-        applied_mode = self._MODE_WHITE_ONLY if self.bias_turn_next else self._MODE_BOTH
-        self.bias_turn_next = not self.bias_turn_next
-        return applied_mode
+        return self._get_applied_mode_for_config()
 
     # ------------------------------ learn helpers -----------------------------
 
@@ -770,22 +841,7 @@ class PSRORLRunner(EloEvalMixin, Runner):
             raise FileNotFoundError(f"pool {entry.role} checkpoint not found: {entry.path}")
         return self._build_inference_policy_from_checkpoint(entry.path, tag=f"pool_{entry.role}/{entry.id}")
 
-    def _get_locked_bucket(self, role: str) -> RolePoolBucket:
-        bucket = self._locked_buckets.get(role)
-        if bucket is None:
-            # Defensive fallback for resumed runs or direct calls.
-            bucket = self.pool.sample_bucket(role, self.bucket_size, self._rng)
-            self._locked_buckets[role] = bucket
-        return bucket
-
-    def _rollout_against_pool(self, applied_mode: str, epoch: int) -> dict[str, Any]:
-        if self.pool.role_size("black") == 0 or self.pool.role_size("white") == 0:
-            self.pool.ensure_non_empty(
-                black_state_dict=self.policy_black.state_dict(),
-                white_state_dict=self.policy_white.state_dict(),
-                epoch=self.pretrain_epoch_offset,
-            )
-
+    def _rollout_against_curriculum_bucket(self, applied_mode: str, epoch: int) -> dict[str, Any]:
         info: dict[str, Any] = {"train/source_self_play": 0.0, "train/source_bucket": 1.0}
         fps_parts: list[float] = []
         data_black = None
@@ -793,27 +849,29 @@ class PSRORLRunner(EloEvalMixin, Runner):
         sampled_policies: list[Any] = []
         global_epoch = self._completed_epoch(epoch)
 
-        # Train current black against a sampled historical white inside the locked white bucket.
+        # Train current black against the scheduled historical white bucket.
         if applied_mode in (self._MODE_BOTH, self._MODE_BLACK_ONLY):
-            white_bucket = self._get_locked_bucket("white")
-            white_idx, white_entry, white_in_bucket_prob = self.pool.sample_from_bucket(white_bucket, self._rng)
-            white_sample_prob = float(white_bucket.prob) * float(white_in_bucket_prob)
+            white_bucket = self._get_current_bucket("white")
+            white_idx, white_entry, white_in_bucket_prob = self.pool.sample_from_bucket(
+                white_bucket, self._rng, mode=self.sample_within_bucket
+            )
+            white_sample_prob = float(white_in_bucket_prob)
             hist_white = self._load_role_pool_policy(white_entry)
             sampled_policies.append(hist_white)
 
-            info.update(
-                {
-                    "pool_white/bucket_index": float(white_bucket.bucket_index),
-                    "pool_white/bucket_size": float(white_bucket.size),
-                    "pool_white/bucket_quality_sum": float(white_bucket.quality),
-                    "pool_white/bucket_prob": float(white_bucket.prob),
-                    "pool_white/sampled_index": float(white_idx),
-                    "pool_white/sampled_epoch": float(white_entry.epoch),
-                    "pool_white/sampled_relative_epoch_ratio": float((white_entry.epoch - global_epoch) / max(global_epoch, 1)),
-                    "pool_white/sampled_prob_in_bucket": float(white_in_bucket_prob),
-                    "pool_white/sampled_prob": float(white_sample_prob),
-                }
-            )
+            info.update({
+                "curriculum/current_bucket_index": float(self._current_bucket_index),
+                "curriculum/current_cycle_index": float(self._current_cycle_index),
+                "curriculum/epoch_in_bucket": float(self._current_epoch_in_bucket),
+                "pool_white/bucket_index": float(white_bucket.bucket_index),
+                "pool_white/bucket_size": float(white_bucket.size),
+                "pool_white/bucket_quality_sum": float(white_bucket.quality),
+                "pool_white/sampled_index": float(white_idx),
+                "pool_white/sampled_epoch": float(white_entry.epoch),
+                "pool_white/sampled_relative_epoch_ratio": float((white_entry.epoch - global_epoch) / max(global_epoch, 1)),
+                "pool_white/sampled_prob_in_bucket": float(white_in_bucket_prob),
+                "pool_white/sampled_prob": float(white_sample_prob),
+            })
 
             black_collector = BlackPlayCollector(
                 self.env,
@@ -823,43 +881,48 @@ class PSRORLRunner(EloEvalMixin, Runner):
                 augment=self.cfg.get("augment", False),
             )
             data_black, black_info = black_collector.rollout(self.steps)
-            black_prefixed_info = add_prefix(black_info, "pool_black_train/")
-            black_prefixed_info.pop("pool_black_train/white_win", None)
+            black_prefixed_info = add_prefix(black_info, "curriculum_black_train/")
+            black_prefixed_info.pop("curriculum_black_train/white_win", None)
             info.update(black_prefixed_info)
             fps_parts.append(float(black_info.get("fps", 0.0)))
 
             current_black_win = float(black_info.get("black_win", 0.0))
             info["pool_white/current_black_win_rate"] = current_black_win
-            white_delta = self.pool.update_after_current_win_rate(
-                role="white",
-                index=white_idx,
-                sample_prob=white_sample_prob,
-                pool_lr=self.pool_lr,
-                current_win_rate=current_black_win,
-            )
-            info["pool_white/quality_delta"] = -float(white_delta)
+            if self.update_teacher_quality:
+                white_delta = self.pool.update_after_current_win_rate(
+                    role="white",
+                    index=white_idx,
+                    sample_prob=white_sample_prob,
+                    pool_lr=self.pool_lr,
+                    current_win_rate=current_black_win,
+                )
+                info["pool_white/quality_delta"] = -float(white_delta)
+            else:
+                info["pool_white/quality_delta"] = 0.0
 
-        # Train current white against a sampled historical black inside the locked black bucket.
+        # Train current white against the scheduled historical black bucket.
         if applied_mode in (self._MODE_BOTH, self._MODE_WHITE_ONLY):
-            black_bucket = self._get_locked_bucket("black")
-            black_idx, black_entry, black_in_bucket_prob = self.pool.sample_from_bucket(black_bucket, self._rng)
-            black_sample_prob = float(black_bucket.prob) * float(black_in_bucket_prob)
+            black_bucket = self._get_current_bucket("black")
+            black_idx, black_entry, black_in_bucket_prob = self.pool.sample_from_bucket(
+                black_bucket, self._rng, mode=self.sample_within_bucket
+            )
+            black_sample_prob = float(black_in_bucket_prob)
             hist_black = self._load_role_pool_policy(black_entry)
             sampled_policies.append(hist_black)
 
-            info.update(
-                {
-                    "pool_black/bucket_index": float(black_bucket.bucket_index),
-                    "pool_black/bucket_size": float(black_bucket.size),
-                    "pool_black/bucket_quality_sum": float(black_bucket.quality),
-                    "pool_black/bucket_prob": float(black_bucket.prob),
-                    "pool_black/sampled_index": float(black_idx),
-                    "pool_black/sampled_epoch": float(black_entry.epoch),
-                    "pool_black/sampled_relative_epoch_ratio": float((black_entry.epoch - global_epoch) / max(global_epoch, 1)),
-                    "pool_black/sampled_prob_in_bucket": float(black_in_bucket_prob),
-                    "pool_black/sampled_prob": float(black_sample_prob),
-                }
-            )
+            info.update({
+                "curriculum/current_bucket_index": float(self._current_bucket_index),
+                "curriculum/current_cycle_index": float(self._current_cycle_index),
+                "curriculum/epoch_in_bucket": float(self._current_epoch_in_bucket),
+                "pool_black/bucket_index": float(black_bucket.bucket_index),
+                "pool_black/bucket_size": float(black_bucket.size),
+                "pool_black/bucket_quality_sum": float(black_bucket.quality),
+                "pool_black/sampled_index": float(black_idx),
+                "pool_black/sampled_epoch": float(black_entry.epoch),
+                "pool_black/sampled_relative_epoch_ratio": float((black_entry.epoch - global_epoch) / max(global_epoch, 1)),
+                "pool_black/sampled_prob_in_bucket": float(black_in_bucket_prob),
+                "pool_black/sampled_prob": float(black_sample_prob),
+            })
 
             white_collector = WhitePlayCollector(
                 self.env,
@@ -869,21 +932,24 @@ class PSRORLRunner(EloEvalMixin, Runner):
                 augment=self.cfg.get("augment", False),
             )
             data_white, white_info = white_collector.rollout(self.steps)
-            white_prefixed_info = add_prefix(white_info, "pool_white_train/")
-            white_prefixed_info.pop("pool_white_train/black_win", None)
+            white_prefixed_info = add_prefix(white_info, "curriculum_white_train/")
+            white_prefixed_info.pop("curriculum_white_train/black_win", None)
             info.update(white_prefixed_info)
             fps_parts.append(float(white_info.get("fps", 0.0)))
 
             current_white_win = float(white_info.get("white_win", 0.0))
             info["pool_black/current_white_win_rate"] = current_white_win
-            black_delta = self.pool.update_after_current_win_rate(
-                role="black",
-                index=black_idx,
-                sample_prob=black_sample_prob,
-                pool_lr=self.pool_lr,
-                current_win_rate=current_white_win,
-            )
-            info["pool_black/quality_delta"] = -float(black_delta)
+            if self.update_teacher_quality:
+                black_delta = self.pool.update_after_current_win_rate(
+                    role="black",
+                    index=black_idx,
+                    sample_prob=black_sample_prob,
+                    pool_lr=self.pool_lr,
+                    current_win_rate=current_white_win,
+                )
+                info["pool_black/quality_delta"] = -float(black_delta)
+            else:
+                info["pool_black/quality_delta"] = 0.0
 
         info["fps"] = float(sum(fps_parts) / len(fps_parts)) if fps_parts else 0.0
         self._apply_learning(applied_mode, data_black, data_white, info)
@@ -896,75 +962,70 @@ class PSRORLRunner(EloEvalMixin, Runner):
         return info
 
     def _maybe_add_current_to_pool(self, epoch: int, info: dict[str, Any]) -> None:
-        if self.add_to_pool_interval <= 0:
-            return
-        if (epoch + 1) % self.add_to_pool_interval != 0:
-            return
-        global_epoch = self._completed_epoch(epoch)
-        black_entry, white_entry = self.pool.add_current_pair(
-            epoch=global_epoch,
-            black_state_dict=self.policy_black.state_dict(),
-            white_state_dict=self.policy_white.state_dict(),
-            prefix="epoch",
-        )
-        info["pool/added_epoch"] = float(global_epoch)
-        logging.info(
-            "Added current policies to role-separated training pool: black=%s white=%s",
-            black_entry.id,
-            white_entry.id,
-        )
+        # The curriculum teacher pool is fixed by default. Current checkpoints are
+        # saved by ``run`` but are not appended back into ``self.pool``.
+        info["pool/current_not_added_to_teacher_pool"] = 1.0
 
     def _epoch(self, epoch: int) -> dict[str, Any]:
         schedule_info: dict[str, Any] = {}
         self._set_policy_schedules(epoch, schedule_info)
 
         applied_mode = self._get_applied_mode_for_current_epoch()
-        phase, phase_index, phase_pos = self._prepare_phase(epoch)
-        use_self_play = phase == self._PHASE_SELF_PLAY or len(self.pool) == 0 or self.bucket_phase_epochs <= 0
+        phase = self._prepare_curriculum_bucket(epoch)
+        use_self_play = phase == self._PHASE_SELF_PLAY
 
         if use_self_play:
+            if not self.allow_self_play_fallback:
+                raise RuntimeError(
+                    "Curriculum fallback to self-play was reached, but allow_self_play_fallback=false. "
+                    "Check whether the configured teacher pool has complete buckets."
+                )
             info = self._rollout_current_self_play(applied_mode)
         else:
-            info = self._rollout_against_pool(applied_mode, epoch)
+            info = self._rollout_against_curriculum_bucket(applied_mode, epoch)
 
         info.update(schedule_info)
-        info.update(
-            {
-                "psro/self_play_phase_epochs": float(self.self_play_phase_epochs),
-                "psro/bucket_phase_epochs": float(self.bucket_phase_epochs),
-                "psro/bucket_size": float(self.bucket_size),
-                "psro/pool_lr": self.pool_lr,
-                "psro/add_to_pool_interval": float(self.add_to_pool_interval),
-                "psro/phase_is_self_play": float(phase == self._PHASE_SELF_PLAY),
-                "psro/phase_is_bucket": float(phase == self._PHASE_BUCKET),
-                "psro/phase_index": float(phase_index),
-                "psro/phase_pos": float(phase_pos),
-                "time/local_epoch_completed": float(epoch + 1),
-                "time/global_epoch_completed": float(self._completed_epoch(epoch)),
-                "time/pretrain_epoch_offset": float(self.pretrain_epoch_offset),
-                "pool_black/size": float(self.pool.role_size("black")),
-                "pool_black/prob_variance": self.pool.prob_variance("black"),
-                "pool_black/bucket_count": float(self.pool.bucket_count("black", self.bucket_size)),
-                "pool_black/bucket_prob_variance": self.pool.bucket_prob_variance("black", self.bucket_size),
-                "pool_white/size": float(self.pool.role_size("white")),
-                "pool_white/prob_variance": self.pool.prob_variance("white"),
-                "pool_white/bucket_count": float(self.pool.bucket_count("white", self.bucket_size)),
-                "pool_white/bucket_prob_variance": self.pool.bucket_prob_variance("white", self.bucket_size),
-                "elo_eval/interval": float(self.elo_interval),
-                "elo_eval/num_models": float(len(self.elo_league)),
-                "elo_eval/payoff_coverage": self.elo_league.payoff_coverage(include_self=True),
-                "balance/enabled": float(self.balance_enabled),
-                "balance/fixed_alternating": float(self.balance_enabled),
-                "balance/fixed_bias_white_only": float(self.balance_enabled),
-            }
-        )
-        if self.legacy_self_play_prob is not None:
-            info["psro/legacy_self_play_prob_unused"] = float(self.legacy_self_play_prob)
+        info.update({
+            "curriculum/bucket_size": float(self.bucket_size),
+            "curriculum/epochs_per_bucket": float(self.epochs_per_bucket),
+            "curriculum/cycles": float(self.curriculum_cycles),
+            "curriculum/start_bucket": float(self.start_bucket),
+            "curriculum/end_bucket": float(self.end_bucket),
+            "curriculum/selected_bucket_count": float(self.selected_bucket_count),
+            "curriculum/available_bucket_count": float(self.available_curriculum_buckets),
+            "curriculum/current_cycle_index": float(self._current_cycle_index),
+            "curriculum/current_bucket_offset": float(self._current_bucket_offset),
+            "curriculum/current_bucket_index": float(self._current_bucket_index),
+            "curriculum/epoch_in_bucket": float(self._current_epoch_in_bucket),
+            "curriculum/train_roles_both": float(self.train_roles == self._MODE_BOTH),
+            "curriculum/train_roles_black_only": float(self.train_roles == self._MODE_BLACK_ONLY),
+            "curriculum/train_roles_white_only": float(self.train_roles == self._MODE_WHITE_ONLY),
+            "curriculum/source_self_play_fallback": float(use_self_play),
+            "curriculum/update_teacher_quality": float(self.update_teacher_quality),
+            "curriculum/pool_lr": self.pool_lr,
+            "time/local_epoch_completed": float(epoch + 1),
+            "time/global_epoch_completed": float(self._completed_epoch(epoch)),
+            "time/pretrain_epoch_offset": float(self.pretrain_epoch_offset),
+            "curriculum/epoch_offset": float(self.curriculum_epoch_offset),
+            "pool_black/size": float(self.pool.role_size("black")),
+            "pool_black/prob_variance": self.pool.prob_variance("black"),
+            "pool_black/bucket_count": float(self.pool.bucket_count("black", self.bucket_size)),
+            "pool_black/bucket_prob_variance": self.pool.bucket_prob_variance("black", self.bucket_size),
+            "pool_white/size": float(self.pool.role_size("white")),
+            "pool_white/prob_variance": self.pool.prob_variance("white"),
+            "pool_white/bucket_count": float(self.pool.bucket_count("white", self.bucket_size)),
+            "pool_white/bucket_prob_variance": self.pool.bucket_prob_variance("white", self.bucket_size),
+            "elo_eval/interval": float(self.elo_interval),
+            "elo_eval/num_models": float(len(self.elo_league)),
+            "elo_eval/payoff_coverage": self.elo_league.payoff_coverage(include_self=True),
+            "balance/enabled": float(self.balance_enabled),
+            "balance/fixed_alternating": float(self.balance_enabled and self.train_roles == self._MODE_BOTH),
+            "balance/fixed_bias_white_only": float(self.balance_enabled and self.train_roles == self._MODE_BOTH),
+        })
 
         info.update(self._bias_mode_to_flags(self.current_bias_mode))
         info.update(self._phase_flags())
         info.update(self._balance_trigger_flags())
-
         self._maybe_add_current_to_pool(epoch, info)
 
         if epoch % 50 == 0 and epoch != 0 and torch.cuda.is_available():
@@ -1018,7 +1079,7 @@ class PSRORLRunner(EloEvalMixin, Runner):
             black_state_dict=self.policy_black.state_dict(),
             white_state_dict=self.policy_white.state_dict(),
             prefix="elo",
-            source="train_psro",
+            source="train_bucket_curriculum",
             parent_black_checkpoint=str(self.cfg.get("black_checkpoint", "") or ""),
             parent_white_checkpoint=str(self.cfg.get("white_checkpoint", "") or ""),
         )
@@ -1108,7 +1169,9 @@ class PSRORLRunner(EloEvalMixin, Runner):
             f"pool_black:{self.pool.role_size('black')} pool_white:{self.pool.role_size('white')}",
             f"bucket_size:{self.bucket_size}",
             f"phase:{self._current_train_phase}",
-            f"phase_pos:{self._current_phase_pos}",
+            f"cycle:{self._current_cycle_index}",
+            f"bucket:{self._current_bucket_index}",
+            f"bucket_ep:{self._current_epoch_in_bucket}",
             f"elo_models:{len(self.elo_league)}",
             f"bias_mode:{self.current_bias_mode}",
             "next_turn:{}".format(
@@ -1116,8 +1179,8 @@ class PSRORLRunner(EloEvalMixin, Runner):
             ),
         ]
         if self._current_train_phase == self._PHASE_BUCKET:
-            black_bucket = self._locked_buckets.get("black")
-            white_bucket = self._locked_buckets.get("white")
+            black_bucket = self._current_buckets.get("black")
+            white_bucket = self._current_buckets.get("white")
             if black_bucket is not None:
                 parts.append(f"bucketB:{black_bucket.bucket_index}/p={black_bucket.prob:.3f}")
             if white_bucket is not None:
@@ -1168,8 +1231,11 @@ class PSRORLRunner(EloEvalMixin, Runner):
     # ---------------------------- metadata snapshots --------------------------
 
     def _save_pool_meta_snapshot(self, epoch_label: str) -> None:
-        self.pool.save()
-        snapshot_path = Path(self.run_dir) / f"pool_meta_{epoch_label}.json"
+        # Do not rewrite the original teacher-pool metadata when the teacher pool
+        # is fixed. We still save a run-local snapshot for reproducibility.
+        if self.update_teacher_quality:
+            self.pool.save()
+        snapshot_path = Path(self.run_dir) / f"teacher_pool_meta_{epoch_label}.json"
         self.pool.save(snapshot_path)
         wandb_save_file(snapshot_path, base_path=self.run_dir)
 
@@ -1224,8 +1290,8 @@ class PSRORLRunner(EloEvalMixin, Runner):
                     "fps": info.get("fps", 0.0),
                     "poolB": self.pool.role_size("black"),
                     "poolW": self.pool.role_size("white"),
-                    "bucketB": self.pool.bucket_count("black", self.bucket_size),
-                    "bucketW": self.pool.bucket_count("white", self.bucket_size),
+                    "bucket": self._current_bucket_index,
+                    "cycle": self._current_cycle_index,
                     "phase": self._current_train_phase,
                     "epoch": self._completed_epoch(i),
                     "eloB": info.get("elo_eval/current_black", float("nan")),
