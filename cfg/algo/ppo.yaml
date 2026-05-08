@@ -59,7 +59,7 @@ black:
   gae_lambda: 0.95
   gamma: 0.99 # 0.99
   max_grad_norm: 0.5
-  batch_size: 16384 # 4096
+  batch_size: 4096 # 4096
   normalize_advantage: true
   average_gae: false
   share_network: true
@@ -108,7 +108,7 @@ white:
   gae_lambda: 0.95
   gamma: 0.99 # 0.99
   max_grad_norm: 0.5
-  batch_size: 16384 # 4096
+  batch_size: 4096 # 4096
   normalize_advantage: true
   average_gae: false
   share_network: true
