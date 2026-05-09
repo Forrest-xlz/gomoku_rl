@@ -23,6 +23,7 @@ then ``bucket_phase_epochs`` epochs of bucket replay, repeated.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -40,6 +41,7 @@ from omegaconf import DictConfig, open_dict
 from tqdm import tqdm
 
 from gomoku_rl.collector import BlackPlayCollector, VersusPlayCollector, WhitePlayCollector
+from gomoku_rl.policy import get_policy
 from gomoku_rl.runner.base import Runner
 from gomoku_rl.runner.elo_model_pool import (
     EloEntry,
@@ -92,6 +94,16 @@ class RolePoolBucket:
     def id(self) -> str:
         return f"{self.role}_bucket_{self.bucket_index:05d}"
 
+
+@dataclass
+class SelectedReviewTeacher:
+    """One historical teacher selected for post-Elo mixed-bucket review."""
+
+    role: str
+    index: int
+    entry: RolePoolEntry
+    prob: float
+    env_num: int
 
 class RoleSeparatedDiskPolicyPool:
     """On-disk role-separated policy pool.
@@ -601,6 +613,94 @@ class PSRORLRunner(EloEvalMixin, Runner):
         self.current_bias_mode = self._MODE_WHITE_ONLY if self.balance_enabled else self._MODE_BOTH
         self.bias_turn_next = bool(self.balance_enabled)
 
+        review_cfg = self.cfg.get("elo_review", {})
+        self.elo_review_enabled = bool(review_cfg.get("enabled", self.cfg.get("elo_review_enabled", True)))
+        self.elo_review_window = max(1, int(review_cfg.get("window", self.cfg.get("elo_review_window", 5))))
+        self.elo_review_min_prior = max(1, int(review_cfg.get("min_prior", self.cfg.get("elo_review_min_prior", self.elo_review_window))))
+        # How to reduce the most recent `window` prior Elo values into the review trigger threshold.
+        #   min:  trigger only if current Elo is below the worst of recent N; preserves old behavior.
+        #   mean: trigger if current Elo is below the recent-N average.
+        #   max:  trigger unless current Elo reaches the best of recent N.
+        self.elo_review_compare_stat = str(
+            review_cfg.get(
+                "compare_stat",
+                review_cfg.get("stat", self.cfg.get("elo_review_compare_stat", "min")),
+            )
+        ).lower().strip()
+        if self.elo_review_compare_stat not in {"min", "mean", "max"}:
+            raise ValueError("elo_review.compare_stat must be one of: min, mean, max")
+        # Number of most-recent complete teacher buckets used for post-Elo review.
+        # ``recent_buckets`` is the preferred name. ``front_buckets`` is kept as a
+        # backward-compatible alias for existing configs; it now means latest buckets,
+        # not bucket 0..N-1.
+        self.elo_review_recent_buckets = max(0, int(review_cfg.get(
+            "recent_buckets",
+            review_cfg.get("front_buckets", self.cfg.get("elo_review_front_buckets", self.elo_review_window)),
+        )))
+        self.elo_review_front_buckets = self.elo_review_recent_buckets
+        self.elo_review_epochs = max(1, int(review_cfg.get("epochs", self.cfg.get("elo_review_epochs", 1))))
+        self.elo_review_policy_name = str(review_cfg.get("policy_name", self.cfg.get("elo_review_policy_name", "ppo_review"))).lower().strip()
+        self.elo_review_accept_margin = float(review_cfg.get("accept_margin", self.cfg.get("elo_review_accept_margin", 0.0)))
+        self.elo_review_best_bucket_source = str(review_cfg.get("best_bucket_source", self.cfg.get("elo_review_best_bucket_source", "opponent"))).lower().strip()
+
+        # Mixed-bucket review samples are collected into CPU memory first, then PPOReview moves only
+        # each minibatch to GPU. These defaults mirror the previous mixed-teacher CPU-buffer runner.
+        self.elo_review_base_env_num = int(review_cfg.get("base_env_num", self.cfg.get("base_env_num", 8)))
+        self.elo_review_min_envs_per_teacher = int(review_cfg.get("min_envs_per_teacher", self.cfg.get("min_envs_per_teacher", 1)))
+        raw_max_envs = review_cfg.get("max_envs_per_teacher", self.cfg.get("max_envs_per_teacher", None))
+        self.elo_review_max_envs_per_teacher = None if raw_max_envs is None or str(raw_max_envs).lower() in {"", "none", "null"} else int(raw_max_envs)
+        self.elo_review_env_rounding = str(review_cfg.get("env_rounding", self.cfg.get("env_rounding", "round"))).lower().strip()
+        self.elo_review_teacher_prob_temperature = float(review_cfg.get("teacher_prob_temperature", self.cfg.get("teacher_prob_temperature", 1.0)))
+        self.elo_review_teacher_chunk_size = max(1, int(review_cfg.get("teacher_chunk_size", self.cfg.get("teacher_chunk_size", 1))))
+        self.elo_review_shuffle_rollout_before_ppo = bool(review_cfg.get("shuffle_rollout_before_ppo", self.cfg.get("shuffle_rollout_before_ppo", True)))
+        self.elo_review_rollout_shuffle_mode = str(review_cfg.get("rollout_shuffle_mode", self.cfg.get("rollout_shuffle_mode", "env"))).lower().strip()
+        self.elo_review_rollout_storage_device = str(review_cfg.get("rollout_storage_device", self.cfg.get("rollout_storage_device", "cpu"))).lower().strip()
+        self.elo_review_collector_out_device = review_cfg.get("collector_out_device", self.cfg.get("collector_out_device", "cpu"))
+        self.elo_review_keep_rejected_elo_entry = bool(review_cfg.get("keep_rejected_elo_entry", self.cfg.get("elo_review_keep_rejected_elo_entry", False)))
+
+        if self.elo_review_base_env_num <= 0:
+            raise ValueError(f"elo_review.base_env_num must be > 0, got {self.elo_review_base_env_num}")
+        if self.elo_review_min_envs_per_teacher < 0:
+            raise ValueError("elo_review.min_envs_per_teacher must be >= 0")
+        if self.elo_review_max_envs_per_teacher is not None and self.elo_review_max_envs_per_teacher < self.elo_review_min_envs_per_teacher:
+            raise ValueError("elo_review.max_envs_per_teacher must be >= min_envs_per_teacher")
+        if self.elo_review_env_rounding not in {"round", "floor", "ceil", "stochastic"}:
+            raise ValueError("elo_review.env_rounding must be one of: round, floor, ceil, stochastic")
+        if self.elo_review_teacher_prob_temperature <= 0.0:
+            raise ValueError("elo_review.teacher_prob_temperature must be > 0")
+        if self.elo_review_best_bucket_source not in {"opponent", "current", "same_role"}:
+            raise ValueError("elo_review.best_bucket_source must be 'opponent' or 'current'")
+        if self.elo_review_rollout_storage_device not in {"cpu", "cuda", "cuda:0", "gpu"}:
+            raise ValueError("elo_review.rollout_storage_device must be one of: cpu, cuda, cuda:0, gpu")
+        if self.elo_review_rollout_shuffle_mode in {"false", "off", "no", "none", "disable", "disabled"}:
+            self.elo_review_shuffle_rollout_before_ppo = False
+            self.elo_review_rollout_shuffle_mode = "none"
+        elif self.elo_review_rollout_shuffle_mode in {"env", "env_dim", "trajectory", "trajectory_env", "row", "rows"}:
+            self.elo_review_rollout_shuffle_mode = "env"
+        else:
+            raise ValueError("elo_review.rollout_shuffle_mode only supports 'env' or 'none'")
+
+        try:
+            self._review_observation_mode, self._review_temporal_num_steps = self._get_observation_cfg()
+        except Exception:
+            self._review_observation_mode = self.cfg.get("observation_mode", None)
+            self._review_temporal_num_steps = self.cfg.get("temporal_num_steps", None)
+
+        logging.info(
+            "Elo review config: enabled=%s window=%d min_prior=%d compare_stat=%s "
+            "recent_buckets=%d epochs=%d policy=%s base_env_num=%d storage=%s keep_rejected_elo=%s",
+            self.elo_review_enabled,
+            self.elo_review_window,
+            self.elo_review_min_prior,
+            self.elo_review_compare_stat,
+            self.elo_review_front_buckets,
+            self.elo_review_epochs,
+            self.elo_review_policy_name,
+            self.elo_review_base_env_num,
+            self.elo_review_rollout_storage_device,
+            self.elo_review_keep_rejected_elo_entry,
+        )
+
         self._locked_bucket_phase_index: int | None = None
         self._locked_buckets: dict[str, RolePoolBucket | None] = {"black": None, "white": None}
         self._current_train_phase = self._PHASE_SELF_PLAY
@@ -971,6 +1071,690 @@ class PSRORLRunner(EloEvalMixin, Runner):
             torch.cuda.empty_cache()
         return info
 
+
+    # -------------------------- post-Elo review helpers --------------------------
+
+    @staticmethod
+    def _opponent_role(role: str) -> str:
+        role = str(role).lower().strip()
+        if role == "black":
+            return "white"
+        if role == "white":
+            return "black"
+        raise ValueError(f"unknown role: {role}")
+
+    @staticmethod
+    def _prob_entropy(probs: list[float]) -> float:
+        return float(-sum(float(p) * math.log(max(float(p), 1e-12)) for p in probs)) if probs else 0.0
+
+    @staticmethod
+    def _prob_effective_n(probs: list[float]) -> float:
+        denom = sum(float(p) ** 2 for p in probs)
+        return float(1.0 / denom) if denom > 0.0 else 0.0
+
+    def _elo_rows_by_id(self, ratings: dict[str, list[dict[str, Any]]], role: str) -> dict[str, dict[str, Any]]:
+        return {str(row["id"]): row for row in ratings.get(role, [])}
+
+    def _elo_row(self, ratings: dict[str, list[dict[str, Any]]], role: str, entry_id: str) -> dict[str, Any] | None:
+        return self._elo_rows_by_id(ratings, role).get(str(entry_id))
+
+    def _prior_elo_rows(
+        self,
+        *,
+        role: str,
+        ratings: dict[str, list[dict[str, Any]]],
+        current_entry_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return all prior Elo rows for ``role``, ordered by training chronology.
+
+        ``min_prior`` is intentionally checked against this full list.
+        ``window`` is only applied later to choose the recent rows used for
+        the regression comparison. This makes the config semantics:
+
+            min_prior: minimum number of historical Elo models in the league
+            window: number of most recent historical Elo models to compare to
+        """
+        rows_by_id = self._elo_rows_by_id(ratings, role)
+        prior_entries = [entry for entry in self.elo_league.entries if entry.id != current_entry_id]
+        prior_entries.sort(key=lambda e: (int(e.epoch), float(e.created_at), str(e.id)))
+        return [rows_by_id[e.id] for e in prior_entries if e.id in rows_by_id]
+
+    def _elo_review_needed(
+        self,
+        *,
+        role: str,
+        ratings: dict[str, list[dict[str, Any]]],
+        current_entry_id: str,
+        current_elo: float,
+        info: dict[str, Any],
+    ) -> bool:
+        prefix = f"elo_review/{role}"
+
+        all_prior_rows = self._prior_elo_rows(role=role, ratings=ratings, current_entry_id=current_entry_id)
+        info[f"{prefix}/prior_count"] = float(len(all_prior_rows))
+        info[f"{prefix}/compare_count"] = 0.0
+
+        if len(all_prior_rows) < int(self.elo_review_min_prior):
+            info[f"{prefix}/triggered"] = 0.0
+            info[f"{prefix}/skipped_not_enough_prior"] = 1.0
+            return False
+
+        compare_rows = all_prior_rows[-int(self.elo_review_window) :]
+        info[f"{prefix}/compare_count"] = float(len(compare_rows))
+        if len(compare_rows) <= 0:
+            info[f"{prefix}/triggered"] = 0.0
+            info[f"{prefix}/skipped_not_enough_prior"] = 1.0
+            return False
+
+        prior_elos = [float(row["elo"]) for row in compare_rows]
+        prior_min_elo = float(min(prior_elos))
+        prior_max_elo = float(max(prior_elos))
+        prior_mean_elo = float(sum(prior_elos) / len(prior_elos))
+
+        compare_stat = str(self.elo_review_compare_stat).lower().strip()
+        if compare_stat == "min":
+            threshold = prior_min_elo
+        elif compare_stat == "mean":
+            threshold = prior_mean_elo
+        elif compare_stat == "max":
+            threshold = prior_max_elo
+        else:
+            raise ValueError(f"elo_review.compare_stat must be one of: min, mean, max, got {compare_stat!r}")
+
+        info[f"{prefix}/prior_min_elo"] = prior_min_elo
+        info[f"{prefix}/prior_max_elo"] = prior_max_elo
+        info[f"{prefix}/prior_mean_elo"] = prior_mean_elo
+        info[f"{prefix}/compare_threshold_elo"] = float(threshold)
+        # Numeric one-hot flags are safer for wandb charts than logging a string.
+        info[f"{prefix}/compare_stat_is_min"] = float(compare_stat == "min")
+        info[f"{prefix}/compare_stat_is_mean"] = float(compare_stat == "mean")
+        info[f"{prefix}/compare_stat_is_max"] = float(compare_stat == "max")
+
+        needed = float(current_elo) < float(threshold)
+        info[f"{prefix}/triggered"] = float(needed)
+        info[f"{prefix}/skipped_not_enough_prior"] = 0.0
+        return bool(needed)
+
+    def _best_elo_entry_for_role(
+        self,
+        *,
+        role: str,
+        ratings: dict[str, list[dict[str, Any]]],
+    ) -> EloEntry | None:
+        rows = ratings.get(role, [])
+        if not rows:
+            return None
+        best_id = str(rows[0]["id"])
+        return next((entry for entry in self.elo_league.entries if entry.id == best_id), None)
+
+    def _find_pool_bucket_by_epoch(self, *, role: str, epoch: int) -> int | None:
+        entries = self.pool._entries(role)
+        if not entries:
+            return None
+        complete_count = len(entries) // self.bucket_size
+        if complete_count <= 0:
+            return None
+
+        exact = [(idx, entry) for idx, entry in enumerate(entries[: complete_count * self.bucket_size]) if int(entry.epoch) == int(epoch)]
+        if exact:
+            return int(exact[-1][0] // self.bucket_size)
+
+        # Fallback for intervals that do not align exactly with pool snapshots: choose the nearest
+        # historical entry not newer than the Elo entry; if all are newer, use the nearest by epoch.
+        eligible = [(idx, entry) for idx, entry in enumerate(entries[: complete_count * self.bucket_size]) if int(entry.epoch) <= int(epoch)]
+        if eligible:
+            idx, _ = max(eligible, key=lambda item: (int(item[1].epoch), int(item[0])))
+            return int(idx // self.bucket_size)
+        idx, _ = min(
+            [(idx, entry) for idx, entry in enumerate(entries[: complete_count * self.bucket_size])],
+            key=lambda item: abs(int(item[1].epoch) - int(epoch)),
+        )
+        return int(idx // self.bucket_size)
+
+    def _review_bucket_indices_for_train_role(
+        self,
+        *,
+        train_role: str,
+        ratings: dict[str, list[dict[str, Any]]],
+        info: dict[str, Any],
+    ) -> list[int]:
+        teacher_role = self._opponent_role(train_role)
+        bucket_count = self.pool.bucket_count(teacher_role, self.bucket_size)
+        prefix = f"elo_review/{train_role}"
+        if bucket_count <= 0:
+            info[f"{prefix}/skipped_no_teacher_bucket"] = 1.0
+            return []
+
+        recent_n = min(int(self.elo_review_recent_buckets), bucket_count)
+        recent_start = max(0, bucket_count - recent_n)
+        bucket_indices = list(range(recent_start, bucket_count))
+
+        best_source_role = teacher_role if self.elo_review_best_bucket_source == "opponent" else train_role
+        best_entry = self._best_elo_entry_for_role(role=best_source_role, ratings=ratings)
+        best_bucket = None
+        if best_entry is not None:
+            # The teacher bucket always comes from the opponent-role training pool. When best_source_role
+            # is current/same_role, this maps by epoch into the opponent pool, because current-role
+            # checkpoints cannot be used as opponents for this review role.
+            best_bucket = self._find_pool_bucket_by_epoch(role=teacher_role, epoch=int(best_entry.epoch))
+            if best_bucket is not None and 0 <= int(best_bucket) < bucket_count and int(best_bucket) not in bucket_indices:
+                bucket_indices.append(int(best_bucket))
+
+        info[f"{prefix}/teacher_role_is_white"] = float(teacher_role == "white")
+        info[f"{prefix}/teacher_bucket_count"] = float(bucket_count)
+        info[f"{prefix}/recent_bucket_count"] = float(recent_n)
+        info[f"{prefix}/recent_bucket_start"] = float(recent_start)
+        info[f"{prefix}/recent_bucket_end"] = float(bucket_count - 1 if recent_n > 0 else -1)
+        # Backward-compatible metric name for old dashboards/configs.
+        info[f"{prefix}/front_bucket_count"] = float(recent_n)
+        info[f"{prefix}/best_bucket_index"] = float(best_bucket if best_bucket is not None else -1)
+        info[f"{prefix}/mixed_bucket_count"] = float(len(bucket_indices))
+        logging.info(
+            "Elo review %s mixed teacher buckets: teacher_role=%s recent=%s best=%s final=%s",
+            train_role,
+            teacher_role,
+            list(range(recent_start, bucket_count)),
+            best_bucket if best_bucket is not None else None,
+            bucket_indices,
+        )
+        return bucket_indices
+
+    def _selected_review_teachers(
+        self,
+        *,
+        train_role: str,
+        ratings: dict[str, list[dict[str, Any]]],
+        info: dict[str, Any],
+    ) -> list[SelectedReviewTeacher]:
+        teacher_role = self._opponent_role(train_role)
+        bucket_indices = self._review_bucket_indices_for_train_role(train_role=train_role, ratings=ratings, info=info)
+        if not bucket_indices:
+            return []
+
+        entries = self.pool._entries(teacher_role)
+        selected: list[tuple[int, RolePoolEntry]] = []
+        for bucket_idx in bucket_indices:
+            start = int(bucket_idx) * int(self.bucket_size)
+            end = min(start + int(self.bucket_size), len(entries))
+            if end - start < int(self.bucket_size):
+                continue
+            selected.extend((idx, entries[idx]) for idx in range(start, end))
+
+        if not selected:
+            return []
+
+        scores = [float(entry.quality) / float(self.elo_review_teacher_prob_temperature) for _, entry in selected]
+        probs = RoleSeparatedDiskPolicyPool._softmax_from_scores(scores)
+        n = len(selected)
+        out: list[SelectedReviewTeacher] = []
+        for (idx, entry), prob in zip(selected, probs):
+            raw_envs = float(self.elo_review_base_env_num) * float(prob) * float(n)
+            env_num = self._round_review_env_count(raw_envs)
+            env_num = max(int(self.elo_review_min_envs_per_teacher), int(env_num))
+            if self.elo_review_max_envs_per_teacher is not None:
+                env_num = min(int(self.elo_review_max_envs_per_teacher), int(env_num))
+            out.append(
+                SelectedReviewTeacher(
+                    role=teacher_role,
+                    index=int(idx),
+                    entry=entry,
+                    prob=float(prob),
+                    env_num=int(env_num),
+                )
+            )
+
+        if out and all(item.env_num <= 0 for item in out):
+            best = max(range(len(out)), key=lambda i: out[i].prob)
+            out[best].env_num = max(1, int(self.elo_review_base_env_num))
+
+        pfx = f"elo_review/{train_role}"
+        probs_only = [float(t.prob) for t in out]
+        env_counts = [int(t.env_num) for t in out]
+        info[f"{pfx}/teacher_count"] = float(len(out))
+        info[f"{pfx}/active_teacher_count"] = float(sum(1 for t in out if t.env_num > 0))
+        info[f"{pfx}/total_review_envs"] = float(sum(env_counts))
+        info[f"{pfx}/teacher_prob_entropy"] = self._prob_entropy(probs_only)
+        info[f"{pfx}/teacher_prob_effective_n"] = self._prob_effective_n(probs_only)
+        info[f"{pfx}/teacher_max_prob"] = float(max(probs_only) if probs_only else 0.0)
+        info[f"{pfx}/teacher_min_prob"] = float(min(probs_only) if probs_only else 0.0)
+        info[f"{pfx}/teacher_max_envs"] = float(max(env_counts) if env_counts else 0)
+        info[f"{pfx}/teacher_min_envs"] = float(min(env_counts) if env_counts else 0)
+        return out
+
+    def _round_review_env_count(self, value: float) -> int:
+        if self.elo_review_env_rounding == "floor":
+            return int(math.floor(value))
+        if self.elo_review_env_rounding == "ceil":
+            return int(math.ceil(value))
+        if self.elo_review_env_rounding == "stochastic":
+            lower = math.floor(value)
+            frac = float(value - lower)
+            return int(lower + (1 if self._rng.random() < frac else 0))
+        return int(round(value))
+
+    def _make_review_rollout_env(self, num_envs: int):
+        kwargs: dict[str, Any] = {}
+        if self._review_observation_mode is not None:
+            kwargs["observation_mode"] = self._review_observation_mode
+        if self._review_temporal_num_steps is not None:
+            kwargs["temporal_num_steps"] = self._review_temporal_num_steps
+        try:
+            return self._make_env(num_envs=int(num_envs), **kwargs)
+        except TypeError:
+            return self._make_env(num_envs=int(num_envs))
+
+    def _store_review_rollout_buffer(self, data):
+        if data is None:
+            return None
+        target = self.elo_review_rollout_storage_device
+        if target in {"gpu", "cuda", "cuda:0"}:
+            target = "cuda"
+        try:
+            data = data.detach()
+        except Exception:
+            pass
+        try:
+            return data.to(target)
+        except TypeError:
+            return data.to(torch.device(target))
+
+    def _shuffle_review_rollout_tensordict(self, tensordict):
+        if tensordict is None or not self.elo_review_shuffle_rollout_before_ppo:
+            return tensordict
+        if self.elo_review_rollout_shuffle_mode == "none":
+            return tensordict
+        if self.elo_review_rollout_shuffle_mode != "env":
+            raise ValueError(f"unsupported elo_review.rollout_shuffle_mode: {self.elo_review_rollout_shuffle_mode}")
+        try:
+            batch_size = tensordict.batch_size
+        except Exception:
+            batch_size = getattr(tensordict, "shape", None)
+        if batch_size is None or len(batch_size) < 1:
+            return tensordict
+        n_env_rows = int(batch_size[0])
+        if n_env_rows <= 1:
+            return tensordict
+        device = getattr(tensordict, "device", None)
+        if device is None:
+            device = "cpu" if self.elo_review_rollout_storage_device == "cpu" else self.device
+        perm = torch.randperm(n_env_rows, device=device)
+        return tensordict[perm]
+
+    def _cat_review_rollouts(self, parts: list[Any]):
+        parts = [p for p in parts if p is not None]
+        if not parts:
+            return None
+        combined = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+        return self._shuffle_review_rollout_tensordict(combined)
+
+    def _review_algo_cfg_for_role(self, role: str):
+        """Return the role-specific PPO config used to build a review policy.
+
+        Normal PSRO training may use independent ``algo.black`` and
+        ``algo.white`` configs. Review mirrors that behavior: black review uses
+        black PPO hyperparameters and white review uses white PPO
+        hyperparameters. If an older flat PPO config is used, this falls back to
+        the top-level ``algo`` block for backward compatibility.
+        """
+        if role not in {"black", "white"}:
+            raise ValueError(f"invalid review role: {role}")
+
+        algo_cfg = self.cfg.algo
+        role_cfg = None
+        try:
+            role_cfg = algo_cfg.get(role, None)
+        except Exception:
+            role_cfg = getattr(algo_cfg, role, None)
+
+        review_cfg = copy.deepcopy(role_cfg if role_cfg is not None else algo_cfg)
+
+        # ``get_policy`` selects the class from the explicit name argument, but
+        # some policy code still reads ``cfg.name`` / ``cfg.role`` internally.
+        # Keep those fields consistent with the temporary review policy.
+        if isinstance(review_cfg, DictConfig):
+            with open_dict(review_cfg):
+                review_cfg.name = self.elo_review_policy_name
+                review_cfg.role = role
+        elif isinstance(review_cfg, dict):
+            review_cfg["name"] = self.elo_review_policy_name
+            review_cfg["role"] = role
+        else:
+            try:
+                setattr(review_cfg, "name", self.elo_review_policy_name)
+            except Exception:
+                pass
+            try:
+                setattr(review_cfg, "role", role)
+            except Exception:
+                pass
+
+        return review_cfg
+
+    def _make_review_policy_from_current(self, role: str):
+        if role not in {"black", "white"}:
+            raise ValueError(f"invalid review role: {role}")
+
+        base_policy = self.policy_black if role == "black" else self.policy_white
+        review_cfg = self._review_algo_cfg_for_role(role)
+        review_policy = get_policy(
+            name=self.elo_review_policy_name,
+            cfg=review_cfg,
+            action_spec=self.env.action_spec,
+            observation_spec=self.env.observation_spec,
+            device=self.env.device,
+        )
+        review_policy.load_state_dict(copy.deepcopy(base_policy.state_dict()))
+        if hasattr(review_policy, "keep_rollout_buffer_on_cpu"):
+            setattr(review_policy, "keep_rollout_buffer_on_cpu", True)
+        if hasattr(review_policy, "gae_on_cpu"):
+            setattr(review_policy, "gae_on_cpu", True)
+        if hasattr(review_policy, "train"):
+            review_policy.train()
+        return review_policy
+
+    def _copy_review_policy_back(self, *, role: str, review_policy) -> None:
+        base_policy = self.policy_black if role == "black" else self.policy_white
+        base_policy.load_state_dict(copy.deepcopy(review_policy.state_dict()))
+        if hasattr(base_policy, "optim") and hasattr(review_policy, "optim"):
+            try:
+                base_policy.optim.load_state_dict(copy.deepcopy(review_policy.optim.state_dict()))
+            except Exception as exc:
+                logging.warning("Could not copy %s review optimizer state back to main policy: %s", role, exc)
+        if hasattr(base_policy, "train"):
+            base_policy.train()
+
+    def _rollout_review_against_mixed_teachers(
+        self,
+        *,
+        train_role: str,
+        train_policy,
+        teachers: list[SelectedReviewTeacher],
+        info: dict[str, Any],
+    ):
+        if train_role not in {"black", "white"}:
+            raise ValueError(f"train_role must be black or white, got {train_role}")
+        active = [teacher for teacher in teachers if int(teacher.env_num) > 0]
+        if not active:
+            return None, 0.0
+
+        teacher_role = self._opponent_role(train_role)
+        data_parts: list[Any] = []
+        fps_values: list[tuple[float, float]] = []
+        win_values: list[tuple[float, float]] = []
+        pfx = f"elo_review/{train_role}"
+
+        for chunk_start in range(0, len(active), int(self.elo_review_teacher_chunk_size)):
+            chunk = active[chunk_start : chunk_start + int(self.elo_review_teacher_chunk_size)]
+            for teacher in chunk:
+                hist_policy = self._load_role_pool_policy(teacher.entry)
+                rollout_env = self._make_review_rollout_env(int(teacher.env_num))
+                collector = None
+                data = None
+                try:
+                    if train_role == "black":
+                        collector = BlackPlayCollector(
+                            rollout_env,
+                            policy_black=train_policy,
+                            policy_white=hist_policy,
+                            out_device=self.elo_review_collector_out_device,
+                            augment=self.cfg.get("augment", False),
+                        )
+                        data, raw_info = collector.rollout(self.steps)
+                        win_key = "black_win"
+                    else:
+                        collector = WhitePlayCollector(
+                            rollout_env,
+                            policy_black=hist_policy,
+                            policy_white=train_policy,
+                            out_device=self.elo_review_collector_out_device,
+                            augment=self.cfg.get("augment", False),
+                        )
+                        data, raw_info = collector.rollout(self.steps)
+                        win_key = "white_win"
+
+                    data = self._store_review_rollout_buffer(data)
+                    data_parts.append(data)
+                    fps_values.append((float(raw_info.get("fps", 0.0)), float(teacher.env_num)))
+                    win_values.append((float(raw_info.get(win_key, 0.0)), float(teacher.env_num)))
+                finally:
+                    del data
+                    del collector
+                    del hist_policy
+                    if rollout_env is not self.env:
+                        del rollout_env
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        combined = self._cat_review_rollouts(data_parts)
+        info[f"{pfx}/teacher_role_is_white"] = float(teacher_role == "white")
+        info[f"{pfx}/review_win_rate_vs_mixed_bucket"] = self._weighted_mean_review(win_values)
+        return combined, self._weighted_mean_review(fps_values)
+
+    @staticmethod
+    def _weighted_mean_review(values: list[tuple[float, float]]) -> float:
+        denom = sum(float(w) for _, w in values)
+        if denom <= 0.0:
+            return 0.0
+        return float(sum(float(v) * float(w) for v, w in values) / denom)
+
+    def _learn_review_policy(self, *, role: str, review_policy, data, info: dict[str, Any], review_epoch: int) -> None:
+        pfx = f"elo_review/{role}"
+        if data is None:
+            info[f"{pfx}/update_skipped_empty_data"] = 1.0
+            return
+        if hasattr(review_policy, "keep_rollout_buffer_on_cpu"):
+            setattr(review_policy, "keep_rollout_buffer_on_cpu", True)
+        if hasattr(review_policy, "gae_on_cpu"):
+            setattr(review_policy, "gae_on_cpu", True)
+        if hasattr(review_policy, "set_outer_epoch"):
+            review_policy.set_outer_epoch(int(self.pretrain_epoch_offset + review_epoch))
+        info.update(add_prefix(review_policy.learn(data), f"elo_review/{role}/policy/"))
+
+    def _evaluate_missing_global_elo_pairs(self) -> tuple[int, float]:
+        missing = self.elo_league.missing_pairs(include_self=True)
+        evaluated = 0
+        start = time.perf_counter()
+        for black_entry, white_entry in missing:
+            score = self._evaluate_one_payoff_pair(black_entry, white_entry)
+            self.elo_league.set_score(
+                black_id=black_entry.id,
+                white_id=white_entry.id,
+                black_win_rate=score,
+                eval_repeats=max(1, self.elo_eval_repeats),
+            )
+            evaluated += 1
+        elapsed = time.perf_counter() - start
+        return int(evaluated), float(elapsed)
+
+    def _fit_global_elo(self) -> tuple[dict[str, list[dict[str, Any]]], dict[str, float]]:
+        return self.elo_league.fit_role_elo_with_alpha(
+            base_elo=self.elo_base,
+            elo_scale=self.elo_scale,
+            l2=self.elo_l2,
+            iters=self.elo_mle_iters,
+            lr=self.elo_mle_lr,
+            patience=self.elo_mle_patience,
+            min_delta=0.0,
+            games_per_pair=max(1, int(getattr(self.eval_env, "num_envs", 1)) * max(1, self.elo_eval_repeats)),
+        )
+
+    def _remove_elo_entry(self, entry: EloEntry) -> None:
+        entry_id = str(entry.id)
+        self.elo_league.entries = [e for e in self.elo_league.entries if e.id != entry_id]
+        self.elo_league.payoff.pop(entry_id, None)
+        for row in self.elo_league.payoff.values():
+            if isinstance(row, dict):
+                row.pop(entry_id, None)
+        for path_str in (entry.black_path, entry.white_path):
+            try:
+                Path(path_str).unlink(missing_ok=True)
+            except Exception:
+                pass
+        self.elo_league.save_meta()
+        self.elo_league.save_payoff()
+        self._fit_global_elo()
+
+    def _evaluate_review_candidate(
+        self,
+        *,
+        role: str,
+        review_policy,
+        baseline_elo: float,
+        global_epoch: int,
+        info: dict[str, Any],
+    ) -> tuple[float, EloEntry]:
+        black_state = review_policy.state_dict() if role == "black" else self.policy_black.state_dict()
+        white_state = review_policy.state_dict() if role == "white" else self.policy_white.state_dict()
+        entry = self.elo_league.add_current_pair(
+            epoch=int(global_epoch),
+            black_state_dict=black_state,
+            white_state_dict=white_state,
+            prefix=f"elo_review_{role}",
+            source="elo_review_candidate",
+            parent_black_checkpoint=str(self.cfg.get("black_checkpoint", "") or ""),
+            parent_white_checkpoint=str(self.cfg.get("white_checkpoint", "") or ""),
+        )
+        evaluated, elapsed = self._evaluate_missing_global_elo_pairs()
+        ratings, fit_summary = self._fit_global_elo()
+        row = self._elo_row(ratings, role, entry.id)
+        candidate_elo = float(row["elo"]) if row is not None else float(self.elo_base)
+        candidate_rank = float(row["rank"]) if row is not None else 1.0
+        pfx = f"elo_review/{role}"
+        info[f"{pfx}/candidate_entry_added"] = 1.0
+        info[f"{pfx}/candidate_elo"] = candidate_elo
+        info[f"{pfx}/candidate_rank"] = candidate_rank
+        info[f"{pfx}/candidate_delta_vs_baseline"] = float(candidate_elo - float(baseline_elo))
+        info[f"{pfx}/candidate_missing_pairs_evaluated"] = float(evaluated)
+        info[f"{pfx}/candidate_eval_seconds"] = float(elapsed)
+        info[f"{pfx}/candidate_fit_loss"] = float(fit_summary.get("loss", 0.0))
+        return candidate_elo, entry
+
+    def _run_role_elo_review(
+        self,
+        *,
+        role: str,
+        baseline_elo: float,
+        ratings: dict[str, list[dict[str, Any]]],
+        global_epoch: int,
+        info: dict[str, Any],
+    ) -> None:
+        pfx = f"elo_review/{role}"
+        review_policy = None
+        candidate_entry = None
+        try:
+            review_policy = self._make_review_policy_from_current(role)
+            total_fps: list[float] = []
+            for review_epoch in range(int(self.elo_review_epochs)):
+                teachers = self._selected_review_teachers(train_role=role, ratings=ratings, info=info)
+                if not teachers:
+                    info[f"{pfx}/skipped_no_teacher"] = 1.0
+                    return
+                data, fps = self._rollout_review_against_mixed_teachers(
+                    train_role=role,
+                    train_policy=review_policy,
+                    teachers=teachers,
+                    info=info,
+                )
+                total_fps.append(float(fps))
+                self._learn_review_policy(role=role, review_policy=review_policy, data=data, info=info, review_epoch=review_epoch)
+                del data
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            info[f"{pfx}/fps"] = float(sum(total_fps) / len(total_fps)) if total_fps else 0.0
+            candidate_elo, candidate_entry = self._evaluate_review_candidate(
+                role=role,
+                review_policy=review_policy,
+                baseline_elo=float(baseline_elo),
+                global_epoch=int(global_epoch),
+                info=info,
+            )
+            accepted = float(candidate_elo) > float(baseline_elo) + float(self.elo_review_accept_margin)
+            info[f"{pfx}/accepted"] = float(accepted)
+            info[f"{pfx}/rejected"] = float(not accepted)
+            if accepted:
+                self._copy_review_policy_back(role=role, review_policy=review_policy)
+                logging.info(
+                    "Accepted %s Elo review at epoch=%d: baseline=%.2f candidate=%.2f delta=%.2f",
+                    role,
+                    global_epoch,
+                    baseline_elo,
+                    candidate_elo,
+                    candidate_elo - float(baseline_elo),
+                )
+            else:
+                logging.info(
+                    "Rejected %s Elo review at epoch=%d: baseline=%.2f candidate=%.2f delta=%.2f",
+                    role,
+                    global_epoch,
+                    baseline_elo,
+                    candidate_elo,
+                    candidate_elo - float(baseline_elo),
+                )
+                if candidate_entry is not None and not self.elo_review_keep_rejected_elo_entry:
+                    self._remove_elo_entry(candidate_entry)
+        finally:
+            del review_policy
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def _maybe_run_elo_review(
+        self,
+        *,
+        epoch: int,
+        global_epoch: int,
+        current_entry: EloEntry,
+        ratings: dict[str, list[dict[str, Any]]],
+        current_black_elo: float,
+        current_white_elo: float,
+        info: dict[str, Any],
+    ) -> None:
+        if not self.elo_review_enabled:
+            info["elo_review/enabled"] = 0.0
+            return
+        info["elo_review/enabled"] = 1.0
+        if self.pool.bucket_count("black", self.bucket_size) <= 0 or self.pool.bucket_count("white", self.bucket_size) <= 0:
+            info["elo_review/skipped_no_complete_bucket"] = 1.0
+            return
+
+        review_black = self._elo_review_needed(
+            role="black",
+            ratings=ratings,
+            current_entry_id=current_entry.id,
+            current_elo=float(current_black_elo),
+            info=info,
+        )
+        review_white = self._elo_review_needed(
+            role="white",
+            ratings=ratings,
+            current_entry_id=current_entry.id,
+            current_elo=float(current_white_elo),
+            info=info,
+        )
+
+        if review_black:
+            self._run_role_elo_review(
+                role="black",
+                baseline_elo=float(current_black_elo),
+                ratings=ratings,
+                global_epoch=int(global_epoch),
+                info=info,
+            )
+        if review_white:
+            # Use the original normal-Elo rating table for trigger/teacher selection. If black review
+            # accepted first, the white review still starts from the updated current black opponent, which
+            # is the desired sequential current-state behavior.
+            self._run_role_elo_review(
+                role="white",
+                baseline_elo=float(current_white_elo),
+                ratings=ratings,
+                global_epoch=int(global_epoch),
+                info=info,
+            )
+
     # ------------------------------ global Elo eval ---------------------------
 
     def _load_elo_policy_pair(self, entry: EloEntry, *, load_black: bool, load_white: bool):
@@ -1025,35 +1809,13 @@ class PSRORLRunner(EloEvalMixin, Runner):
         info["elo_eval/added_epoch"] = float(entry.epoch)
         info["elo_eval/num_models"] = float(len(self.elo_league))
 
-        missing = self.elo_league.missing_pairs(include_self=True)
-        evaluated = 0
-        start = time.perf_counter()
-        for black_entry, white_entry in missing:
-            score = self._evaluate_one_payoff_pair(black_entry, white_entry)
-            self.elo_league.set_score(
-                black_id=black_entry.id,
-                white_id=white_entry.id,
-                black_win_rate=score,
-                eval_repeats=max(1, self.elo_eval_repeats),
-            )
-            evaluated += 1
-
-        ratings, fit_summary = self.elo_league.fit_role_elo_with_alpha(
-            base_elo=self.elo_base,
-            elo_scale=self.elo_scale,
-            l2=self.elo_l2,
-            iters=self.elo_mle_iters,
-            lr=self.elo_mle_lr,
-            patience=self.elo_mle_patience,
-            min_delta=0.0,
-            games_per_pair=max(1, int(getattr(self.eval_env, "num_envs", 1)) * max(1, self.elo_eval_repeats)),
-        )
-        elapsed = time.perf_counter() - start
+        evaluated, elapsed = self._evaluate_missing_global_elo_pairs()
+        ratings, fit_summary = self._fit_global_elo()
 
         black_rows = ratings.get("black", [])
         white_rows = ratings.get("white", [])
-        current_black_row = next((row for row in black_rows if row["id"] == entry.id), None)
-        current_white_row = next((row for row in white_rows if row["id"] == entry.id), None)
+        current_black_row = self._elo_row(ratings, "black", entry.id)
+        current_white_row = self._elo_row(ratings, "white", entry.id)
         best_black_row = black_rows[0] if black_rows else None
         best_white_row = white_rows[0] if white_rows else None
 
@@ -1098,6 +1860,16 @@ class PSRORLRunner(EloEvalMixin, Runner):
             float(fit_summary.get("black_advantage_elo", 0.0)),
             len(self.elo_league),
             evaluated,
+        )
+
+        self._maybe_run_elo_review(
+            epoch=epoch,
+            global_epoch=global_epoch,
+            current_entry=entry,
+            ratings=ratings,
+            current_black_elo=current_black_elo,
+            current_white_elo=current_white_elo,
+            info=info,
         )
 
     # ------------------------------- logging ---------------------------------

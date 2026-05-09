@@ -41,19 +41,16 @@ def make_dqn_actor(
     device: DeviceLike,
 ):
     net_kwargs = get_kwargs(cfg, "num_residual_blocks", "num_channels")
-
     net = MyDuelingCnnDQNet(
         in_channels=_get_in_channels(observation_spec),
         out_features=action_spec.space.n,
         **net_kwargs,
     )
-
     actor = QValueActor(
         net,
         spec=action_spec,
         action_mask_key="action_mask",
     ).to(device)
-
     return actor
 
 
@@ -74,7 +71,6 @@ def make_egreedy_actor(
             action_mask_key="action_mask",
         ),
     )
-
     return explorative_policy
 
 
@@ -85,7 +81,6 @@ def make_ppo_actor(
     device: DeviceLike,
 ):
     in_channels = _get_in_channels(observation_spec)
-
     actor_net = ActorNet(
         residual_tower=ResidualTower(
             in_channels=in_channels,
@@ -109,7 +104,6 @@ def make_ppo_actor(
         distribution_class=Categorical,
         return_log_prob=True,
     )
-
     return policy_module
 
 
@@ -119,7 +113,6 @@ def make_critic(
     device: DeviceLike,
 ):
     in_channels = _get_in_channels(observation_spec)
-
     value_net = ValueNet(
         residual_tower=ResidualTower(
             in_channels=in_channels,
@@ -133,7 +126,6 @@ def make_critic(
         module=value_net,
         in_keys=["observation"],
     )
-
     return value_module
 
 
@@ -144,7 +136,6 @@ def make_ppo_ac(
     device: DeviceLike,
 ):
     in_channels = _get_in_channels(observation_spec)
-
     residual_tower = ResidualTower(
         in_channels=in_channels,
         num_channels=cfg.num_channels,
@@ -167,7 +158,6 @@ def make_ppo_ac(
         in_keys=["hidden", "action_mask"],
         out_keys=["probs"],
     )
-
     policy_module = ProbabilisticActor(
         module=policy_module,
         spec=action_spec,
@@ -177,7 +167,6 @@ def make_ppo_ac(
     )
 
     value_head = ValueHead(num_channels=cfg.num_channels).to(device)
-
     value_module = ValueOperator(
         module=value_head,
         in_keys=["hidden"],
@@ -190,33 +179,26 @@ def make_dataset_naive(
     tensordict: TensorDict,
     batch_size: int,
 ) -> Generator[TensorDict, None, None]:
-    """
-    Shuffle a TensorDict and yield PPO minibatches.
+    """Shuffle a TensorDict and yield PPO minibatches.
 
-    Old behavior:
-        Only full minibatches were used:
-            floor(num_samples / batch_size) * batch_size
-        Tail samples were dropped.
-
-    New behavior:
-        All samples are used.
-        The last minibatch may be smaller than batch_size.
+    This keeps normal full minibatches and keeps a tail minibatch only when it
+    is large enough. Very small tail minibatches are skipped because BatchNorm
+    layers are unstable for small batches and fail outright when batch size is 1.
 
     Example:
-        num_samples = 32256
-        batch_size = 4096
+        num_samples = 32256, batch_size = 4096
+        full minibatches = 7
+        tail minibatch = 3584
 
-        Old:
-            7 minibatches, 3584 samples dropped.
+        Because 3584 >= 1000, the tail minibatch is kept.
 
-        New:
-            8 minibatches, last minibatch has 3584 samples.
+        If tail minibatch = 999, it is skipped.
     """
     tensordict = tensordict.reshape(-1)
-
     batch_size = int(batch_size)
-    assert batch_size > 0, f"batch_size must be positive, got {batch_size}"
+    min_tail_batch_size = 1000
 
+    assert batch_size > 0, f"batch_size must be positive, got {batch_size}"
     num_samples = int(tensordict.shape[0])
     assert num_samples > 0, "make_dataset_naive received an empty TensorDict."
 
@@ -224,6 +206,19 @@ def make_dataset_naive(
 
     for start in range(0, num_samples, batch_size):
         end = min(start + batch_size, num_samples)
+        mb_size = int(end - start)
+        is_tail = end == num_samples
+
+        if is_tail and mb_size < min_tail_batch_size:
+            # If the whole dataset is smaller than min_tail_batch_size, keep it
+            # as long as BatchNorm can run. In normal PPO training this branch
+            # should not be hit, but it avoids silently producing zero batches
+            # for tiny debugging rollouts.
+            if start == 0 and mb_size >= 2:
+                indices = perm[start:end]
+                yield tensordict[indices]
+            continue
+
         indices = perm[start:end]
         yield tensordict[indices]
 
@@ -233,8 +228,6 @@ def get_optimizer(cfg: DictConfig, params: Iterable[Parameter]) -> Optimizer:
         "adam": Adam,
         "adamw": AdamW,
     }
-
     name: str = cfg.name.lower()
     assert name in dict_cls
-
     return dict_cls[name](params=params, **cfg.kwargs)

@@ -28,10 +28,10 @@ dual_clip_coef: 3.0
 optimizer:
   name: adam
   kwargs:
-    lr: 1e-4
+    lr: 3e-5
 
 lr_decay_mode: constant
-lr_start: 1e-4
+lr_start: 3e-5
 lr_end: 1e-5
 lr_epochs: 5000
 entropy_decay_mode: constant
@@ -59,7 +59,7 @@ black:
   gae_lambda: 0.95
   gamma: 0.99 # 0.99
   max_grad_norm: 0.5
-  batch_size: 16384 # 4096
+  batch_size: 4096 # 4096
   normalize_advantage: true
   average_gae: false
   share_network: true
@@ -77,10 +77,10 @@ black:
   optimizer:
     name: adam
     kwargs:
-      lr: 1e-4
+      lr: 3e-5
 
   lr_decay_mode: constant
-  lr_start: 1e-4
+  lr_start: 3e-5
   lr_end: 1e-5
   lr_epochs: 5000
   entropy_decay_mode: constant
@@ -108,7 +108,7 @@ white:
   gae_lambda: 0.95
   gamma: 0.99 # 0.99
   max_grad_norm: 0.5
-  batch_size: 16384 # 4096
+  batch_size: 4096 # 4096
   normalize_advantage: true
   average_gae: false
   share_network: true
@@ -126,10 +126,10 @@ white:
   optimizer:
     name: adam
     kwargs:
-      lr: 1e-4
+      lr: 3e-5
 
   lr_decay_mode: constant
-  lr_start: 1e-4
+  lr_start: 3e-5
   lr_end: 1e-5
   lr_epochs: 5000
   entropy_decay_mode: constant

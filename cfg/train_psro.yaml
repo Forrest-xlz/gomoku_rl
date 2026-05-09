@@ -4,7 +4,7 @@ board_size: 15
 device: cuda
 out_device: cuda
 run_dir:
-version_name: psro-temporal6-block4-psro-bucket
+version_name: psro-temporal6-block4-psro-bucket-review
 augment: false
 
 epochs: 20000
@@ -14,9 +14,9 @@ log_interval: 10
 
 # Resume offset for checkpoint/model-pool/Elo names.
 # Example: pretrain_epoch_offset=1000 and save_interval=100 -> black_01100.pt.
-pretrain_epoch_offset: 2700
-black_checkpoint: wandb/run-20260508_001742-t4iot4cl/files/black_02700.pt
-white_checkpoint: wandb/run-20260508_001742-t4iot4cl/files/white_02700.pt
+pretrain_epoch_offset: 5700
+black_checkpoint: wandb/run-20260509_074553-6jm3i4gb/files/black_06300.pt
+white_checkpoint: wandb/run-20260509_074553-6jm3i4gb/files/white_06300.pt
 
 # Action pruning settings.
 action_pruning:
@@ -44,14 +44,14 @@ balance:
 # f stores checkpoint files. e stores metadata. If e is empty/missing, a new
 # pool_meta.json is created under f.
 f: train_model_pool_psro-temporal6-block4-psro-bucket
-e: wandb/run-20260508_001742-t4iot4cl/files/pool_meta_02700.json
+e: wandb/run-20260509_074553-6jm3i4gb/files/pool_meta_06300.json
 
 # Training-time Elo model pool.
 # elo_models stores checkpoint files. elo_e stores entries + payoff.
 # If elo_e points to existing metadata, current start checkpoint is not added.
 elo_models: elo_eval_model_pool_psro-temporal6-block4-psro-bucket
-elo_e: wandb/run-20260508_001742-t4iot4cl/files/elo_meta_02700.json
-elo_interval: 200
+elo_e: wandb/run-20260509_074553-6jm3i4gb/files/elo_meta_06300.json
+elo_interval: 201
 elo_eval_repeats: 1
 elo_base: 1200.0
 elo_scale: 400.0
@@ -59,6 +59,32 @@ elo_mle_iters: 1000
 elo_mle_lr: 0.05
 elo_mle_patience: 100
 elo_l2: 0.0001
+
+# Post-Elo review: triggered separately for black/white when current role Elo
+# is lower than every one of the previous N Elo-evaluated models.
+elo_review:
+  enabled: true
+  window: 3              # N: compare against previous N Elo-evaluated models
+  min_prior: 4           # skip until there are at least this many prior Elo models
+  compare_stat: mean # min | mean | max
+  front_buckets: 3       # review buckets = first N buckets + best-Elo bucket if not already included
+  epochs: 2              # number of mixed-bucket review PPO updates before re-Elo
+  policy_name: ppo_review
+  accept_margin: 0.0     # accept only if reviewed role Elo > pre-review role Elo + margin
+  best_bucket_source: opponent  # teacher buckets come from opponent-role pool; maps best Elo epoch to that pool
+
+  # CPU-memory rollout storage, then GPU minibatch PPO.
+  base_env_num: 256
+  min_envs_per_teacher: 50
+  max_envs_per_teacher: 1000
+  env_rounding: round
+  teacher_prob_temperature: 1.0
+  teacher_chunk_size: 8
+  collector_out_device: cpu
+  rollout_storage_device: cpu
+  shuffle_rollout_before_ppo: true
+  rollout_shuffle_mode: env
+  keep_rejected_elo_entry: false
 
 wandb:
   name: ${version_name}
